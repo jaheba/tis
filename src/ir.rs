@@ -36,6 +36,7 @@ pub enum Op {
         value: ValueId,
     },
     Len(ValueId),
+    Runtime(CoreOp, Vec<ValueId>),
 }
 
 #[derive(Debug, Clone)]
@@ -96,10 +97,48 @@ pub struct Block {
     pub terminator: Option<Terminator>,
 }
 
-/// The executable program for one function. No bytecode is generated.
+/// Runtime operations retain their semantic identity through bytecode lowering.
+#[derive(Debug, Clone)]
+pub enum CoreOp {
+    Missing,
+    UnpackStar(usize, usize),
+    LoadName(String),
+    StoreName(String),
+    Binary(String),
+    Inplace(String),
+    Compare(String),
+    Unary(String),
+    Call(Vec<Option<String>>),
+    Function(Box<Function>),
+    Class(String, Box<Function>),
+    GetAttr(String),
+    SetAttr(String),
+    Iter,
+    Next,
+    IsDone,
+    Unpack(usize),
+    UnpackItem(usize),
+    Slice,
+    Set,
+    Format(String, bool),
+    Join,
+    Assert,
+    Namespace,
+}
+
+/// A function owns semantic IR, lexical scope metadata and cached bytecode.
 #[derive(Debug, Clone)]
 pub struct Function {
     pub(crate) blocks: Vec<Block>,
+    pub(crate) parameter_names: Vec<String>,
+    pub(crate) positional_only: usize,
+    pub(crate) keyword_only: Vec<String>,
+    pub(crate) vararg: Option<String>,
+    pub(crate) kwarg: Option<String>,
+    pub(crate) local_names: Vec<String>,
+    pub(crate) global_names: Vec<String>,
+    pub(crate) nonlocal_names: Vec<String>,
+    pub(crate) module: bool,
     pub(crate) value_count: usize,
     pub(crate) code: Option<Code>,
     locations: Vec<Option<(usize, usize)>>,
@@ -109,6 +148,15 @@ impl Function {
     pub fn new(parameters: usize) -> Self {
         let mut function = Self {
             blocks: Vec::new(),
+            parameter_names: Vec::new(),
+            positional_only: 0,
+            keyword_only: Vec::new(),
+            vararg: None,
+            kwarg: None,
+            local_names: Vec::new(),
+            global_names: Vec::new(),
+            nonlocal_names: Vec::new(),
+            module: false,
             value_count: 0,
             code: None,
             locations: Vec::new(),
@@ -273,6 +321,16 @@ impl fmt::Display for Op {
                 write!(f, "setitem %{}, %{}, %{}", object.0, key.0, value.0)
             }
             Self::Len(object) => write!(f, "len %{}", object.0),
+            Self::Runtime(operation, values) => {
+                match operation {
+                    CoreOp::Function(_) => write!(f, "function")?,
+                    CoreOp::Class(name, _) => write!(f, "class {name}")?,
+                    other => write!(f, "{other:?}")?,
+                }
+                write!(f, "(")?;
+                operands(f, values)?;
+                write!(f, ")")
+            }
         }
     }
 }

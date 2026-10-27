@@ -106,6 +106,7 @@ impl Op {
                 .collect(),
             Self::SetItem { object, key, value } => vec![*object, *key, *value],
             Self::Len(object) => vec![*object],
+            Self::Runtime(_, values) => values.clone(),
         }
     }
 }

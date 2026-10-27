@@ -4,11 +4,20 @@ use crate::{
     ir::{AddFeedback, AddStrategy, Constant, Function, ValueId},
     runtime,
 };
+use std::{cell::RefCell, rc::Rc};
 
 #[derive(Debug, Default)]
 pub struct Vm {
     pub heap: Heap,
     stack: Vec<Option<Value>>,
+    pub(crate) environments: Vec<Value>,
+    pub(crate) globals: Option<Value>,
+    pub output: String,
+    pub(crate) depth: usize,
+    pub(crate) transient_roots: Vec<Value>,
+    pinned: std::collections::BTreeMap<usize, Value>,
+    next_root: usize,
+    next_collection: usize,
 }
 
 impl Vm {
@@ -18,31 +27,52 @@ impl Vm {
 
     /// Frame values occupy one stack window; both return and error release that window.
     pub fn run(&mut self, function: &mut Function, arguments: &[Value]) -> Result<Value> {
-        let expected = function.parameters(function.entry()).len();
-        if expected != arguments.len() {
-            return Err(Error::Arguments {
-                expected,
-                actual: arguments.len(),
-            });
+        let handle = Rc::new(RefCell::new(function.clone()));
+        let parent = self.ensure_globals();
+        let result = self.invoke_function(handle.clone(), parent, &[], arguments, &[]);
+        *function = handle.borrow().clone();
+        result
+    }
+
+    pub fn run_program(&mut self, program: &mut crate::Program) -> Result<Value> {
+        let module = program
+            .function_mut("<module>")
+            .ok_or(Error::InvalidIr("missing module"))?;
+        self.run(module, &[])
+    }
+
+    pub(crate) fn execute_frame(
+        &mut self,
+        function: Rc<RefCell<Function>>,
+        environment: Value,
+        arguments: &[Value],
+    ) -> Result<Value> {
+        if self.depth >= 256 {
+            return Err(Error::Runtime(
+                "RecursionError: maximum recursion depth exceeded".into(),
+            ));
         }
-        for &value in arguments {
-            if matches!(value, Value::Ref(_)) {
-                self.heap.get(value)?;
-            }
-        }
-        let code = match function.code.take() {
-            Some(code) => code,
-            None => Code::lower(function)?,
-        };
+        let code = function.borrow_mut().bytecode()?.clone();
+        let parameters = function
+            .borrow()
+            .parameters(function.borrow().entry())
+            .to_vec();
         let base = self.stack.len();
         let frame_end = base + code.slots;
         self.stack.resize(frame_end, None);
-        for (&parameter, &value) in function.parameters(function.entry()).iter().zip(arguments) {
+        for (&parameter, &value) in parameters.iter().zip(arguments) {
             self.stack[base + parameter.0] = Some(value);
         }
-        let result = self.execute(function, &code, base, frame_end);
+        self.depth += 1;
+        self.environments.push(environment);
+        // Runtime calls currently recurse through Rust; grow before entering another frame
+        // so the language recursion limit is reached before exhausting the native stack.
+        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            self.execute(&function, &code, base, frame_end)
+        });
+        self.environments.pop();
+        self.depth -= 1;
         self.stack.truncate(base);
-        function.code = Some(code);
         result
     }
 
@@ -51,9 +81,28 @@ impl Vm {
             .stack
             .iter()
             .filter_map(|value| *value)
+            .chain(self.environments.iter().copied())
+            .chain(self.transient_roots.iter().copied())
+            .chain(self.pinned.values().copied())
+            .chain(self.globals)
             .chain(external_roots.iter().copied())
             .collect::<Vec<_>>();
         self.heap.collect(&roots)
+    }
+
+    /// Pin a host-held handle across automatic collections until `unpin` is called.
+    pub fn pin(&mut self, value: Value) -> Result<usize> {
+        if matches!(value, Value::Ref(_)) {
+            self.heap.get(value)?;
+        }
+        let root = self.next_root;
+        self.next_root = root.checked_add(1).ok_or(Error::IntegerOverflow)?;
+        self.pinned.insert(root, value);
+        Ok(root)
+    }
+
+    pub fn unpin(&mut self, root: usize) -> Option<Value> {
+        self.pinned.remove(&root)
     }
 
     pub fn stack_len(&self) -> usize {
@@ -62,7 +111,7 @@ impl Vm {
 
     fn execute(
         &mut self,
-        function: &mut Function,
+        function: &Rc<RefCell<Function>>,
         code: &Code,
         base: usize,
         frame_end: usize,
@@ -108,6 +157,7 @@ impl Vm {
                     let site = ValueId(read_operand(&code.body, &mut ip)?);
                     let rhs = self.pop(frame_end)?;
                     let lhs = self.pop(frame_end)?;
+                    let mut function = function.borrow_mut();
                     let feedback = function
                         .feedback_mut(site)
                         .ok_or(Error::InvalidIr("addition has no feedback site"))?;
@@ -183,7 +233,34 @@ impl Vm {
                         ip = target;
                     }
                 }
+                Opcode::Runtime => {
+                    let id = read_operand(&code.body, &mut ip)?;
+                    let (operation, count) = code
+                        .operations
+                        .get(id)
+                        .ok_or(Error::InvalidIr("runtime operation"))?;
+                    if self.stack.len().saturating_sub(frame_end) < *count {
+                        return Err(Error::InvalidIr("operand stack underflow"));
+                    }
+                    let values = self
+                        .stack
+                        .split_off(self.stack.len() - count)
+                        .into_iter()
+                        .map(|value| value.ok_or(Error::InvalidIr("empty operand")))
+                        .collect::<Result<Vec<_>>>()?;
+                    let roots = self.transient_roots.len();
+                    self.transient_roots.extend_from_slice(&values);
+                    let result = self.operation(operation, &values);
+                    self.transient_roots.truncate(roots);
+                    let result = result?;
+                    self.push(result);
+                }
                 Opcode::Return => return self.pop(frame_end),
+            }
+            // Collect only between instructions, when all live temporaries are rooted.
+            if self.heap.allocation_count() >= self.next_collection.max(4096) {
+                self.collect_garbage(&[])?;
+                self.next_collection = self.heap.allocation_count().saturating_mul(2).max(4096);
             }
         }
     }

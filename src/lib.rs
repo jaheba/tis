@@ -2,6 +2,7 @@
 
 pub mod bytecode;
 mod error;
+mod execution;
 pub mod frontend;
 mod heap;
 pub mod ir;

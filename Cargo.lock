@@ -678,6 +678,7 @@ dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
  "serde",
+ "stacker",
 ]
 
 [[package]]

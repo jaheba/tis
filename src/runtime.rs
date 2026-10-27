@@ -56,7 +56,15 @@ pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
         Value::Bool(value) => value,
         Value::Int(value) => value != 0,
         Value::Float(value) => value != 0.0,
-        Value::Ref(_) => heap.len(value)? != 0,
+        Value::Ref(_) => match heap.get(value)? {
+            Object::String(_)
+            | Object::List(_)
+            | Object::Tuple(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::Range { .. } => heap.len(value)? != 0,
+            _ => true,
+        },
     })
 }
 

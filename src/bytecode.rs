@@ -12,6 +12,7 @@ pub struct Code {
     pub(crate) body: Vec<u8>,
     pub(crate) constants: Vec<Constant>,
     pub(crate) slots: usize,
+    pub(crate) operations: Vec<(crate::ir::CoreOp, usize)>,
 }
 
 #[repr(u8)]
@@ -32,6 +33,7 @@ pub(crate) enum Opcode {
     Jump,
     JumpIfFalse,
     Return,
+    Runtime,
 }
 
 impl Opcode {
@@ -52,6 +54,7 @@ impl Opcode {
             12 => Self::Jump,
             13 => Self::JumpIfFalse,
             14 => Self::Return,
+            15 => Self::Runtime,
             _ => return Err(Error::InvalidIr("invalid opcode")),
         })
     }
@@ -59,7 +62,8 @@ impl Opcode {
     fn has_operand(self) -> bool {
         matches!(
             self,
-            Self::Constant
+            Self::Runtime
+                | Self::Constant
                 | Self::Load
                 | Self::Store
                 | Self::Add
@@ -79,6 +83,7 @@ impl Code {
                 body: Vec::new(),
                 constants: Vec::new(),
                 slots: function.value_count,
+                operations: Vec::new(),
             },
             patches: Vec::new(),
         };
@@ -185,6 +190,11 @@ impl Builder {
             Op::GetItem(..) => self.emit(Opcode::GetItem),
             Op::SetItem { .. } => self.emit(Opcode::SetItem),
             Op::Len(..) => self.emit(Opcode::Len),
+            Op::Runtime(operation, values) => {
+                let id = self.code.operations.len();
+                self.code.operations.push((operation.clone(), values.len()));
+                self.operand(Opcode::Runtime, id)?;
+            }
             Op::Constant(_) => unreachable!(),
         }
         Ok(())

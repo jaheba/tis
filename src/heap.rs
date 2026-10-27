@@ -36,14 +36,59 @@ pub enum Key {
     None,
     Int(i64),
     String(String),
+    Float(u64),
+    Tuple(Vec<Key>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Object {
     String(String),
     List(Vec<Value>),
     Tuple(Vec<Value>),
     Dict(Vec<(Key, Value)>),
+    Set(Vec<Value>),
+    Environment(crate::execution::Environment),
+    Function(crate::execution::Closure),
+    Native(String),
+    Bound(Value, String),
+    Method(Value, Value),
+    Class {
+        name: String,
+        namespace: Value,
+        bases: Vec<Value>,
+    },
+    Instance {
+        class: Value,
+        attributes: std::collections::BTreeMap<String, Value>,
+    },
+    Range {
+        start: i64,
+        stop: i64,
+        step: i64,
+    },
+    Iterator {
+        source: Value,
+        index: usize,
+        size: usize,
+    },
+    Slice {
+        start: Value,
+        stop: Value,
+        step: Value,
+    },
+    Done,
+    Enumerate {
+        iterator: Value,
+        index: i64,
+    },
+    Zip {
+        iterators: Vec<Value>,
+        done: bool,
+    },
+    View {
+        source: Value,
+        kind: String,
+    },
 }
 
 #[derive(Debug)]
@@ -58,6 +103,7 @@ pub struct Heap {
     entries: StableHeap<Entry>,
     generations: RefCell<Vec<Option<usize>>>,
     next_generation: Cell<usize>,
+    live: Cell<usize>,
 }
 
 impl Heap {
@@ -67,6 +113,7 @@ impl Heap {
             entries: StableHeap::with_capacity(16),
             generations: RefCell::new(Vec::new()),
             next_generation: Cell::new(1),
+            live: Cell::new(0),
         }
     }
 
@@ -79,6 +126,7 @@ impl Heap {
                 .expect("heap generation exhausted"),
         );
         let id = self.entries.allocate(Entry { object });
+        self.live.set(self.live.get() + 1);
         let mut generations = self.generations.borrow_mut();
         if id.index() == generations.len() {
             generations.push(Some(generation));
@@ -111,9 +159,24 @@ impl Heap {
             Value::Int(value) => Ok(Key::Int(value)),
             Value::Ref(_) => match self.get(value)? {
                 Object::String(value) => Ok(Key::String(value.clone())),
+                Object::Tuple(values) => values
+                    .iter()
+                    .map(|&value| self.key(value))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Key::Tuple),
                 _ => Err(Error::Type("unhashable key")),
             },
-            Value::Float(_) => Err(Error::Unsupported("float dictionary keys")),
+            Value::Float(value) => {
+                if value.is_finite()
+                    && value.fract() == 0.0
+                    && value >= i64::MIN as f64
+                    && value < -(i64::MIN as f64)
+                {
+                    Ok(Key::Int(value as i64))
+                } else {
+                    Ok(Key::Float(value.to_bits()))
+                }
+            }
         }
     }
 
@@ -122,10 +185,19 @@ impl Heap {
             Object::String(value) => value.chars().count(),
             Object::List(value) | Object::Tuple(value) => value.len(),
             Object::Dict(value) => value.len(),
+            Object::Set(value) => value.len(),
+            Object::View { source, .. } => return self.len(*source),
+            Object::Range { start, stop, step } => {
+                crate::execution::range_len(*start, *stop, *step)?
+            }
+            _ => return Err(Error::Type("object has no length")),
         })
     }
 
     pub fn get_item(&self, object: Value, key: Value) -> Result<Value> {
+        if matches!(key, Value::Ref(_)) && matches!(self.get(key)?, Object::Slice { .. }) {
+            return crate::execution::slice(self, object, key);
+        }
         match self.get(object)? {
             Object::List(items) | Object::Tuple(items) => Ok(items[index(key, items.len())?]),
             Object::String(text) => {
@@ -141,6 +213,7 @@ impl Heap {
                     .map(|(_, value)| *value)
                     .ok_or(Error::MissingKey)
             }
+            _ => Err(Error::Type("object is not subscriptable")),
         }
     }
 
@@ -187,11 +260,7 @@ impl Heap {
             if std::mem::replace(&mut marked[id.index()], true) {
                 continue;
             }
-            match &self.entries.get(id).object {
-                Object::List(items) | Object::Tuple(items) => pending.extend(items.iter().copied()),
-                Object::Dict(items) => pending.extend(items.iter().map(|(_, value)| *value)),
-                Object::String(_) => {}
-            }
+            pending.extend(crate::execution::children(&self.entries.get(id).object));
         }
         let garbage = self
             .generations
@@ -209,15 +278,12 @@ impl Heap {
                 .free();
             self.generations.get_mut()[id.index()] = None;
         }
+        self.live.set(self.live.get() - garbage.len());
         Ok(garbage.len())
     }
 
     pub fn allocation_count(&self) -> usize {
-        self.generations
-            .borrow()
-            .iter()
-            .filter(|generation| generation.is_some())
-            .count()
+        self.live.get()
     }
     pub fn slot_count(&self) -> usize {
         self.entries.len()
@@ -275,4 +341,15 @@ fn index(value: Value, len: usize) -> Result<usize> {
         .ok()
         .filter(|&index| index < len)
         .ok_or(Error::Index)
+}
+
+impl PartialEq for Object {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::List(a), Self::List(b)) | (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (Self::Dict(a), Self::Dict(b)) => a == b,
+            _ => false,
+        }
+    }
 }

@@ -5,6 +5,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Syntax(String),
+    Runtime(String),
     Arguments { expected: usize, actual: usize },
     InvalidIr(&'static str),
     Uninitialized(usize),
@@ -19,6 +20,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Runtime(message) => f.write_str(message),
             Self::Syntax(message) => write!(f, "syntax error: {message}"),
             Self::Arguments { expected, actual } => {
                 write!(f, "expected {expected} arguments, got {actual}")
