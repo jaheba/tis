@@ -84,6 +84,7 @@ Integers are `i64`, with overflow errors; arithmetic with floats uses `f64`.
 This is a research implementation with trusted IR and no sandbox guarantees.
 Exceptions propagate to Rust; Python `try`/`except`, imports, generators/yield, async, decorators,
 multiple inheritance, descriptors and user-defined operator protocols are not implemented.
+Dictionary keys currently support None, bool, integer, non-NaN float, string and recursively hashable tuples.
 Containers and builtins implement a subset of Python's APIs.
 Unsupported constructs return errors.
 

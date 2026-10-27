@@ -108,3 +108,53 @@ fn enumeration_and_zip_are_lazy_and_keep_their_inputs_live() {
     let (_, result) = run(source);
     result.unwrap();
 }
+
+#[test]
+fn scope_declarations_and_loop_control_are_checked_before_execution() {
+    for source in [
+        "return 1",
+        "nonlocal x",
+        "def f():\n    nonlocal missing\n",
+        "while True:\n    def f():\n        break\n",
+        "def f():\n    class A:\n        return 1\n",
+        "def f():\n    global x\n    nonlocal x\n",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+    let (_, result) = run(
+        "x = 1\ndef f():\n    global x\n    x = 3\nf()\nassert x == 3\ndef outer():\n    x = 8\n    class A:\n        def read(self):\n            return x\n    return A()\nassert outer().read() == 8\n",
+    );
+    result.unwrap();
+}
+
+#[test]
+fn numeric_comparison_does_not_round_large_integers() {
+    let (_, result) = run(
+        "assert 9007199254740993 != 9007199254740992.0\nassert 9007199254740993 > 9007199254740992.0\nassert 9223372036854775807 < 9223372036854775808.0\nassert -2 < -1.5 < -1\nassert not (float('nan') == float('nan'))\nassert sorted([(2, 1), (1, 2)]) == [(1, 2), (2, 1)]\nassert {1, 2} == {2, 1}\nassert dict(a=2, b=3) == {'a': 2, 'b': 3}\n",
+    );
+    result.unwrap();
+}
+
+#[test]
+fn exhausted_iterators_stay_exhausted_after_source_growth() {
+    let (_, result) = run(
+        "a = [1]\ni = iter(a)\nassert next(i) == 1\nassert next(i, None) is None\na.append(2)\nassert next(i, None) is None\n",
+    );
+    result.unwrap();
+}
+
+#[test]
+fn dictionary_keys_keep_the_original_representation_and_numeric_identity() {
+    let (_, result) = run(
+        "d = {True: 'first', 1.0: 'replacement'}\nassert len(d) == 1\nassert list(d.keys())[0] is True\nassert str(d) == \"{True: 'replacement'}\"\nd = {1.0: 2}\nd[1] = 3\nassert isinstance(list(d)[0], float)\nassert d == {True: 3}\nassert not {}.values()\nassert -9223372036854775808 < -9223372036854775807\n",
+    );
+    result.unwrap();
+}
+
+#[test]
+fn nested_class_namespaces_do_not_become_lexical_scopes() {
+    let (_, result) = run(
+        "x = 9\nclass Outer:\n    x = 1\n    class Inner:\n        y = x\n        def read(self):\n            return x\nassert Outer.Inner.y == 9\nassert Outer.Inner().read() == 9\n",
+    );
+    result.unwrap();
+}

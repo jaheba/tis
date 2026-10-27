@@ -31,9 +31,10 @@ impl HeapId {
 static NEXT_HEAP: AtomicUsize = AtomicUsize::new(1);
 
 /// Dictionary keys are owned, so string keys do not depend on another object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Key {
     None,
+    Bool(bool),
     Int(i64),
     String(String),
     Float(u64),
@@ -70,6 +71,7 @@ pub enum Object {
         source: Value,
         index: usize,
         size: usize,
+        exhausted: bool,
     },
     Slice {
         start: Value,
@@ -153,29 +155,31 @@ impl Heap {
     }
 
     pub fn key(&self, value: Value) -> Result<Key> {
+        self.key_at(value, 0)
+    }
+
+    fn key_at(&self, value: Value, depth: usize) -> Result<Key> {
+        if depth > 128 {
+            return Err(Error::Runtime("RecursionError: tuple key depth".into()));
+        }
         match value {
             Value::None => Ok(Key::None),
-            Value::Bool(value) => Ok(Key::Int(i64::from(value))),
+            Value::Bool(value) => Ok(Key::Bool(value)),
             Value::Int(value) => Ok(Key::Int(value)),
             Value::Ref(_) => match self.get(value)? {
                 Object::String(value) => Ok(Key::String(value.clone())),
                 Object::Tuple(values) => values
                     .iter()
-                    .map(|&value| self.key(value))
+                    .map(|&value| self.key_at(value, depth + 1))
                     .collect::<Result<Vec<_>>>()
                     .map(Key::Tuple),
                 _ => Err(Error::Type("unhashable key")),
             },
             Value::Float(value) => {
-                if value.is_finite()
-                    && value.fract() == 0.0
-                    && value >= i64::MIN as f64
-                    && value < -(i64::MIN as f64)
-                {
-                    Ok(Key::Int(value as i64))
-                } else {
-                    Ok(Key::Float(value.to_bits()))
+                if value.is_nan() {
+                    return Err(Error::Unsupported("NaN dictionary keys"));
                 }
+                Ok(Key::Float(value.to_bits()))
             }
         }
     }
@@ -349,6 +353,26 @@ impl PartialEq for Object {
             (Self::String(a), Self::String(b)) => a == b,
             (Self::List(a), Self::List(b)) | (Self::Tuple(a), Self::Tuple(b)) => a == b,
             (Self::Dict(a), Self::Dict(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        let numeric = |key: &Key| match key {
+            Key::Bool(value) => Some(Value::Bool(*value)),
+            Key::Int(value) => Some(Value::Int(*value)),
+            Key::Float(bits) => Some(Value::Float(f64::from_bits(*bits))),
+            _ => None,
+        };
+        if let (Some(a), Some(b)) = (numeric(self), numeric(other)) {
+            return crate::execution::numeric_order(a, b) == Some(Some(std::cmp::Ordering::Equal));
+        }
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Tuple(a), Self::Tuple(b)) => a == b,
             _ => false,
         }
     }

@@ -6,4 +6,6 @@
 
 The paged allocator keeps live entries at stable addresses while allocating through a shared reference. Freeing or obtaining mutable entry access requires an exclusive borrow. Keep the upstream safety comments and tests with these files.
 
-The surrounding tis heap is safe Rust. It adds generation checks and explicit-root tracing over tis objects. It does not implement Monty's HeapReader capabilities, reference counting or cycle collector. Changing the copied unsafe modules requires a separate safety review.
+The surrounding tis heap is safe Rust. It adds generation checks and tracing over tis objects.
+The VM supplies automatic collections with frame, environment, call and host roots.
+Direct Heap users supply their roots explicitly. It does not implement Monty's HeapReader capabilities, reference counting or cycle collector. Changing the copied unsafe modules requires a separate safety review.

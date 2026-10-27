@@ -62,7 +62,8 @@ pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
             | Object::Tuple(_)
             | Object::Dict(_)
             | Object::Set(_)
-            | Object::Range { .. } => heap.len(value)? != 0,
+            | Object::Range { .. }
+            | Object::View { .. } => heap.len(value)? != 0,
             _ => true,
         },
     })

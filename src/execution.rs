@@ -464,7 +464,11 @@ impl Vm {
                     return Err(Error::Unsupported("multiple inheritance"));
                 }
                 let namespace = self.heap.allocate(Object::Environment(Environment {
-                    parent: Some(env),
+                    parent: Some(if self.env(env)?.class_scope {
+                        self.env(env)?.parent.unwrap()
+                    } else {
+                        env
+                    }),
                     values: BTreeMap::new(),
                     locals: BTreeSet::new(),
                     globals: BTreeSet::new(),
@@ -656,6 +660,7 @@ impl Vm {
             source,
             index: 0,
             size,
+            exhausted: false,
         }))
     }
 
@@ -703,10 +708,14 @@ impl Vm {
             source,
             index,
             size,
+            exhausted,
         } = self.heap.get(iterator)?.clone()
         else {
             return Err(Error::Type("next requires iterator"));
         };
+        if exhausted {
+            return Ok(self.heap.allocate(Object::Done));
+        }
         let len = self.heap.len(source)?;
         if matches!(
             self.heap.get(source)?,
@@ -718,6 +727,12 @@ impl Vm {
             ));
         }
         if index >= len {
+            *self.heap.get_mut(iterator)? = Object::Iterator {
+                source,
+                index,
+                size,
+                exhausted: true,
+            };
             return Ok(self.heap.allocate(Object::Done));
         }
         let value = match self.heap.get(source)? {
@@ -768,7 +783,7 @@ impl Vm {
         args: &[Value],
         keywords: &[(String, Value)],
     ) -> Result<Value> {
-        if name != "print" && !keywords.is_empty() {
+        if name != "print" && name != "dict" && !keywords.is_empty() {
             return Err(Error::Unsupported("builtin keyword arguments"));
         }
         Ok(match name {
@@ -834,6 +849,10 @@ impl Vm {
                 let dict = self.heap.allocate(Object::Dict(vec![]));
                 if let Some(&source) = args.first() {
                     self.method(dict, "update", &[source])?;
+                }
+                for (name, value) in keywords {
+                    let key = text_heap(&self.heap, name.clone());
+                    self.heap.set_item(dict, key, *value)?;
                 }
                 dict
             }
@@ -1355,6 +1374,7 @@ fn number(value: Value) -> Result<f64> {
 fn key_value(heap: &Heap, key: &Key) -> Value {
     match key {
         Key::None => Value::None,
+        Key::Bool(value) => Value::Bool(*value),
         Key::Int(n) => Value::Int(*n),
         Key::String(s) => text_heap(heap, s.clone()),
         Key::Float(bits) => Value::Float(f64::from_bits(*bits)),
@@ -1542,8 +1562,8 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
     if let (Ok(a), Ok(b)) = (integer(a), integer(b)) {
         return Ok(a == b);
     }
-    if let (Ok(a), Ok(b)) = (number(a), number(b)) {
-        return Ok(a == b);
+    if let Some(ordering) = numeric_order(a, b) {
+        return Ok(ordering == Some(std::cmp::Ordering::Equal));
     }
     if let (Value::Ref(_), Value::Ref(_)) = (a, b) {
         match (heap.get(a)?, heap.get(b)?) {
@@ -1554,6 +1574,24 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
                 }
                 for (&a, &b) in a.iter().zip(b) {
                     if !equal(heap, a, b, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            (Object::Set(a), Object::Set(b)) => {
+                if a.len() != b.len() {
+                    return Ok(false);
+                }
+                for &value in a {
+                    let mut found = false;
+                    for &candidate in b {
+                        if equal(heap, value, candidate, depth + 1)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         return Ok(false);
                     }
                 }
@@ -1623,15 +1661,7 @@ fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool> {
         }
         _ => {}
     }
-    let ordering = if let (Ok(a), Ok(b)) = (integer(a), integer(b)) {
-        a.partial_cmp(&b)
-    } else if let (Ok(a), Ok(b)) = (number(a), number(b)) {
-        a.partial_cmp(&b)
-    } else if let (Ok(Object::String(a)), Ok(Object::String(b))) = (heap.get(a), heap.get(b)) {
-        a.partial_cmp(b)
-    } else {
-        return Err(Error::Type("unsupported ordering"));
-    };
+    let ordering = order(heap, a, b, 0)?;
     Ok(match op {
         "<" => ordering == Some(std::cmp::Ordering::Less),
         "<=" => matches!(
@@ -1733,4 +1763,54 @@ fn render(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Re
             result
         }
     })
+}
+
+pub(crate) fn numeric_order(a: Value, b: Value) -> Option<Option<std::cmp::Ordering>> {
+    use std::cmp::Ordering;
+    fn mixed(integer: i64, float: f64) -> Option<Ordering> {
+        if float.is_nan() {
+            return None;
+        }
+        if float >= -(i64::MIN as f64) {
+            return Some(Ordering::Less);
+        }
+        if float < i64::MIN as f64 {
+            return Some(Ordering::Greater);
+        }
+        match integer.cmp(&(float as i64)) {
+            Ordering::Equal => (0.0_f64).partial_cmp(&float.fract()),
+            other => Some(other),
+        }
+    }
+    match (a, b) {
+        (Value::Float(a), Value::Float(b)) => Some(a.partial_cmp(&b)),
+        (a, Value::Float(b)) => integer(a).ok().map(|a| mixed(a, b)),
+        (Value::Float(a), b) => integer(b).ok().map(|b| mixed(b, a).map(Ordering::reverse)),
+        (a, b) => integer(a)
+            .ok()
+            .zip(integer(b).ok())
+            .map(|(a, b)| Some(a.cmp(&b))),
+    }
+}
+
+fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cmp::Ordering>> {
+    if depth > 128 {
+        return Err(error("RecursionError: comparison depth"));
+    }
+    if let Some(order) = numeric_order(a, b) {
+        return Ok(order);
+    }
+    match (heap.get(a), heap.get(b)) {
+        (Ok(Object::String(a)), Ok(Object::String(b))) => Ok(Some(a.cmp(b))),
+        (Ok(Object::List(a)), Ok(Object::List(b)))
+        | (Ok(Object::Tuple(a)), Ok(Object::Tuple(b))) => {
+            for (&a, &b) in a.iter().zip(b) {
+                if !equal(heap, a, b, depth + 1)? {
+                    return order(heap, a, b, depth + 1);
+                }
+            }
+            Ok(Some(a.len().cmp(&b.len())))
+        }
+        _ => Err(Error::Type("unsupported ordering")),
+    }
 }

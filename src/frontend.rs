@@ -27,6 +27,7 @@ pub fn compile(source: &str) -> Result<Program> {
     let module = ruff_python_parser::parse_module(source)
         .map_err(|e| Error::Syntax(e.to_string()))?
         .into_syntax();
+    validate_scope(&module.body, &[], false, false)?;
     let mut builder = Builder::new(&module.body, true)?;
     let mut block = Some(builder.function.entry());
     for (index, statement) in module.body.iter().enumerate() {
@@ -410,6 +411,14 @@ impl Builder {
                 self.binary(expr.op, left, right, block)?
             }
             Expr::UnaryOp(expr) => {
+                // The positive magnitude of i64::MIN cannot be represented as an i64 constant.
+                if expr.op == ast::UnaryOp::USub
+                    && let Expr::NumberLiteral(literal) = &*expr.operand
+                    && let ast::Number::Int(integer) = &literal.value
+                    && integer.to_string() == "9223372036854775808"
+                {
+                    return Ok((block, self.constant(block, Constant::Int(i64::MIN))));
+                }
                 let (next, value) = self.expression(&expr.operand, block)?;
                 block = next;
                 self.runtime(
@@ -1040,4 +1049,83 @@ fn operator_name(op: ast::Operator) -> Result<&'static str> {
         ast::Operator::BitXor => "^",
         _ => return Err(Error::Unsupported("binary operator")),
     })
+}
+
+fn validate_scope(
+    body: &[Stmt],
+    parents: &[BTreeSet<String>],
+    in_function: bool,
+    in_loop: bool,
+) -> Result<()> {
+    for statement in body {
+        match statement {
+            Stmt::FunctionDef(definition) => {
+                let mut locals = BTreeSet::new();
+                let mut globals = BTreeSet::new();
+                let mut nonlocals = BTreeSet::new();
+                bindings(&definition.body, &mut locals, &mut globals, &mut nonlocals);
+                locals.extend(
+                    definition
+                        .parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(&definition.parameters.args)
+                        .chain(&definition.parameters.kwonlyargs)
+                        .map(|p| p.parameter.name.to_string()),
+                );
+                locals.extend(
+                    definition
+                        .parameters
+                        .vararg
+                        .iter()
+                        .chain(definition.parameters.kwarg.iter())
+                        .map(|p| p.name.to_string()),
+                );
+                locals.retain(|name| !globals.contains(name) && !nonlocals.contains(name));
+                let mut scopes = parents.to_vec();
+                scopes.push(locals);
+                validate_scope(&definition.body, &scopes, true, false)?;
+            }
+            Stmt::ClassDef(definition) => validate_scope(&definition.body, parents, false, false)?,
+            Stmt::Nonlocal(declaration) => {
+                for name in &declaration.names {
+                    // The final scope is the current function; a nonlocal needs an enclosing function.
+                    let enclosing = if in_function {
+                        &parents[..parents.len().saturating_sub(1)]
+                    } else {
+                        parents
+                    };
+                    if !enclosing
+                        .iter()
+                        .rev()
+                        .any(|scope| scope.contains(name.as_str()))
+                    {
+                        return Err(Error::Syntax(format!("no binding for nonlocal {name}")));
+                    }
+                }
+            }
+            Stmt::Return(_) if !in_function => {
+                return Err(Error::Syntax("return outside function".into()));
+            }
+            Stmt::Break(_) | Stmt::Continue(_) if !in_loop => {
+                return Err(Error::Syntax("loop control outside loop".into()));
+            }
+            Stmt::For(stmt) => {
+                validate_scope(&stmt.body, parents, in_function, true)?;
+                validate_scope(&stmt.orelse, parents, in_function, in_loop)?;
+            }
+            Stmt::While(stmt) => {
+                validate_scope(&stmt.body, parents, in_function, true)?;
+                validate_scope(&stmt.orelse, parents, in_function, in_loop)?;
+            }
+            Stmt::If(stmt) => {
+                validate_scope(&stmt.body, parents, in_function, in_loop)?;
+                for clause in &stmt.elif_else_clauses {
+                    validate_scope(&clause.body, parents, in_function, in_loop)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

@@ -139,6 +139,13 @@ impl Code {
             if opcode.has_operand() {
                 let operand = read_operand(&self.body, &mut ip)?;
                 write!(output, " {operand}").unwrap();
+                if matches!(opcode, Opcode::Runtime) {
+                    let (operation, _) = self
+                        .operations
+                        .get(operand)
+                        .ok_or(Error::InvalidIr("runtime operation"))?;
+                    write!(output, " ({})", Op::Runtime(operation.clone(), vec![])).unwrap();
+                }
                 if matches!(opcode, Opcode::Constant) {
                     write!(
                         output,
