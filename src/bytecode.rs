@@ -4,15 +4,27 @@ use std::fmt::Write;
 
 use crate::{
     Error, Result,
-    ir::{BlockId, Constant, Edge, Function, Op, Terminator, ValueId},
+    hir::{BlockId, Constant, Edge, Function, Op, Terminator, ValueId},
 };
 
 #[derive(Debug, Clone)]
 pub struct Code {
     pub(crate) body: Vec<u8>,
+    pub function: crate::profile::FunctionId,
+    pub revision: u64,
+    pub(crate) backedges: std::collections::BTreeSet<(usize, usize)>,
+    pub(crate) sites: Vec<Option<Site>>,
+    offsets: Vec<Vec<usize>>,
+    block_offsets: Vec<usize>,
     pub(crate) constants: Vec<Constant>,
     pub(crate) slots: usize,
-    pub(crate) operations: Vec<(crate::ir::CoreOp, usize)>,
+    pub(crate) operations: Vec<(crate::hir::CoreOp, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Site {
+    pub inputs: Vec<ValueId>,
+    pub call: bool,
 }
 
 #[repr(u8)]
@@ -34,6 +46,8 @@ pub(crate) enum Opcode {
     JumpIfFalse,
     Return,
     Runtime,
+    EnterBlock,
+    Observe,
 }
 
 impl Opcode {
@@ -55,6 +69,8 @@ impl Opcode {
             13 => Self::JumpIfFalse,
             14 => Self::Return,
             15 => Self::Runtime,
+            16 => Self::EnterBlock,
+            17 => Self::Observe,
             _ => return Err(Error::InvalidIr("invalid opcode")),
         })
     }
@@ -62,7 +78,9 @@ impl Opcode {
     fn has_operand(self) -> bool {
         matches!(
             self,
-            Self::Runtime
+            Self::EnterBlock
+                | Self::Observe
+                | Self::Runtime
                 | Self::Constant
                 | Self::Load
                 | Self::Store
@@ -78,9 +96,25 @@ impl Opcode {
 
 impl Code {
     pub fn lower(function: &Function) -> Result<Self> {
+        let analysis = function.analyze()?;
+        let mut sites = vec![None; function.value_count];
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                sites[instruction.result.0] = Some(Site {
+                    inputs: instruction.op.inputs(),
+                    call: matches!(&instruction.op, Op::Runtime(crate::hir::CoreOp::Call(_), _)),
+                });
+            }
+        }
         let mut builder = Builder {
             code: Self {
                 body: Vec::new(),
+                function: function.id(),
+                revision: function.revision(),
+                backedges: analysis.backedges,
+                sites,
+                offsets: Vec::new(),
+                block_offsets: Vec::new(),
                 constants: Vec::new(),
                 slots: function.value_count,
                 operations: Vec::new(),
@@ -88,12 +122,19 @@ impl Code {
             patches: Vec::new(),
         };
         let mut offsets = Vec::new();
-        for block in &function.blocks {
+        for (block_id, block) in function.blocks.iter().enumerate() {
             offsets.push(builder.code.body.len());
+            builder.code.block_offsets.push(builder.code.body.len());
+            builder.operand(Opcode::EnterBlock, block_id)?;
+            let mut instruction_offsets = Vec::new();
             for instruction in &block.instructions {
+                instruction_offsets.push(builder.code.body.len());
+                builder.operand(Opcode::Observe, instruction.result.0)?;
                 builder.operation(&instruction.op, instruction.result)?;
                 builder.slot(Opcode::Store, instruction.result)?;
             }
+            instruction_offsets.push(builder.code.body.len());
+            builder.code.offsets.push(instruction_offsets);
             match block
                 .terminator
                 .as_ref()
@@ -122,6 +163,21 @@ impl Code {
             )?;
         }
         Ok(builder.code)
+    }
+
+    /// Resume before operand loads, with an empty operand stack and restored HIR slots.
+    pub fn resume_offset(&self, point: crate::hir::ResumePoint) -> Result<usize> {
+        self.offsets
+            .get(point.block.0)
+            .and_then(|offsets| offsets.get(point.instruction))
+            .copied()
+            .ok_or(Error::InvalidIr("invalid resume point"))
+    }
+    pub fn block_offset(&self, block: BlockId) -> Result<usize> {
+        self.block_offsets
+            .get(block.0)
+            .copied()
+            .ok_or(Error::InvalidIr("invalid block"))
     }
 
     pub fn bytes(&self) -> &[u8] {

@@ -5,7 +5,12 @@ mod error;
 mod execution;
 pub mod frontend;
 mod heap;
-pub mod ir;
+pub mod hir;
+pub mod lir;
+pub mod profile;
+
+// Compatibility for existing IR-builder users.
+pub use hir as ir;
 mod runtime;
 mod value;
 mod vm;

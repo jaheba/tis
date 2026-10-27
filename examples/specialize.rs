@@ -1,6 +1,6 @@
 use tis::{
     Object, Value, Vm,
-    ir::{Function, Op, Terminator},
+    hir::{Function, Op, Terminator},
 };
 
 fn main() -> tis::Result<()> {

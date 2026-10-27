@@ -2,7 +2,7 @@
 
 use crate::{
     Error, Result,
-    ir::{BlockId, Constant, CoreOp, Edge, Function, Op, Terminator, ValueId},
+    hir::{BlockId, Constant, CoreOp, Edge, Function, Op, Terminator, ValueId},
 };
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +29,7 @@ pub fn compile(source: &str) -> Result<Program> {
         .into_syntax();
     validate_scope(&module.body, &[], false, false)?;
     let mut builder = Builder::new(&module.body, true)?;
+    builder.function.name = "<module>".into();
     let mut block = Some(builder.function.entry());
     for (index, statement) in module.body.iter().enumerate() {
         let Some(current) = block else {
@@ -249,7 +250,8 @@ impl Builder {
                 if !stmt.decorator_list.is_empty() {
                     return Err(Error::Unsupported("function decorators"));
                 }
-                let function = Self::function(&stmt.parameters, &stmt.body)?;
+                let function =
+                    Self::function(&stmt.parameters, &stmt.body)?.with_name(stmt.name.to_string());
                 let (next, defaults) = self.defaults(&stmt.parameters, block)?;
                 block = next;
                 let value = self.runtime(block, CoreOp::Function(Box::new(function)), defaults);
@@ -274,6 +276,7 @@ impl Builder {
                     }
                 }
                 let mut body = Self::new(&stmt.body, false)?;
+                body.function.name = format!("<class {}>", stmt.name);
                 let end = body.statements(&stmt.body, Some(body.function.entry()))?;
                 body.finish(end)?;
                 let value = self.runtime(

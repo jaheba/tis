@@ -3,7 +3,7 @@ mod support;
 
 use tis::{
     Value, Vm,
-    ir::{Constant, Function, Op, Terminator},
+    hir::{Constant, Function, Op, Terminator},
 };
 
 #[test]

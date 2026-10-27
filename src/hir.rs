@@ -1,14 +1,23 @@
+mod analysis;
 mod view;
+pub use analysis::Analysis;
 
-use std::fmt;
+use crate::profile::{self, FunctionId, FunctionProfile};
+use std::{cell::RefCell, fmt, rc::Rc};
 
 use crate::{Result, bytecode::Code};
 
-/// IDs remain stable when execution specializes an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePoint {
+    pub block: BlockId,
+    pub instruction: usize,
+}
+
+/// IDs remain stable when execution specializes an instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId(pub usize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub usize);
 
 #[derive(Debug, Clone)]
@@ -129,6 +138,10 @@ pub enum CoreOp {
 /// A function owns semantic IR, lexical scope metadata and cached bytecode.
 #[derive(Debug, Clone)]
 pub struct Function {
+    id: FunctionId,
+    pub(crate) name: String,
+    revision: u64,
+    pub(crate) profile: Rc<RefCell<FunctionProfile>>,
     pub(crate) blocks: Vec<Block>,
     pub(crate) parameter_names: Vec<String>,
     pub(crate) positional_only: usize,
@@ -140,13 +153,17 @@ pub struct Function {
     pub(crate) nonlocal_names: Vec<String>,
     pub(crate) module: bool,
     pub(crate) value_count: usize,
-    pub(crate) code: Option<Code>,
+    pub(crate) code: Option<Rc<Code>>,
     locations: Vec<Option<(usize, usize)>>,
 }
 
 impl Function {
     pub fn new(parameters: usize) -> Self {
         let mut function = Self {
+            id: profile::function_id(),
+            name: "<anonymous>".into(),
+            revision: profile::revision(),
+            profile: Rc::new(RefCell::new(FunctionProfile::default())),
             blocks: Vec::new(),
             parameter_names: Vec::new(),
             positional_only: 0,
@@ -170,7 +187,7 @@ impl Function {
     }
 
     pub fn block(&mut self, parameters: usize) -> BlockId {
-        self.code = None;
+        self.invalidate();
         let id = BlockId(self.blocks.len());
         let parameters = (0..parameters).map(|_| self.value()).collect();
         self.blocks.push(Block {
@@ -198,7 +215,7 @@ impl Function {
     }
 
     pub fn terminate(&mut self, block: BlockId, terminator: Terminator) {
-        self.code = None;
+        self.invalidate();
         self.blocks[block.0].terminator = Some(terminator);
     }
 
@@ -218,14 +235,65 @@ impl Function {
 
     pub fn bytecode(&mut self) -> Result<&Code> {
         if self.code.is_none() {
-            self.code = Some(Code::lower(self)?);
+            self.code = Some(Rc::new(Code::lower(self)?));
         }
         Ok(self.code.as_ref().unwrap())
     }
 
+    pub fn id(&self) -> FunctionId {
+        self.id
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn profile(&self) -> FunctionProfile {
+        self.profile.borrow().clone()
+    }
+    pub fn analyze(&self) -> Result<Analysis> {
+        analysis::analyze(self)
+    }
+    pub fn lower_lir(&self, mode: crate::lir::LoweringMode) -> Result<crate::lir::Function> {
+        crate::lir::Function::lower(self, mode)
+    }
+    pub(crate) fn snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.profile = Rc::new(RefCell::new(self.profile()));
+        snapshot.code = None;
+        for block in &mut snapshot.blocks {
+            for instruction in &mut block.instructions {
+                if let Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) =
+                    &mut instruction.op
+                {
+                    **body = body.snapshot();
+                }
+            }
+        }
+        snapshot
+    }
+    pub(crate) fn shared_bytecode(&mut self) -> Result<Rc<Code>> {
+        self.bytecode()?;
+        Ok(self.code.as_ref().unwrap().clone())
+    }
+    pub(crate) fn instruction(&self, value: ValueId) -> Option<&Instruction> {
+        let &(block, index) = self.locations.get(value.0)?.as_ref()?;
+        self.blocks.get(block)?.instructions.get(index)
+    }
+    fn invalidate(&mut self) {
+        self.code = None;
+        self.revision = profile::revision();
+        self.profile = Rc::new(RefCell::new(FunctionProfile::default()));
+    }
+
     fn value(&mut self) -> ValueId {
         let id = ValueId(self.value_count);
-        self.code = None;
+        self.invalidate();
         self.value_count += 1;
         self.locations.push(None);
         id

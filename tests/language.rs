@@ -19,6 +19,16 @@ fn game_nbody_full_interpreter_acceptance() {
     let (mut vm, result) = run(include_str!("fixtures/game_nbody.py"));
     result.unwrap();
     assert_eq!(vm.output, "-0.169075164\n-0.169089263\n");
+    let requests = vm.take_compilation_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.hir().name() == "advance"
+                && matches!(request.hotspot, tis::profile::Hotspot::Loop { .. }))
+    );
+    for request in requests {
+        request.lower().unwrap().verify().unwrap();
+    }
     vm.collect_garbage(&[]).unwrap();
     assert!(
         vm.heap.allocation_count() < 300,

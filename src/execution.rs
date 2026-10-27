@@ -2,7 +2,7 @@
 
 use crate::{
     Error, Heap, Key, Object, Result, Value, Vm,
-    ir::{CoreOp, Function},
+    hir::{CoreOp, Function},
     runtime,
 };
 use std::{
@@ -111,6 +111,29 @@ impl Vm {
         env
     }
 
+    pub(crate) fn bound_arguments(
+        &self,
+        function: &Function,
+        env: Value,
+        arguments: &[Value],
+    ) -> Result<Vec<Value>> {
+        if function.parameter_names.is_empty()
+            && function.keyword_only.is_empty()
+            && function.vararg.is_none()
+            && function.kwarg.is_none()
+        {
+            return Ok(arguments.to_vec());
+        }
+        function
+            .parameter_names
+            .iter()
+            .chain(&function.keyword_only)
+            .chain(function.vararg.iter())
+            .chain(function.kwarg.iter())
+            .map(|name| self.lookup(env, name))
+            .collect()
+    }
+
     pub fn get_global(&self, name: &str) -> Result<Value> {
         self.lookup(
             self.globals
@@ -120,6 +143,10 @@ impl Vm {
     }
 
     pub fn function_ir(&self, callable: Value) -> Result<Function> {
+        self.function_hir(callable)
+    }
+
+    pub fn function_hir(&self, callable: Value) -> Result<Function> {
         match self.heap.get(callable)? {
             Object::Function(closure) => Ok(closure.function.borrow().clone()),
             _ => Err(Error::Type("expected Python function")),
@@ -477,6 +504,7 @@ impl Vm {
                 }));
                 self.execute_frame(Rc::new(RefCell::new((**body).clone())), namespace, &[])?;
                 self.heap.allocate(Object::Class {
+                    code: body.id(),
                     name: name.clone(),
                     namespace,
                     bases: values.to_vec(),

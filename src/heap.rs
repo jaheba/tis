@@ -54,6 +54,7 @@ pub enum Object {
     Bound(Value, String),
     Method(Value, Value),
     Class {
+        code: crate::profile::FunctionId,
         name: String,
         namespace: Value,
         bases: Vec<Value>,

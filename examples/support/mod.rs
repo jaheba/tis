@@ -1,4 +1,4 @@
-use tis::ir::{Constant, Edge, Function, Op, Terminator};
+use tis::hir::{Constant, Edge, Function, Op, Terminator};
 
 pub fn addition() -> Function {
     let mut function = Function::new(2);

@@ -1,6 +1,6 @@
 use tis::{
     Error, Heap, Key, Object, Value, Vm,
-    ir::{AddFeedback, AddStrategy, Constant, Edge, Function, Op, Terminator, ValueId},
+    hir::{AddFeedback, AddStrategy, Constant, Edge, Function, Op, Terminator, ValueId},
 };
 
 #[test]

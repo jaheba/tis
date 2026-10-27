@@ -4,7 +4,7 @@ use std::{env, fs, process};
 
 use tis::{Object, Value, Vm};
 
-const HELP: &str = "Usage: cargo run --example ir -- [OPTIONS]\n\n  --demo add|sum                Function to inspect (default: sum)\n  --phase cold|warm|fallback    Feedback to collect (default: warm)\n  --source PATH                Inspect Python source (always cold)\n  --function NAME              Function in source (default: <module>)\n  --format text|dot|html|bytecode        Output format (default: text)\n  --output PATH                Write to a file instead of stdout\n  --help                       Show this help\n\nExample:\n  cargo run --example ir -- --format html --output /tmp/tis-ir.html";
+const HELP: &str = "Usage: cargo run --example ir -- [OPTIONS]\n\n  --demo add|sum                Function to inspect (default: sum)\n  --phase cold|warm|fallback    Feedback to collect (default: warm)\n  --source PATH                Inspect Python source (always cold)\n  --function NAME              Function in source (default: <module>)\n  --format text|dot|html|bytecode|lir|profile        Output format (default: text)\n  --output PATH                Write to a file instead of stdout\n  --help                       Show this help\n\nExample:\n  cargo run --example ir -- --format html --output /tmp/tis-ir.html";
 
 fn main() {
     if let Err(error) = run() {
@@ -93,6 +93,11 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .disassemble()
             .map_err(|error| error.to_string())?,
+        "lir" => function
+            .lower_lir(tis::lir::LoweringMode::Profiled)
+            .map_err(|error| error.to_string())?
+            .dump(),
+        "profile" => function.profile().to_string(),
         "text" => function.dump(),
         "dot" => function.to_dot(),
         "html" => function.to_html(),
