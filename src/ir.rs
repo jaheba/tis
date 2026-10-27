@@ -1,0 +1,288 @@
+mod view;
+
+use std::fmt;
+
+use crate::{Result, bytecode::Code};
+
+/// IDs remain stable when execution specializes an instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockId(pub usize);
+
+#[derive(Debug, Clone)]
+pub enum Constant {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum Op {
+    Constant(Constant),
+    Add(ValueId, ValueId),
+    Subtract(ValueId, ValueId),
+    Less(ValueId, ValueId),
+    List(Vec<ValueId>),
+    Tuple(Vec<ValueId>),
+    Dict(Vec<(ValueId, ValueId)>),
+    GetItem(ValueId, ValueId),
+    SetItem {
+        object: ValueId,
+        key: ValueId,
+        value: ValueId,
+    },
+    Len(ValueId),
+}
+
+#[derive(Debug, Clone)]
+pub struct Edge {
+    pub block: BlockId,
+    pub arguments: Vec<ValueId>,
+}
+
+impl Edge {
+    pub fn new(block: BlockId, arguments: Vec<ValueId>) -> Self {
+        Self { block, arguments }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Terminator {
+    Return(ValueId),
+    Jump(Edge),
+    Branch {
+        condition: ValueId,
+        yes: Edge,
+        no: Edge,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AddStrategy {
+    #[default]
+    Generic,
+    Integer,
+}
+
+/// Observations select a guarded execution strategy; they are not proofs of types.
+#[derive(Debug, Clone, Default)]
+pub struct AddFeedback {
+    pub strategy: AddStrategy,
+    pub executions: u64,
+    pub fast_paths: u64,
+    pub guard_failures: u64,
+    pub(crate) consecutive_integers: u8,
+}
+
+impl AddFeedback {
+    pub const WARMUP: u8 = 8;
+}
+
+#[derive(Debug, Clone)]
+pub struct Instruction {
+    pub result: ValueId,
+    pub op: Op,
+    pub feedback: Option<AddFeedback>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub parameters: Vec<ValueId>,
+    pub instructions: Vec<Instruction>,
+    pub terminator: Option<Terminator>,
+}
+
+/// The executable program for one function. No bytecode is generated.
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) value_count: usize,
+    pub(crate) code: Option<Code>,
+    locations: Vec<Option<(usize, usize)>>,
+}
+
+impl Function {
+    pub fn new(parameters: usize) -> Self {
+        let mut function = Self {
+            blocks: Vec::new(),
+            value_count: 0,
+            code: None,
+            locations: Vec::new(),
+        };
+        function.block(parameters);
+        function
+    }
+
+    pub fn entry(&self) -> BlockId {
+        BlockId(0)
+    }
+
+    pub fn block(&mut self, parameters: usize) -> BlockId {
+        self.code = None;
+        let id = BlockId(self.blocks.len());
+        let parameters = (0..parameters).map(|_| self.value()).collect();
+        self.blocks.push(Block {
+            parameters,
+            instructions: Vec::new(),
+            terminator: None,
+        });
+        id
+    }
+
+    pub fn parameters(&self, block: BlockId) -> &[ValueId] {
+        &self.blocks[block.0].parameters
+    }
+
+    pub fn append(&mut self, block: BlockId, op: Op) -> ValueId {
+        let result = self.value();
+        let feedback = matches!(op, Op::Add(..)).then(AddFeedback::default);
+        self.locations[result.0] = Some((block.0, self.blocks[block.0].instructions.len()));
+        self.blocks[block.0].instructions.push(Instruction {
+            result,
+            op,
+            feedback,
+        });
+        result
+    }
+
+    pub fn terminate(&mut self, block: BlockId, terminator: Terminator) {
+        self.code = None;
+        self.blocks[block.0].terminator = Some(terminator);
+    }
+
+    pub fn feedback(&self, value: ValueId) -> Option<&AddFeedback> {
+        let &(block, instruction) = self.locations.get(value.0)?.as_ref()?;
+        self.blocks[block].instructions[instruction]
+            .feedback
+            .as_ref()
+    }
+
+    pub(crate) fn feedback_mut(&mut self, value: ValueId) -> Option<&mut AddFeedback> {
+        let &(block, instruction) = self.locations.get(value.0)?.as_ref()?;
+        self.blocks[block].instructions[instruction]
+            .feedback
+            .as_mut()
+    }
+
+    pub fn bytecode(&mut self) -> Result<&Code> {
+        if self.code.is_none() {
+            self.code = Some(Code::lower(self)?);
+        }
+        Ok(self.code.as_ref().unwrap())
+    }
+
+    fn value(&mut self) -> ValueId {
+        let id = ValueId(self.value_count);
+        self.code = None;
+        self.value_count += 1;
+        self.locations.push(None);
+        id
+    }
+}
+
+impl fmt::Display for Function {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, block) in self.blocks.iter().enumerate() {
+            write!(f, "b{index}(")?;
+            operands(f, &block.parameters)?;
+            writeln!(f, "):")?;
+            for instruction in &block.instructions {
+                writeln!(f, "    {instruction}")?;
+            }
+            write!(f, "    ")?;
+            match &block.terminator {
+                Some(terminator) => writeln!(f, "{terminator}")?,
+                None => writeln!(f, "<unterminated>")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Instruction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "%{} = ", self.result.0)?;
+        if let Op::Add(lhs, rhs) = self.op {
+            let name = match self.feedback.as_ref().map(|feedback| feedback.strategy) {
+                Some(AddStrategy::Integer) => "add.int [fallback=add]",
+                _ => "add",
+            };
+            write!(f, "{name} %{}, %{}", lhs.0, rhs.0)
+        } else {
+            write!(f, "{}", self.op)
+        }
+    }
+}
+
+impl fmt::Display for Terminator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Return(value) => write!(f, "return %{}", value.0),
+            Self::Jump(edge) => write!(f, "jump {edge}"),
+            Self::Branch { condition, yes, no } => {
+                write!(f, "branch %{}, {yes}, {no}", condition.0)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Edge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "b{}(", self.block.0)?;
+        operands(f, &self.arguments)?;
+        write!(f, ")")
+    }
+}
+
+impl fmt::Display for Op {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Constant(value) => write!(f, "const {value:?}"),
+            Self::Add(lhs, rhs) => write!(f, "add %{}, %{}", lhs.0, rhs.0),
+            Self::Subtract(lhs, rhs) => write!(f, "subtract %{}, %{}", lhs.0, rhs.0),
+            Self::Less(lhs, rhs) => write!(f, "less %{}, %{}", lhs.0, rhs.0),
+            Self::List(values) | Self::Tuple(values) => {
+                write!(
+                    f,
+                    "{}(",
+                    if matches!(self, Self::List(_)) {
+                        "list"
+                    } else {
+                        "tuple"
+                    }
+                )?;
+                operands(f, values)?;
+                write!(f, ")")
+            }
+            Self::Dict(entries) => {
+                write!(f, "dict(")?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "%{}: %{}", key.0, value.0)?;
+                }
+                write!(f, ")")
+            }
+            Self::GetItem(object, key) => write!(f, "getitem %{}, %{}", object.0, key.0),
+            Self::SetItem { object, key, value } => {
+                write!(f, "setitem %{}, %{}, %{}", object.0, key.0, value.0)
+            }
+            Self::Len(object) => write!(f, "len %{}", object.0),
+        }
+    }
+}
+
+fn operands(f: &mut fmt::Formatter<'_>, values: &[ValueId]) -> fmt::Result {
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "%{}", value.0)?;
+    }
+    Ok(())
+}

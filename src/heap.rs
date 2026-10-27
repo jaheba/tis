@@ -1,0 +1,278 @@
+use std::{
+    cell::{Cell, RefCell},
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use crate::{Error, ObjectId, Result, Value};
+
+// These two modules are copied from Monty; the exception does not cover tis heap code.
+#[allow(unsafe_code, dead_code)]
+#[rustfmt::skip]
+mod free_list;
+#[allow(unsafe_code, dead_code)]
+#[rustfmt::skip]
+mod stable_heap;
+
+use stable_heap::StableHeap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct HeapId(usize);
+
+impl HeapId {
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
+static NEXT_HEAP: AtomicUsize = AtomicUsize::new(1);
+
+/// Dictionary keys are owned, so string keys do not depend on another object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    None,
+    Int(i64),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Object {
+    String(String),
+    List(Vec<Value>),
+    Tuple(Vec<Value>),
+    Dict(Vec<(Key, Value)>),
+}
+
+#[derive(Debug)]
+struct Entry {
+    object: Object,
+}
+
+/// Monty's stable paged arena, with generation-checked handles and explicit-root collection.
+#[derive(Debug)]
+pub struct Heap {
+    identity: usize,
+    entries: StableHeap<Entry>,
+    generations: RefCell<Vec<Option<usize>>>,
+    next_generation: Cell<usize>,
+}
+
+impl Heap {
+    pub fn new() -> Self {
+        Self {
+            identity: NEXT_HEAP.fetch_add(1, Ordering::Relaxed),
+            entries: StableHeap::with_capacity(16),
+            generations: RefCell::new(Vec::new()),
+            next_generation: Cell::new(1),
+        }
+    }
+
+    /// Stable pages permit allocation while another object's shared reference is alive.
+    pub fn allocate(&self, object: Object) -> Value {
+        let generation = self.next_generation.get();
+        self.next_generation.set(
+            generation
+                .checked_add(1)
+                .expect("heap generation exhausted"),
+        );
+        let id = self.entries.allocate(Entry { object });
+        let mut generations = self.generations.borrow_mut();
+        if id.index() == generations.len() {
+            generations.push(Some(generation));
+        } else {
+            generations[id.index()] = Some(generation);
+        }
+        Value::Ref(ObjectId {
+            heap: self.identity,
+            index: id.index(),
+            generation,
+        })
+    }
+
+    pub fn get(&self, value: Value) -> Result<&Object> {
+        let id = self.checked_id(value)?;
+        Ok(&self.entries.get(id).object)
+    }
+
+    pub fn get_mut(&mut self, value: Value) -> Result<impl DerefMut<Target = Object> + '_> {
+        let id = self.checked_id(value)?;
+        Ok(ObjectMut(
+            self.entries.entry(id).ok_or(Error::InvalidObject)?,
+        ))
+    }
+
+    pub fn key(&self, value: Value) -> Result<Key> {
+        match value {
+            Value::None => Ok(Key::None),
+            Value::Bool(value) => Ok(Key::Int(i64::from(value))),
+            Value::Int(value) => Ok(Key::Int(value)),
+            Value::Ref(_) => match self.get(value)? {
+                Object::String(value) => Ok(Key::String(value.clone())),
+                _ => Err(Error::Type("unhashable key")),
+            },
+            Value::Float(_) => Err(Error::Unsupported("float dictionary keys")),
+        }
+    }
+
+    pub fn len(&self, value: Value) -> Result<usize> {
+        Ok(match self.get(value)? {
+            Object::String(value) => value.chars().count(),
+            Object::List(value) | Object::Tuple(value) => value.len(),
+            Object::Dict(value) => value.len(),
+        })
+    }
+
+    pub fn get_item(&self, object: Value, key: Value) -> Result<Value> {
+        match self.get(object)? {
+            Object::List(items) | Object::Tuple(items) => Ok(items[index(key, items.len())?]),
+            Object::String(text) => {
+                let position = index(key, text.chars().count())?;
+                let character = text.chars().nth(position).ok_or(Error::Index)?;
+                Ok(self.allocate(Object::String(character.to_string())))
+            }
+            Object::Dict(items) => {
+                let key = self.key(key)?;
+                items
+                    .iter()
+                    .find(|(candidate, _)| *candidate == key)
+                    .map(|(_, value)| *value)
+                    .ok_or(Error::MissingKey)
+            }
+        }
+    }
+
+    pub fn set_item(&mut self, object: Value, key: Value, value: Value) -> Result<()> {
+        if matches!(value, Value::Ref(_)) {
+            self.checked_id(value)?;
+        }
+        let dict_key = if matches!(self.get(object)?, Object::Dict(_)) {
+            Some(self.key(key)?)
+        } else {
+            None
+        };
+        match &mut *self.get_mut(object)? {
+            Object::List(items) => {
+                let index = index(key, items.len())?;
+                items[index] = value;
+                Ok(())
+            }
+            Object::Dict(items) => {
+                let key = dict_key.expect("dictionary key resolved before mutation");
+                if let Some((_, previous)) =
+                    items.iter_mut().find(|(candidate, _)| *candidate == key)
+                {
+                    *previous = value;
+                } else {
+                    items.push((key, value));
+                }
+                Ok(())
+            }
+            _ => Err(Error::Type("object does not support item assignment")),
+        }
+    }
+
+    /// All external values that must survive collection must be listed as roots.
+    /// Marking completes before freeing anything, so invalid roots leave the heap unchanged.
+    pub fn collect(&mut self, roots: &[Value]) -> Result<usize> {
+        let mut marked = vec![false; self.entries.len()];
+        let mut pending = roots.to_vec();
+        while let Some(value) = pending.pop() {
+            if !matches!(value, Value::Ref(_)) {
+                continue;
+            }
+            let id = self.checked_id(value)?;
+            if std::mem::replace(&mut marked[id.index()], true) {
+                continue;
+            }
+            match &self.entries.get(id).object {
+                Object::List(items) | Object::Tuple(items) => pending.extend(items.iter().copied()),
+                Object::Dict(items) => pending.extend(items.iter().map(|(_, value)| *value)),
+                Object::String(_) => {}
+            }
+        }
+        let garbage = self
+            .generations
+            .get_mut()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, generation)| {
+                (generation.is_some() && !marked[index]).then_some(HeapId::from_index(index))
+            })
+            .collect::<Vec<_>>();
+        for &id in &garbage {
+            self.entries
+                .entry(id)
+                .expect("live generation has an entry")
+                .free();
+            self.generations.get_mut()[id.index()] = None;
+        }
+        Ok(garbage.len())
+    }
+
+    pub fn allocation_count(&self) -> usize {
+        self.generations
+            .borrow()
+            .iter()
+            .filter(|generation| generation.is_some())
+            .count()
+    }
+    pub fn slot_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn checked_id(&self, value: Value) -> Result<HeapId> {
+        let Value::Ref(id) = value else {
+            return Err(Error::Type("expected an object"));
+        };
+        if id.heap != self.identity
+            || self.generations.borrow().get(id.index).copied().flatten() != Some(id.generation)
+        {
+            return Err(Error::InvalidObject);
+        }
+        Ok(HeapId::from_index(id.index))
+    }
+}
+
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ObjectMut<G>(G);
+
+impl<G: Deref<Target = Entry>> Deref for ObjectMut<G> {
+    type Target = Object;
+    fn deref(&self) -> &Self::Target {
+        &self.0.object
+    }
+}
+
+impl<G: DerefMut<Target = Entry>> DerefMut for ObjectMut<G> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.object
+    }
+}
+
+fn index(value: Value, len: usize) -> Result<usize> {
+    let value = match value {
+        Value::Int(value) => value,
+        Value::Bool(value) => i64::from(value),
+        _ => return Err(Error::Type("index must be an integer")),
+    };
+    let index = if value < 0 {
+        i64::try_from(len)
+            .map_err(|_| Error::Index)?
+            .checked_add(value)
+            .ok_or(Error::Index)?
+    } else {
+        value
+    };
+    usize::try_from(index)
+        .ok()
+        .filter(|&index| index < len)
+        .ok_or(Error::Index)
+}

@@ -1,0 +1,11 @@
+/target
+
+# Benchmark results keep reports and reproduction code; raw evidence belongs in the external cache.
+/benchmarks/results/**
+!/benchmarks/results/*/
+!/benchmarks/results/*.md
+!/benchmarks/results/*/*.md
+!/benchmarks/results/*/*.py
+!/benchmarks/results/*/*.js
+!/benchmarks/results/*/inspect.rs
+!/benchmarks/results/*/tis-harness-adapter.patch
