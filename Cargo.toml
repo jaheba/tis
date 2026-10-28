@@ -13,6 +13,11 @@ cranelift-codegen = "=0.137.0"
 cranelift-frontend = "=0.137.0"
 cranelift-module = "=0.137.0"
 cranelift-jit = "=0.137.0"
+memmap2 = "=0.9.12"
+wasmtime-internal-jit-icache-coherence = "=50.0.0"
+
+[build-dependencies]
+object = { version = "=0.39.1", default-features = false, features = ["read", "std"] }
 
 [workspace]
 

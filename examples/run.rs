@@ -19,7 +19,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Some("bytecode") => Tiering::Bytecode,
                     Some("lir") => Tiering::Lir,
                     Some("native") => Tiering::Native,
-                    _ => return Err("--tier requires bytecode, lir or native".into()),
+                    Some("copy-patch") => Tiering::CopyPatch,
+                    _ => return Err("--tier requires bytecode, lir, native or copy-patch".into()),
                 }
             }
             "--stats" => stats = true,
@@ -28,7 +29,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let path = path.ok_or(
-        "usage: cargo run --example run -- [--tier bytecode|lir|native] [--stats] FILE.py",
+        "usage: cargo run --example run -- [--tier bytecode|lir|native|copy-patch] [--stats] FILE.py",
     )?;
     let source = fs::read_to_string(path)?;
     let mut program = compile(&source)?;

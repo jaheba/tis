@@ -80,40 +80,7 @@ pub enum Helper {
     Len,
     Python(CoreOp),
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FloatOperator {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Power,
-}
-impl FloatOperator {
-    pub(crate) fn evaluate(self, left: f64, right: f64) -> Option<f64> {
-        Some(match self {
-            Self::Add => left + right,
-            Self::Subtract => left - right,
-            Self::Multiply => left * right,
-            Self::Divide => {
-                if right == 0.0 {
-                    return None;
-                }
-                left / right
-            }
-            Self::Power => {
-                if left == 0.0 && right < 0.0 {
-                    return None;
-                }
-                let result = left.powf(right);
-                if result.is_nan() {
-                    return None;
-                }
-                result
-            }
-        })
-    }
-}
-
+pub use crate::scalar::FloatOperator;
 #[derive(Debug, Clone)]
 pub enum Operation {
     Constant(Constant),

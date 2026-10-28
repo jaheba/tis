@@ -984,10 +984,13 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
+ "memmap2",
+ "object",
  "ruff_python_ast",
  "ruff_python_parser",
  "serde",
  "stacker",
+ "wasmtime-internal-jit-icache-coherence",
 ]
 
 [[package]]

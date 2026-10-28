@@ -11,6 +11,10 @@ pub struct Vm {
     pub heap: Heap,
     pub(crate) stack: Vec<Option<Value>>,
     pub tiering: crate::Tiering,
+    pub(crate) copy_artifacts: std::collections::BTreeMap<
+        (crate::profile::FunctionId, u64),
+        Rc<crate::copy_patch::CopyCode>,
+    >,
     pub(crate) native_artifacts: std::collections::BTreeMap<
         (crate::profile::FunctionId, u64),
         Rc<crate::native::NativeCode>,

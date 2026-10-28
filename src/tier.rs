@@ -15,10 +15,20 @@ pub enum Tiering {
     Bytecode,
     Lir,
     Native,
+    CopyPatch,
 }
 #[derive(Debug, Clone, Default)]
 pub struct TierStats {
     pub lowered: u64,
+    pub copy_patch_entries: u64,
+    pub copy_patch_osr_entries: u64,
+    pub copy_patch_compilations: u64,
+    pub copy_patch_code_bytes: u64,
+    pub copy_patch_data_bytes: u64,
+    pub copy_patch_stencils: u64,
+    pub copy_patch_relocations: u64,
+    pub native_compile_ns: u64,
+    pub copy_patch_compile_ns: u64,
     pub compilation_errors: u64,
     pub lir_entries: u64,
     pub native_entries: u64,
@@ -101,6 +111,7 @@ impl Vm {
             }
         }
 
+        self.copy_artifacts.remove(&(lir.source, lir.revision));
         self.native_artifacts.remove(&(lir.source, lir.revision));
         self.retired_versions.remove(&(lir.source, lir.revision));
         self.artifacts
@@ -217,15 +228,11 @@ impl Vm {
                             read(&registers, *left)?.float()?,
                             read(&registers, *right)?.float()?,
                         );
-                        Some(Datum::Bool(match operator.as_str() {
-                            "==" => left == right,
-                            "!=" => left != right,
-                            "<" => left < right,
-                            "<=" => left <= right,
-                            ">" => left > right,
-                            ">=" => left >= right,
-                            _ => return Err(Error::InvalidIr("float comparison")),
-                        }))
+                        Some(Datum::Bool(
+                            crate::scalar::FloatCondition::from_symbol(operator)
+                                .ok_or(Error::InvalidIr("float comparison"))?
+                                .evaluate(left, right),
+                        ))
                     }
                     Operation::BoxFloat(value) => Some(Datum::Boxed(Value::Float(
                         read(&registers, *value)?.float()?,
@@ -416,6 +423,7 @@ impl Vm {
         if self.artifacts.remove(&(hir.id(), hir.revision())).is_some() {
             self.tier_stats.retired = self.tier_stats.retired.saturating_add(1);
         }
+        self.copy_artifacts.remove(&(hir.id(), hir.revision()));
         self.native_artifacts.remove(&(hir.id(), hir.revision()));
         self.retired_versions.insert((hir.id(), hir.revision()));
         self.tier_stats.deoptimizations = self.tier_stats.deoptimizations.saturating_add(1);
@@ -470,12 +478,66 @@ impl Vm {
         start: BlockId,
         osr: bool,
     ) -> Result<Outcome> {
-        if self.tiering == Tiering::Native {
+        if self.tiering == Tiering::CopyPatch {
+            let key = (lir.source, lir.revision);
+            let compiled = if let Some(compiled) = self.copy_artifacts.get(&key) {
+                compiled.clone()
+            } else {
+                let start = std::time::Instant::now();
+                let result = crate::copy_patch::CopyCode::compile(lir.clone());
+                self.tier_stats.copy_patch_compile_ns = self
+                    .tier_stats
+                    .copy_patch_compile_ns
+                    .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                let compiled = match result {
+                    Ok(compiled) => Rc::new(compiled),
+                    Err(error) => {
+                        self.tier_stats.compilation_errors =
+                            self.tier_stats.compilation_errors.saturating_add(1);
+                        return Err(error);
+                    }
+                };
+                self.tier_stats.copy_patch_compilations =
+                    self.tier_stats.copy_patch_compilations.saturating_add(1);
+                self.tier_stats.copy_patch_code_bytes = self
+                    .tier_stats
+                    .copy_patch_code_bytes
+                    .saturating_add(compiled.code_bytes as u64);
+                self.tier_stats.copy_patch_data_bytes = self
+                    .tier_stats
+                    .copy_patch_data_bytes
+                    .saturating_add(compiled.data_bytes as u64);
+                self.tier_stats.copy_patch_stencils = self
+                    .tier_stats
+                    .copy_patch_stencils
+                    .saturating_add(compiled.stencils as u64);
+                self.tier_stats.copy_patch_relocations = self
+                    .tier_stats
+                    .copy_patch_relocations
+                    .saturating_add(compiled.relocations as u64);
+                self.copy_artifacts.insert(key, compiled.clone());
+                compiled
+            };
+            if osr {
+                self.tier_stats.copy_patch_osr_entries =
+                    self.tier_stats.copy_patch_osr_entries.saturating_add(1);
+            } else {
+                self.tier_stats.copy_patch_entries =
+                    self.tier_stats.copy_patch_entries.saturating_add(1);
+            }
+            compiled.execute(self, function, code, base, frame_end, start.0, osr)
+        } else if self.tiering == Tiering::Native {
             let key = (lir.source, lir.revision);
             let native = if let Some(native) = self.native_artifacts.get(&key) {
                 native.clone()
             } else {
-                let native = match crate::native::NativeCode::compile(lir.clone()) {
+                let start = std::time::Instant::now();
+                let result = crate::native::NativeCode::compile(lir.clone());
+                self.tier_stats.native_compile_ns = self
+                    .tier_stats
+                    .native_compile_ns
+                    .saturating_add(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                let native = match result {
                     Ok(native) => Rc::new(native),
                     Err(error) => {
                         self.tier_stats.compilation_errors =

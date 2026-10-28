@@ -8,6 +8,8 @@ Keep object operations independent of frames and stack placement.
 Do not introduce Monty compatibility, stdlib, sandbox or binding infrastructure unless requested.
 Unsafe Rust is permitted. Keep native execution boundaries small and document pointer, ABI and lifetime invariants.
 Preserve the safety invariants of the copied Monty storage modules.
+Copy-and-patch stencils compile as a separate build-time Rust crate; preserve relocation and tail-continuation checks.
+Run `rustfmt --edition 2024 src/copy_patch/stencils.rs` when editing that source.
 Do not commit unless explicitly asked.
 
 Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` after Rust changes.

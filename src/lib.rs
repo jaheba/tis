@@ -11,8 +11,12 @@ pub mod profile;
 
 // Compatibility for existing IR-builder users.
 pub use hir as ir;
+mod copy_patch;
 mod native;
+mod native_abi;
+mod native_runtime;
 mod runtime;
+mod scalar;
 mod tier;
 mod value;
 mod vm;

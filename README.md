@@ -2,7 +2,7 @@
 
 A Rust interpreter for a Python subset, built around an explicit value IR.
 Ruff AST → HIR → stack bytecode → interpreter.
-Runtime profiles feed HIR → typed LIR → reference execution or Cranelift native code.
+Runtime profiles feed HIR → typed LIR → reference execution, Cranelift, or copy-and-patch native code.
 There is no stdlib or sandbox infrastructure.
 
 ```sh
@@ -14,6 +14,7 @@ cargo run --example run -- tests/fixtures/language.py
 
 # Hot loops switch into native code; --stats reports tier entries, exits and emitted bytes.
 cargo run --example run -- --tier native --stats tests/fixtures/game_nbody.py
+cargo run --example run -- --tier copy-patch --stats tests/fixtures/game_nbody.py
 ```
 
 `game_nbody.py` is the unchanged Flying Circus workload, including its full 20,000 iterations.
@@ -102,7 +103,7 @@ for request in vm.take_compilation_requests() {
 
 `hir::Function::lower_lir(LoweringMode::Generic | LoweringMode::Profiled)` lowers HIR directly.
 `ir` remains an alias for `hir` for existing Rust callers.
-Bytecode is the default tier; set `vm.tiering = Tiering::Lir` or `Tiering::Native` to enable tiering.
+Bytecode is the default tier; set `vm.tiering = Tiering::Lir`, `Tiering::Native` or `Tiering::CopyPatch` to enable tiering.
 LIR is lowered from HIR, never reconstructed from bytecode.
 Immutable bytecode buffers are shared across calls.
 
@@ -134,12 +135,54 @@ Python operations call shared Rust helpers with the current environment and live
 The native register buffer has a fixed C layout, independent of Rust's `Value` enum layout.
 Runtime callback panics are caught before they can unwind through generated code.
 An executable module is owned until its last active native frame returns, including recursive retirement.
-The implementation is in `src/native.rs`; it follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
+The Cranelift emitter is in `src/native.rs`; both native backends use `src/native_runtime.rs` and the same C-layout slots.
+The Cranelift emitter follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
 
 This is a correctness baseline: boxed results still invoke profiling callbacks, and registers are materialized in memory.
 LIR helper effects remain conservative; there is no inlining, escape analysis or automatic reoptimization yet.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
 `vm.tier_stats` exposes reference/native entries, OSR entries, compilation errors, deoptimizations and cumulative emitted bytes.
+
+## Copy-and-patch experiment
+
+```sh
+cargo run --example run -- --tier copy-patch --stats tests/fixtures/game_nbody.py
+cargo run --release --example backend_compare
+```
+
+`build.rs` invokes rustc once per target build to compile `src/copy_patch/stencils.rs` at optimization level 3.
+It extracts 21 self-contained function bodies from the object file into the executable's stencil library.
+The build rejects external relocations and indirect non-tail continuations.
+The shared scalar module supplies float arithmetic and comparison semantics; Python helpers, GC and side exits
+use the same runtime bridge as Cranelift.
+
+At runtime the linker copies the selected machine-code bodies into an anonymous writable image.
+It patches adjacent records containing operand offsets, constants, helper addresses, and code/data continuations.
+The image becomes read/execute, instruction caches are flushed, and entries are published only afterward.
+Linking calls neither rustc nor Cranelift.
+The copied C-ABI stencils tail-call their continuations; branch targets and loop entries select another stencil.
+Parallel block arguments use scratch slots before any destination is overwritten.
+An active execution owns its image, so retirement during a recursive call cannot unmap active code.
+
+This first version patches data records rather than embedding every operand as an instruction immediate.
+It uses memory-backed registers and indirect continuations, without cross-stencil register allocation or fusion.
+Supported stencil targets are AArch64 and x86-64; execution is currently tested on macOS ARM64.
+The long-loop test uses a small thread stack to check that continuations do not accumulate native frames.
+
+The comparison example warms the same floating-point kernel, discards three compilation samples, then reports
+20-sample median backend compilation time, image sizes, and a separate 10,000-call execution measurement.
+Backend timing excludes common HIR-to-LIR lowering and the first execution.
+A release run on macOS ARM64 with Rust 1.99.0 produced:
+
+| Backend | Median compilation | Code bytes | Explicit patch records |
+| --- | ---: | ---: | ---: |
+| Current Cranelift backend | 446.6 µs | 948 | — |
+| Copy-and-patch | 10.2 µs | 2,092 | 3,720 bytes |
+
+These are small-kernel measurements with the current backend settings, not `game_nbody` timings or total resident sizes.
+The copied image trades more code/data for cheaper compilation; the tool reports execution time independently.
+`TierStats` separates copy-and-patch entries, OSR, compilation time, copied bytes, stencil count and continuation relocations.
+Cranelift compilation counters remain zero in copy-and-patch-only runs.
 
 ## Heap and frames
 
@@ -177,5 +220,5 @@ cargo test
 node tests/viewer.mjs /tmp/tis-ir.html
 ```
 
-The full n-body acceptance test runs in bytecode, reference LIR and native modes with `cargo test`.
+The full n-body acceptance test runs in bytecode, reference LIR, Cranelift and copy-and-patch modes with `cargo test`.
 The Node check exercises viewer logic with a minimal DOM model; it does not verify browser layout.
