@@ -11,9 +11,12 @@ pub mod profile;
 
 // Compatibility for existing IR-builder users.
 pub use hir as ir;
+mod native;
 mod runtime;
+mod tier;
 mod value;
 mod vm;
+pub use tier::{TierStats, Tiering};
 
 pub use error::{Error, Result};
 pub use frontend::{Program, compile};

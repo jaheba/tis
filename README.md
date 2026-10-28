@@ -2,8 +2,8 @@
 
 A Rust interpreter for a Python subset, built around an explicit value IR.
 Ruff AST → HIR → stack bytecode → interpreter.
-Runtime profiles feed a separate HIR → typed LIR path for a future native backend.
-There is no JIT, stdlib or sandbox infrastructure.
+Runtime profiles feed HIR → typed LIR → reference execution or Cranelift native code.
+There is no stdlib or sandbox infrastructure.
 
 ```sh
 cargo run --example run -- tests/fixtures/game_nbody.py
@@ -11,6 +11,9 @@ cargo run --example run -- tests/fixtures/game_nbody.py
 # -0.169089263
 cargo run --example run -- tests/fixtures/language.py
 # language core ok
+
+# Hot loops switch into native code; --stats reports tier entries, exits and emitted bytes.
+cargo run --example run -- --tier native --stats tests/fixtures/game_nbody.py
 ```
 
 `game_nbody.py` is the unchanged Flying Circus workload, including its full 20,000 iterations.
@@ -99,39 +102,61 @@ for request in vm.take_compilation_requests() {
 
 `hir::Function::lower_lir(LoweringMode::Generic | LoweringMode::Profiled)` lowers HIR directly.
 `ir` remains an alias for `hir` for existing Rust callers.
-The bytecode interpreter remains the execution path; LIR is not read back from bytecode.
+Bytecode is the default tier; set `vm.tiering = Tiering::Lir` or `Tiering::Native` to enable tiering.
+LIR is lowered from HIR, never reconstructed from bytecode.
 Immutable bytecode buffers are shared across calls.
 
-LIR has boxed, integer and boolean registers, explicit block arguments, runtime-helper calls and truth conversion.
+LIR has boxed, integer, float and boolean registers, explicit block arguments, runtime-helper calls and truth conversion.
 String construction and generic Python operations have safepoints, boxed root maps and conservative effect metadata.
 Monomorphic integer addition sites lower to tag guards, integer unboxing, checked addition and boxing.
-Observed types are hints: both type failure and overflow have explicit side exits.
+Stable float and mixed integer/float arithmetic lower to exact tag guards, conversion and typed operations.
+Float comparisons specialize only when both operands are floats, preserving exact mixed integer/float comparisons.
+Observed types are hints: type changes, integer overflow, division by zero and invalid power domains have explicit side exits.
 HIR and LIR verification check definitions, dominance and edge arguments; LIR also checks types, guards and root maps.
 
 A side exit stores the live HIR slots and current lexical environment needed to resume before the original operation.
 `lir.reconstruct(...)` materializes a `DeoptFrame` from boxed register locations.
 `Vm::resume_hir(...)` checks its code revision and continues bytecode execution at that boundary.
 Tests exercise type changes and integer overflow after an earlier mutation, verifying that the mutation is not repeated.
-Natural loop headers carry OSR entry state, but native OSR transitions are not implemented.
+A hot loop can enter LIR or native execution at its header during the first invocation (OSR).
+Edge arguments transfer in parallel in all three tiers.
 
-There is no machine-code emitter, register allocator, executable-memory manager or native calling convention yet.
-The native backend will need to implement the helper-call contract, register root locations and entry/exit stubs.
-LIR helper effects are deliberately conservative; this stage performs no inlining or escape analysis.
+The reference LIR backend executes the same guards and runtime-helper contract as native code.
+Hotspot thresholds automatically install an artifact and subsequent calls select it by HIR ID and revision.
+A failed guard retires the artifact and resumes bytecode before the original operation, without repeating earlier effects.
+Automatic retry of a retired artifact is disabled; `vm.compile_lir(&hir)` explicitly rebuilds it from current observations.
+`vm.install_lir(&hir, lir)` validates a manually lowered artifact before installation.
+Stale HIR revisions never select an older artifact.
+
+The native backend uses Cranelift for code generation, register allocation, linking and executable memory.
+It emits primitive arithmetic, tag guards, comparisons, branches, parallel edge transfers and returns.
+Python operations call shared Rust helpers with the current environment and live boxed roots.
+The native register buffer has a fixed C layout, independent of Rust's `Value` enum layout.
+Runtime callback panics are caught before they can unwind through generated code.
+An executable module is owned until its last active native frame returns, including recursive retirement.
+The implementation is in `src/native.rs`; it follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
+
+This is a correctness baseline: boxed results still invoke profiling callbacks, and registers are materialized in memory.
+LIR helper effects remain conservative; there is no inlining, escape analysis or automatic reoptimization yet.
+Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
+`vm.tier_stats` exposes reference/native entries, OSR entries, compilation errors, deoptimizations and cumulative emitted bytes.
 
 ## Heap and frames
 
 Monty's stable paged arena and free list are copied unchanged into `src/heap/`, with their license.
-Only those two modules may contain unsafe Rust.
+Native execution also uses unsafe Rust at the documented ABI and executable-memory boundary.
 The tis object layer uses generation-checked handles and tracing collection, including cycles and slot reuse.
 Monty's reference counting and HeapReader API are not part of this port.
 
-Collection runs between bytecode instructions, with stack slots, active environments, in-flight calls and module globals rooted.
+Collection runs between bytecode instructions and at LIR/native runtime boundaries.
+Stack slots, active environments, in-flight calls and module globals are rooted; LIR/native safepoints use their live root maps.
 Host-held handles can be retained with `Vm::pin` and released with `Vm::unpin`.
 `Vm::collect_garbage(&roots)` also accepts temporary external roots.
 Direct `Heap` use has explicit collection only.
 
 Calls currently use Rust recursion with stack growth and a 256-frame language limit.
 Both return and error release the VM frame window and active environment roots.
+Iterator and representation recursion have bounded depth and stack growth; class hierarchy lookup is iterative.
 
 ## Current limits
 
@@ -152,5 +177,5 @@ cargo test
 node tests/viewer.mjs /tmp/tis-ir.html
 ```
 
-The full n-body acceptance test runs with `cargo test`.
+The full n-body acceptance test runs in bytecode, reference LIR and native modes with `cargo test`.
 The Node check exercises viewer logic with a minimal DOM model; it does not verify browser layout.

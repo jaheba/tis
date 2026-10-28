@@ -22,6 +22,7 @@ pub struct Register(pub usize);
 pub enum Type {
     Boxed,
     I64,
+    F64,
     Bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub struct FrameState {
 pub enum ExitReason {
     TypeGuard,
     IntegerOverflow,
+    FloatArithmetic,
 }
 #[derive(Debug, Clone)]
 pub struct SideExit {
@@ -78,6 +80,40 @@ pub enum Helper {
     Len,
     Python(CoreOp),
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Power,
+}
+impl FloatOperator {
+    pub(crate) fn evaluate(self, left: f64, right: f64) -> Option<f64> {
+        Some(match self {
+            Self::Add => left + right,
+            Self::Subtract => left - right,
+            Self::Multiply => left * right,
+            Self::Divide => {
+                if right == 0.0 {
+                    return None;
+                }
+                left / right
+            }
+            Self::Power => {
+                if left == 0.0 && right < 0.0 {
+                    return None;
+                }
+                let result = left.powf(right);
+                if result.is_nan() {
+                    return None;
+                }
+                result
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Operation {
     Constant(Constant),
@@ -91,6 +127,25 @@ pub enum Operation {
         value: Register,
         exit: ExitId,
     },
+    GuardFloat {
+        value: Register,
+        exit: ExitId,
+    },
+    UnboxFloat(Register),
+    IntToFloat(Register),
+    FloatBinary {
+        operator: FloatOperator,
+        left: Register,
+        right: Register,
+        failure: ExitId,
+    },
+    FloatCompare {
+        operator: String,
+        left: Register,
+        right: Register,
+    },
+    BoxFloat(Register),
+    BoxBool(Register),
     UnboxInt(Register),
     CheckedAdd {
         left: Register,
@@ -200,7 +255,115 @@ impl Function {
                                 .iter()
                                 .all(|operand| operand.monomorphic() == Some(ValueKind::Int))
                     });
-                if integer_add {
+                let float_signature = profile
+                    .site(origin)
+                    .filter(|site| {
+                        mode == LoweringMode::Profiled
+                            && site.executions >= hir::AddFeedback::WARMUP as u64
+                            && site.operands.len() == 2
+                    })
+                    .and_then(|site| {
+                        let left = site.operands[0].monomorphic()?;
+                        let right = site.operands[1].monomorphic()?;
+                        if [left, right]
+                            .iter()
+                            .all(|kind| matches!(kind, ValueKind::Int | ValueKind::Float))
+                            && [left, right].contains(&ValueKind::Float)
+                        {
+                            Some([left, right])
+                        } else {
+                            None
+                        }
+                    });
+                let float_operator = match &instruction.op {
+                    hir::Op::Add(..) => Some(FloatOperator::Add),
+                    hir::Op::Subtract(..) => Some(FloatOperator::Subtract),
+                    hir::Op::Runtime(CoreOp::Binary(op) | CoreOp::Inplace(op), _) => {
+                        match op.as_str() {
+                            "+" => Some(FloatOperator::Add),
+                            "-" => Some(FloatOperator::Subtract),
+                            "*" => Some(FloatOperator::Multiply),
+                            "/" => Some(FloatOperator::Divide),
+                            "**" => Some(FloatOperator::Power),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let float_compare = match &instruction.op {
+                    hir::Op::Runtime(CoreOp::Compare(op), _)
+                        if ["==", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) =>
+                    {
+                        Some(op.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(signature) = float_signature
+                    && (float_operator.is_some()
+                        || (float_compare.is_some()
+                            && signature == [ValueKind::Float, ValueKind::Float]))
+                {
+                    let guard = output.exit(state, ExitReason::TypeGuard);
+                    let inputs = instruction.op.inputs();
+                    let mut args = vec![];
+                    for (input, kind) in inputs.into_iter().zip(signature) {
+                        let input = Register(input.0);
+                        if kind == ValueKind::Float {
+                            emit(
+                                &mut instructions,
+                                None,
+                                Operation::GuardFloat {
+                                    value: input,
+                                    exit: guard,
+                                },
+                            );
+                            let reg = output.register(Type::F64);
+                            emit(&mut instructions, Some(reg), Operation::UnboxFloat(input));
+                            args.push(reg);
+                        } else {
+                            emit(
+                                &mut instructions,
+                                None,
+                                Operation::GuardInt {
+                                    value: input,
+                                    exit: guard,
+                                },
+                            );
+                            let int = output.register(Type::I64);
+                            emit(&mut instructions, Some(int), Operation::UnboxInt(input));
+                            let reg = output.register(Type::F64);
+                            emit(&mut instructions, Some(reg), Operation::IntToFloat(int));
+                            args.push(reg);
+                        }
+                    }
+                    if let Some(operator) = float_operator {
+                        let failure = output.exit(state, ExitReason::FloatArithmetic);
+                        let reg = output.register(Type::F64);
+                        emit(
+                            &mut instructions,
+                            Some(reg),
+                            Operation::FloatBinary {
+                                operator,
+                                left: args[0],
+                                right: args[1],
+                                failure,
+                            },
+                        );
+                        emit(&mut instructions, Some(result), Operation::BoxFloat(reg));
+                    } else {
+                        let reg = output.register(Type::Bool);
+                        emit(
+                            &mut instructions,
+                            Some(reg),
+                            Operation::FloatCompare {
+                                operator: float_compare.unwrap(),
+                                left: args[0],
+                                right: args[1],
+                            },
+                        );
+                        emit(&mut instructions, Some(result), Operation::BoxBool(reg));
+                    }
+                } else if integer_add {
                     let hir::Op::Add(left, right) = instruction.op else {
                         unreachable!()
                     };
@@ -447,7 +610,8 @@ impl Function {
                         guarded.clear();
                         Some(Type::Bool)
                     }
-                    Operation::GuardInt { value, exit: id } => {
+                    Operation::GuardInt { value, exit: id }
+                    | Operation::GuardFloat { value, exit: id } => {
                         kind(*value, Type::Boxed)?;
                         if exit(*id)?.reason != ExitReason::TypeGuard {
                             return Err(fail());
@@ -462,16 +626,83 @@ impl Function {
                         {
                             return Err(fail());
                         }
-                        guarded.insert(*value, *id);
+                        guarded.insert(
+                            *value,
+                            if matches!(instruction.operation, Operation::GuardInt { .. }) {
+                                Type::I64
+                            } else {
+                                Type::F64
+                            },
+                        );
                         None
                     }
                     Operation::UnboxInt(value) => {
                         kind(*value, Type::Boxed)?;
-                        if !guarded.contains_key(value) {
+                        if guarded.get(value) != Some(&Type::I64) {
                             return Err(fail());
                         }
                         unboxed_sources.insert(instruction.result.ok_or_else(fail)?, *value);
                         Some(Type::I64)
+                    }
+                    Operation::UnboxFloat(value) => {
+                        kind(*value, Type::Boxed)?;
+                        if guarded.get(value) != Some(&Type::F64) {
+                            return Err(fail());
+                        }
+                        unboxed_sources.insert(instruction.result.ok_or_else(fail)?, *value);
+                        Some(Type::F64)
+                    }
+                    Operation::IntToFloat(value) => {
+                        kind(*value, Type::I64)?;
+                        let source = *unboxed_sources.get(value).ok_or_else(fail)?;
+                        unboxed_sources.insert(instruction.result.ok_or_else(fail)?, source);
+                        Some(Type::F64)
+                    }
+                    Operation::FloatBinary {
+                        left,
+                        right,
+                        failure,
+                        ..
+                    } => {
+                        kind(*left, Type::F64)?;
+                        kind(*right, Type::F64)?;
+                        let snapshot = state(exit(*failure)?.state)?;
+                        if exit(*failure)?.reason != ExitReason::FloatArithmetic
+                            || snapshot.resume != instruction.point
+                        {
+                            return Err(fail());
+                        }
+                        for input in [left, right] {
+                            let source = unboxed_sources.get(input).ok_or_else(fail)?;
+                            if !snapshot
+                                .values
+                                .iter()
+                                .any(|(_, register)| register == source)
+                            {
+                                return Err(fail());
+                            }
+                        }
+                        Some(Type::F64)
+                    }
+                    Operation::FloatCompare {
+                        operator,
+                        left,
+                        right,
+                    } => {
+                        kind(*left, Type::F64)?;
+                        kind(*right, Type::F64)?;
+                        if !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str()) {
+                            return Err(fail());
+                        }
+                        Some(Type::Bool)
+                    }
+                    Operation::BoxFloat(value) => {
+                        kind(*value, Type::F64)?;
+                        Some(Type::Boxed)
+                    }
+                    Operation::BoxBool(value) => {
+                        kind(*value, Type::Bool)?;
+                        Some(Type::Boxed)
                     }
                     Operation::CheckedAdd {
                         left,
@@ -504,12 +735,16 @@ impl Function {
                         Some(Type::Boxed)
                     }
                     Operation::Call {
+                        helper,
                         arguments,
                         state: id,
                         roots,
                         effects,
                         ..
                     } => {
+                        if !helper.accepts(arguments.len()) {
+                            return Err(fail());
+                        }
                         for &arg in arguments {
                             kind(arg, Type::Boxed)?;
                         }
@@ -693,10 +928,17 @@ impl Operation {
         match self {
             Self::Constant(_) => vec![],
             Self::GuardInt { value, .. }
+            | Self::GuardFloat { value, .. }
+            | Self::UnboxFloat(value)
+            | Self::IntToFloat(value)
+            | Self::BoxFloat(value)
+            | Self::BoxBool(value)
             | Self::UnboxInt(value)
             | Self::BoxInt(value)
             | Self::Truth { value, .. } => vec![*value],
-            Self::CheckedAdd { left, right, .. } => vec![*left, *right],
+            Self::CheckedAdd { left, right, .. }
+            | Self::FloatBinary { left, right, .. }
+            | Self::FloatCompare { left, right, .. } => vec![*left, *right],
             Self::Call { arguments, .. } => arguments.clone(),
         }
     }
@@ -771,6 +1013,8 @@ impl Function {
                 }
                 let snapshot = match &ins.operation {
                     Operation::GuardInt { exit, .. }
+                    | Operation::GuardFloat { exit, .. }
+                    | Operation::FloatBinary { failure: exit, .. }
                     | Operation::CheckedAdd { overflow: exit, .. } => {
                         Some(self.exits[exit.0].state)
                     }
@@ -801,5 +1045,39 @@ impl Function {
             }
         }
         Ok(())
+    }
+}
+
+impl Helper {
+    fn accepts(&self, count: usize) -> bool {
+        match self {
+            Self::StringConstant(_) => count == 0,
+            Self::Add | Self::Subtract | Self::Less | Self::GetItem => count == 2,
+            Self::SetItem => count == 3,
+            Self::Len => count == 1,
+            Self::List | Self::Tuple => true,
+            Self::Dict => count.is_multiple_of(2),
+            Self::Python(op) => match op {
+                CoreOp::Missing | CoreOp::LoadName(_) | CoreOp::Namespace => count == 0,
+                CoreOp::StoreName(_)
+                | CoreOp::Unary(_)
+                | CoreOp::GetAttr(_)
+                | CoreOp::Iter
+                | CoreOp::Next
+                | CoreOp::IsDone
+                | CoreOp::Unpack(_)
+                | CoreOp::UnpackStar(..)
+                | CoreOp::UnpackItem(_)
+                | CoreOp::Format(..)
+                | CoreOp::Assert => count == 1,
+                CoreOp::Binary(_)
+                | CoreOp::Inplace(_)
+                | CoreOp::Compare(_)
+                | CoreOp::SetAttr(_) => count == 2,
+                CoreOp::Slice => count == 3,
+                CoreOp::Call(names) => count == names.len() + 1,
+                CoreOp::Function(_) | CoreOp::Class(..) | CoreOp::Set | CoreOp::Join => true,
+            },
+        }
     }
 }

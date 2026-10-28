@@ -592,19 +592,25 @@ impl Vm {
     }
 
     fn class_attribute(&self, class: Value, name: &str) -> Result<Option<Value>> {
-        let Object::Class {
-            namespace, bases, ..
-        } = self.heap.get(class)?
-        else {
-            return Err(Error::Type("expected class"));
-        };
-        if let Some(value) = self.env(*namespace)?.values.get(name) {
-            return Ok(Some(*value));
-        }
-        for &base in bases {
-            if let Some(value) = self.class_attribute(base, name)? {
-                return Ok(Some(value));
+        let mut pending = vec![class];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(class) = pending.pop() {
+            let Value::Ref(id) = class else {
+                return Err(Error::Type("expected class"));
+            };
+            if !seen.insert(id) {
+                return Err(error("cyclic class hierarchy"));
             }
+            let Object::Class {
+                namespace, bases, ..
+            } = self.heap.get(class)?
+            else {
+                return Err(Error::Type("expected class"));
+            };
+            if let Some(value) = self.env(*namespace)?.values.get(name) {
+                return Ok(Some(*value));
+            }
+            pending.extend(bases.iter().rev().copied());
         }
         Ok(None)
     }
@@ -693,12 +699,25 @@ impl Vm {
     }
 
     fn next(&mut self, iterator: Value) -> Result<Value> {
+        self.next_at(iterator, 0)
+    }
+
+    fn next_at(&mut self, iterator: Value, depth: usize) -> Result<Value> {
+        if depth >= 256 {
+            return Err(error("RecursionError: iterator nesting"));
+        }
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            self.next_inner(iterator, depth)
+        })
+    }
+
+    fn next_inner(&mut self, iterator: Value, depth: usize) -> Result<Value> {
         match self.heap.get(iterator)?.clone() {
             Object::Enumerate {
                 iterator: inner,
                 index,
             } => {
-                let value = self.next(inner)?;
+                let value = self.next_at(inner, depth + 1)?;
                 if self.is_done(value) {
                     return Ok(value);
                 }
@@ -717,7 +736,7 @@ impl Vm {
                 }
                 let mut row = vec![];
                 for &inner in &iterators {
-                    let value = self.next(inner)?;
+                    let value = self.next_at(inner, depth + 1)?;
                     if self.is_done(value) {
                         *self.heap.get_mut(iterator)? = Object::Zip {
                             iterators,
@@ -1706,6 +1725,14 @@ fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool> {
 }
 
 fn render(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Result<String> {
+    if active.len() >= 256 {
+        return Err(error("RecursionError: representation nesting"));
+    }
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        render_inner(heap, value, quote, active)
+    })
+}
+fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Result<String> {
     Ok(match value {
         Value::None => "None".into(),
         Value::Bool(b) => if b { "True" } else { "False" }.into(),

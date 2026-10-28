@@ -6,8 +6,8 @@ Runtime profiles are keyed by stable HIR identity and code revision, not heap ad
 Keep speculative guards, side-exit state and GC root maps explicit in LIR.
 Keep object operations independent of frames and stack placement.
 Do not introduce Monty compatibility, stdlib, sandbox or binding infrastructure unless requested.
-Use safe Rust outside the copied Monty storage modules (`src/heap/stable_heap.rs` and `src/heap/free_list.rs`).
-Those two files retain their existing unsafe internals with explicit user approval; preserve their safety invariants.
+Unsafe Rust is permitted. Keep native execution boundaries small and document pointer, ABI and lifetime invariants.
+Preserve the safety invariants of the copied Monty storage modules.
 Do not commit unless explicitly asked.
 
 Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` after Rust changes.

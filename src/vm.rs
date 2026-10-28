@@ -9,7 +9,16 @@ use std::{cell::RefCell, rc::Rc};
 #[derive(Debug, Default)]
 pub struct Vm {
     pub heap: Heap,
-    stack: Vec<Option<Value>>,
+    pub(crate) stack: Vec<Option<Value>>,
+    pub tiering: crate::Tiering,
+    pub(crate) native_artifacts: std::collections::BTreeMap<
+        (crate::profile::FunctionId, u64),
+        Rc<crate::native::NativeCode>,
+    >,
+    pub tier_stats: crate::TierStats,
+    pub(crate) retired_versions: std::collections::BTreeSet<(crate::profile::FunctionId, u64)>,
+    pub(crate) artifacts:
+        std::collections::BTreeMap<(crate::profile::FunctionId, u64), Rc<crate::lir::Function>>,
     pub(crate) environments: Vec<Value>,
     pub(crate) globals: Option<Value>,
     pub output: String,
@@ -108,7 +117,22 @@ impl Vm {
         // Runtime calls currently recurse through Rust; grow before entering another frame
         // so the language recursion limit is reached before exhausting the native stack.
         let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            self.execute(&function, &code, base, frame_end, ip, block)
+            if ip == 0
+                && let Some(lir) = self.artifact(code.function, code.revision)
+            {
+                let outcome = self.execute_tier(
+                    &function,
+                    &code,
+                    lir,
+                    base,
+                    frame_end,
+                    crate::hir::BlockId(0),
+                    false,
+                )?;
+                self.finish_lir(&function, &code, base, frame_end, outcome)
+            } else {
+                self.execute(&function, &code, base, frame_end, ip, block)
+            }
         });
         {
             let function = function.borrow();
@@ -127,6 +151,31 @@ impl Vm {
         self.depth -= 1;
         self.stack.truncate(base);
         result
+    }
+
+    pub(crate) fn finish_lir(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        base: usize,
+        frame_end: usize,
+        outcome: crate::tier::Outcome,
+    ) -> Result<Value> {
+        match outcome {
+            crate::tier::Outcome::Return(value) => Ok(value),
+            crate::tier::Outcome::Deopt(frame) => {
+                let ip = code.resume_offset(frame.resume)?;
+                self.stack[base..frame_end].copy_from_slice(&frame.slots);
+                self.execute(
+                    function,
+                    code,
+                    base,
+                    frame_end,
+                    ip,
+                    Some(frame.resume.block.0),
+                )
+            }
+        }
     }
 
     /// Continue at a pre-effect HIR boundary after a speculative LIR side exit.
@@ -228,12 +277,33 @@ impl Vm {
             crate::profile::Hotspot::Function => self.thresholds.function_entries,
             crate::profile::Hotspot::Loop { .. } => self.thresholds.loop_backedges,
         };
-        if threshold == 0
-            || count < threshold
-            || !self
-                .requested
-                .insert((function.id(), function.revision(), hotspot))
+        if threshold == 0 || count < threshold {
+            return;
+        }
+        let notify = self
+            .requested
+            .insert((function.id(), function.revision(), hotspot));
+        if self.tiering != crate::Tiering::Bytecode
+            && !self.has_lir(&function)
+            && !self
+                .retired_versions
+                .contains(&(function.id(), function.revision()))
         {
+            match function.lower_lir(crate::lir::LoweringMode::Profiled) {
+                Ok(lir) => {
+                    self.artifacts
+                        .insert((function.id(), function.revision()), Rc::new(lir));
+                    self.tier_stats.lowered = self.tier_stats.lowered.saturating_add(1);
+                }
+                Err(_) => {
+                    self.retired_versions
+                        .insert((function.id(), function.revision()));
+                    self.tier_stats.compilation_errors =
+                        self.tier_stats.compilation_errors.saturating_add(1);
+                }
+            }
+        }
+        if !notify {
             return;
         }
         self.compilation_requests
@@ -271,67 +341,28 @@ impl Vm {
             match opcode {
                 Opcode::EnterBlock => {
                     let block = read_operand(&code.body, &mut ip)?;
-                    let is_backedge = current_block
-                        .is_some_and(|previous| code.backedges.contains(&(previous, block)));
-                    {
-                        let function = function.borrow();
-                        let mut profile = function.profile.borrow_mut();
-                        let count = profile
-                            .blocks
-                            .get_mut(block)
-                            .ok_or(Error::InvalidIr("profile block"))?;
-                        *count = count.saturating_add(1);
-                        if let Some(previous) = current_block {
-                            let count = profile.edges.entry((previous, block)).or_default();
-                            *count = count.saturating_add(1);
-                            if is_backedge {
-                                let count = profile.backedges.entry((previous, block)).or_default();
-                                *count = count.saturating_add(1);
-                            }
-                        }
-                    }
+                    let is_backedge = self.record_block(function, code, block, current_block)?;
                     current_block = Some(block);
-                    if is_backedge {
-                        self.consider_compilation(
+                    if is_backedge
+                        && let Some(lir) = self.artifact(code.function, code.revision)
+                        && lir.osr_entries.iter().any(|entry| entry.header.0 == block)
+                    {
+                        self.tier_stats.osr_entries = self.tier_stats.osr_entries.saturating_add(1);
+                        let outcome = self.execute_tier(
                             function,
-                            crate::profile::Hotspot::Loop { header: block },
-                        );
+                            code,
+                            lir,
+                            base,
+                            frame_end,
+                            crate::hir::BlockId(block),
+                            true,
+                        )?;
+                        return self.finish_lir(function, code, base, frame_end, outcome);
                     }
                 }
                 Opcode::Observe => {
                     let site = read_operand(&code.body, &mut ip)?;
-                    let metadata = code
-                        .sites
-                        .get(site)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidIr("profile site"))?;
-                    let target = if metadata.call {
-                        metadata
-                            .inputs
-                            .first()
-                            .map(|&input| {
-                                self.read(base, input)
-                                    .map(|value| crate::profile::CallTarget::of(&self.heap, value))
-                            })
-                            .transpose()?
-                    } else {
-                        None
-                    };
-                    let function = function.borrow();
-                    let mut profile = function.profile.borrow_mut();
-                    let site = &mut profile.sites[site];
-                    site.executions = site.executions.saturating_add(1);
-                    site.operands
-                        .resize_with(metadata.inputs.len(), Default::default);
-                    for (operand, &input) in site.operands.iter_mut().zip(&metadata.inputs) {
-                        operand.observe(crate::profile::ValueKind::of(
-                            &self.heap,
-                            self.read(base, input)?,
-                        ));
-                    }
-                    if let Some(target) = target {
-                        site.call(target);
-                    }
+                    self.observe_site(function, code, base, ValueId(site))?;
                 }
                 Opcode::Constant => {
                     let index = read_operand(&code.body, &mut ip)?;
@@ -481,10 +512,7 @@ impl Vm {
                 Opcode::Return => return self.pop(frame_end),
             }
             // Collect only between instructions, when all live temporaries are rooted.
-            if self.heap.allocation_count() >= self.next_collection.max(4096) {
-                self.collect_garbage(&[])?;
-                self.next_collection = self.heap.allocation_count().saturating_mul(2).max(4096);
-            }
+            self.maybe_collect()?;
         }
     }
 
@@ -542,6 +570,87 @@ impl Vm {
             .stack
             .get_mut(base + value.0)
             .ok_or(Error::InvalidIr("invalid value"))? = Some(result);
+        Ok(())
+    }
+}
+
+impl Vm {
+    pub(crate) fn record_block(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        block: usize,
+        previous: Option<usize>,
+    ) -> Result<bool> {
+        let backedge = previous.is_some_and(|from| code.backedges.contains(&(from, block)));
+        {
+            let function = function.borrow();
+            let mut profile = function.profile.borrow_mut();
+            let count = profile
+                .blocks
+                .get_mut(block)
+                .ok_or(Error::InvalidIr("profile block"))?;
+            *count = count.saturating_add(1);
+            if let Some(previous) = previous {
+                let count = profile.edges.entry((previous, block)).or_default();
+                *count = count.saturating_add(1);
+                if backedge {
+                    let count = profile.backedges.entry((previous, block)).or_default();
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        if backedge {
+            self.consider_compilation(function, crate::profile::Hotspot::Loop { header: block });
+        }
+        Ok(backedge)
+    }
+    pub(crate) fn observe_site(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        base: usize,
+        value: ValueId,
+    ) -> Result<()> {
+        let metadata = code
+            .sites
+            .get(value.0)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidIr("profile site"))?;
+        let target = if metadata.call {
+            metadata
+                .inputs
+                .first()
+                .map(|&input| {
+                    self.read(base, input)
+                        .map(|value| crate::profile::CallTarget::of(&self.heap, value))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let function = function.borrow();
+        let mut profile = function.profile.borrow_mut();
+        let site = &mut profile.sites[value.0];
+        site.executions = site.executions.saturating_add(1);
+        site.operands
+            .resize_with(metadata.inputs.len(), Default::default);
+        for (operand, &input) in site.operands.iter_mut().zip(&metadata.inputs) {
+            operand.observe(crate::profile::ValueKind::of(
+                &self.heap,
+                self.read(base, input)?,
+            ));
+        }
+        if let Some(target) = target {
+            site.call(target);
+        }
+        Ok(())
+    }
+    pub(crate) fn maybe_collect(&mut self) -> Result<()> {
+        if self.heap.allocation_count() >= self.next_collection.max(4096) {
+            self.collect_garbage(&[])?;
+            self.next_collection = self.heap.allocation_count().saturating_mul(2).max(4096);
+        }
         Ok(())
     }
 }
