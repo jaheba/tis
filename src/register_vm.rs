@@ -179,6 +179,21 @@ impl Vm {
                         self.check_local(a, value)?;
                         value
                     }
+                    Opcode::CallPositional => {
+                        let inputs = &code.sites[destination.0]
+                            .as_ref()
+                            .ok_or(Error::InvalidIr("call inputs"))?
+                            .inputs;
+                        let (&callee, inputs) = inputs
+                            .split_first()
+                            .ok_or(Error::InvalidIr("call target"))?;
+                        let callable = self.read(base, callee)?;
+                        arguments.clear();
+                        for &input in inputs {
+                            arguments.push(self.read(base, input)?);
+                        }
+                        self.call_from_registers(callable, &arguments)?
+                    }
                     Opcode::Runtime
                     | Opcode::Numeric
                     | Opcode::List
@@ -218,11 +233,9 @@ impl Vm {
                                 if *count != arguments.len() {
                                     return Err(Error::InvalidIr("register runtime arity"));
                                 }
-                                let roots = self.transient_roots.len();
-                                self.transient_roots.extend_from_slice(&arguments);
-                                let result = self.operation(operation, &arguments);
-                                self.transient_roots.truncate(roots);
-                                result?
+                                // Inputs remain in this register window across nested execution.
+                                // Unlike stack bytecode, operand collection does not remove their roots.
+                                self.operation(operation, &arguments)?
                             }
                         }
                     }

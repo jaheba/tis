@@ -324,6 +324,7 @@ impl Vm {
             .chain(self.modules.values().copied())
             .chain(self.globals)
             .chain(external_roots.iter().copied())
+            .filter(|value| matches!(value, Value::Ref(_)))
             .collect::<Vec<_>>();
         self.heap.collect(&roots)
     }

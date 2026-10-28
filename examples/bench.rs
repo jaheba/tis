@@ -87,14 +87,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run_ns = sample(&mut vm)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{}}}",
+            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"positional_calls\":{},\"leaf_calls\":{}}}",
             stats.native_compile_ns + stats.copy_patch_compile_ns
                 - before.native_compile_ns
                 - before.copy_patch_compile_ns,
             stats.deoptimizations - before.deoptimizations,
             stats.native_runtime_calls - before.native_runtime_calls,
             stats.native_root_syncs - before.native_root_syncs,
-            stats.native_field_hits - before.native_field_hits
+            stats.native_field_hits - before.native_field_hits,
+            stats.bytecode_positional_calls - before.bytecode_positional_calls,
+            stats.bytecode_leaf_calls - before.bytecode_leaf_calls
         );
         io::stdout().flush()?;
     }

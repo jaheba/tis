@@ -142,10 +142,10 @@ impl CallTarget {
         match heap.get(value) {
             Ok(Object::Function(closure)) => Self::Function(closure.function.borrow().id()),
             Ok(Object::Method(function, _)) => Self::of(heap, *function),
-            Ok(Object::Native(name)) => Self::Native(name.clone()),
+            Ok(Object::Native(name)) => Self::Native(name.to_string()),
             Ok(Object::Bound(receiver, name)) => Self::Method {
                 receiver: ValueKind::of(heap, *receiver),
-                name: name.clone(),
+                name: name.to_string(),
             },
             Ok(Object::Class { code, name, .. }) => Self::Class {
                 code: *code,

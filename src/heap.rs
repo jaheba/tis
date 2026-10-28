@@ -50,8 +50,8 @@ pub enum Object {
     Set(Vec<Value>),
     Environment(crate::execution::Environment),
     Function(crate::execution::Closure),
-    Native(String),
-    Bound(Value, String),
+    Native(std::borrow::Cow<'static, str>),
+    Bound(Value, std::borrow::Cow<'static, str>),
     Method(Value, Value),
     Class {
         code: crate::profile::FunctionId,
@@ -262,11 +262,11 @@ impl Heap {
         }
     }
 
-    /// All external values that must survive collection must be listed as roots.
-    /// Marking completes before freeing anything, so invalid roots leave the heap unchanged.
     pub(crate) fn collection_epoch(&self) -> usize {
         self.collection_epoch
     }
+    /// All external values that must survive collection must be listed as roots.
+    /// Marking completes before freeing anything, so invalid roots leave the heap unchanged.
     pub fn collect(&mut self, roots: &[Value]) -> Result<usize> {
         self.collection_epoch = self
             .collection_epoch
@@ -282,26 +282,25 @@ impl Heap {
             if std::mem::replace(&mut marked[id.index()], true) {
                 continue;
             }
-            pending.extend(crate::execution::children(&self.entries.get(id).object));
+            crate::execution::visit_children(&self.entries.get(id).object, |value| {
+                pending.push(value)
+            });
         }
-        let garbage = self
-            .generations
-            .get_mut()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, generation)| {
-                (generation.is_some() && !marked[index]).then_some(HeapId::from_index(index))
-            })
-            .collect::<Vec<_>>();
-        for &id in &garbage {
-            self.entries
-                .entry(id)
-                .expect("live generation has an entry")
-                .free();
-            self.generations.get_mut()[id.index()] = None;
+        // Finish validation and marking before freeing anything. Invalid external roots
+        // therefore leave all objects intact, without requiring a temporary garbage vector.
+        let mut freed = 0;
+        for (index, generation) in self.generations.get_mut().iter_mut().enumerate() {
+            if generation.is_some() && !marked[index] {
+                self.entries
+                    .entry(HeapId::from_index(index))
+                    .expect("live generation has an entry")
+                    .free();
+                *generation = None;
+                freed += 1;
+            }
         }
-        self.live.set(self.live.get() - garbage.len());
-        Ok(garbage.len())
+        self.live.set(self.live.get() - freed);
+        Ok(freed)
     }
 
     pub fn allocation_count(&self) -> usize {

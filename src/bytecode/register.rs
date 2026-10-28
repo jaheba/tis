@@ -22,6 +22,7 @@ pub(crate) enum Opcode {
     SetItem,
     Len,
     Runtime,
+    CallPositional,
     Numeric,
     LoadLocal,
     StoreLocal,
@@ -99,6 +100,9 @@ impl RegisterCode {
                     }
                     Op::Runtime(CoreOp::CheckLocal(slot), inputs) => {
                         (Opcode::CheckLocal, *slot, inputs[0].0, 0)
+                    }
+                    Op::Runtime(CoreOp::Call(names), _) if names.iter().all(Option::is_none) => {
+                        (Opcode::CallPositional, 0, 0, 0)
                     }
                     Op::Runtime(_, inputs) if Operator::from_hir(&instruction.op).is_some() => {
                         (Opcode::Numeric, inputs[0].0, inputs[1].0, 0)
@@ -218,17 +222,22 @@ impl RegisterCode {
             .unwrap();
         }
         for (id, edge) in self.body.iter().enumerate() {
-            if matches!(edge.op, Opcode::Runtime | Opcode::Numeric) {
+            if matches!(
+                edge.op,
+                Opcode::Runtime | Opcode::Numeric | Opcode::CallPositional
+            ) {
                 let (operation, _) = code
                     .operations
-                    .get(if matches!(edge.op, Opcode::Numeric) {
-                        code.sites[edge.dst as usize]
-                            .as_ref()
-                            .and_then(|site| site.runtime)
-                            .ok_or(Error::InvalidIr("numeric operation"))?
-                    } else {
-                        edge.a as usize
-                    })
+                    .get(
+                        if matches!(edge.op, Opcode::Numeric | Opcode::CallPositional) {
+                            code.sites[edge.dst as usize]
+                                .as_ref()
+                                .and_then(|site| site.runtime)
+                                .ok_or(Error::InvalidIr("runtime operation"))?
+                        } else {
+                            edge.a as usize
+                        },
+                    )
                     .ok_or(Error::InvalidIr("register operation"))?;
                 writeln!(
                     text,

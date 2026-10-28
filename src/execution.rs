@@ -32,37 +32,86 @@ fn error(message: impl Into<String>) -> Error {
     Error::Runtime(message.into())
 }
 
-pub(crate) fn children(object: &Object) -> Vec<Value> {
-    match object {
-        Object::List(values) => {
-            if values.is_float() {
-                vec![]
-            } else {
-                values.to_vec()
-            }
+fn builtin_method_name(name: &str) -> Result<&'static str> {
+    Ok(match name {
+        "append" => "append",
+        "extend" => "extend",
+        "pop" => "pop",
+        "reverse" => "reverse",
+        "copy" => "copy",
+        "clear" => "clear",
+        "insert" => "insert",
+        "count" => "count",
+        "index" => "index",
+        "remove" => "remove",
+        "sort" => "sort",
+        "values" => "values",
+        "keys" => "keys",
+        "items" => "items",
+        "get" => "get",
+        "setdefault" => "setdefault",
+        "update" => "update",
+        "add" => "add",
+        "discard" => "discard",
+        "join" => "join",
+        "split" => "split",
+        "upper" => "upper",
+        "lower" => "lower",
+        "strip" => "strip",
+        "startswith" => "startswith",
+        "endswith" => "endswith",
+        "replace" => "replace",
+        _ => return Err(Error::InvalidIr("builtin method name")),
+    })
+}
+
+pub(crate) fn visit_children(object: &Object, mut visit: impl FnMut(Value)) {
+    let mut edge = |value| {
+        if matches!(value, Value::Ref(_)) {
+            visit(value);
         }
-        Object::Tuple(values) | Object::Set(values) => values.clone(),
-        Object::Enumerate { iterator, .. } => vec![*iterator],
-        Object::Zip { iterators, .. } => iterators.clone(),
-        Object::Dict(values) => values.iter().map(|(_, value)| *value).collect(),
-        Object::Environment(env) => env.values.values().copied().chain(env.parent).collect(),
+    };
+    match object {
+        Object::List(values) if !values.is_float() => values.iter().copied().for_each(edge),
+        Object::Tuple(values)
+        | Object::Set(values)
+        | Object::Zip {
+            iterators: values, ..
+        } => values.iter().copied().for_each(edge),
+        Object::Dict(values) => values.iter().map(|(_, value)| *value).for_each(edge),
+        Object::Environment(env) => env
+            .values
+            .values()
+            .copied()
+            .chain(env.parent)
+            .for_each(edge),
         Object::Function(closure) => std::iter::once(closure.environment)
             .chain(closure.defaults.iter().copied())
-            .collect(),
+            .for_each(edge),
         Object::Bound(value, _)
         | Object::Iterator { source: value, .. }
-        | Object::View { source: value, .. } => vec![*value],
-        Object::Method(function, receiver) => vec![*function, *receiver],
+        | Object::View { source: value, .. }
+        | Object::Enumerate {
+            iterator: value, ..
+        } => edge(*value),
+        Object::Method(function, receiver) => {
+            edge(*function);
+            edge(*receiver);
+        }
         Object::Class {
             namespace, bases, ..
         } => std::iter::once(*namespace)
             .chain(bases.iter().copied())
-            .collect(),
+            .for_each(edge),
         Object::Instance { class, attributes } => std::iter::once(*class)
             .chain(attributes.values().copied())
-            .collect(),
-        Object::Slice { start, stop, step } => vec![*start, *stop, *step],
-        _ => vec![],
+            .for_each(edge),
+        Object::Slice { start, stop, step } => {
+            edge(*start);
+            edge(*stop);
+            edge(*step);
+        }
+        _ => {}
     }
 }
 
@@ -387,6 +436,33 @@ impl Vm {
         let result = self.call_keywords(callable, arguments, &[]);
         self.transient_roots.truncate(roots);
         result
+    }
+
+    /// Register operands remain rooted in their caller's window until the result is stored.
+    /// Current builtins cannot execute Python or collect, except keyed list sorting.
+    pub(crate) fn call_from_registers(
+        &mut self,
+        callable: Value,
+        arguments: &[Value],
+    ) -> Result<Value> {
+        self.tier_stats.bytecode_positional_calls += 1;
+        let leaf = match self.heap.get(callable)? {
+            Object::Native(std::borrow::Cow::Borrowed(name)) => Some((None, *name)),
+            Object::Bound(receiver, std::borrow::Cow::Borrowed(name)) if *name != "sort" => {
+                Some((Some(*receiver), *name))
+            }
+            _ => None,
+        };
+        if let Some((receiver, name)) = leaf {
+            self.tier_stats.bytecode_leaf_calls += 1;
+            if let Some(receiver) = receiver {
+                self.method(receiver, name, arguments)
+            } else {
+                self.builtin(name, arguments, &[])
+            }
+        } else {
+            self.call_keywords(callable, arguments, &[])
+        }
     }
 
     fn call_keywords(
@@ -774,6 +850,7 @@ impl Vm {
                 ]
                 .contains(&name) =>
             {
+                let name = builtin_method_name(name)?;
                 return Ok(self.heap.allocate(Object::Bound(object, name.into())));
             }
             Object::Dict(_)
@@ -790,9 +867,11 @@ impl Vm {
                 ]
                 .contains(&name) =>
             {
+                let name = builtin_method_name(name)?;
                 return Ok(self.heap.allocate(Object::Bound(object, name.into())));
             }
             Object::Set(_) if ["add", "discard", "remove", "copy", "clear"].contains(&name) => {
+                let name = builtin_method_name(name)?;
                 return Ok(self.heap.allocate(Object::Bound(object, name.into())));
             }
             Object::String(_)
@@ -808,6 +887,7 @@ impl Vm {
                 ]
                 .contains(&name) =>
             {
+                let name = builtin_method_name(name)?;
                 return Ok(self.heap.allocate(Object::Bound(object, name.into())));
             }
             _ => {}
@@ -974,7 +1054,7 @@ impl Vm {
                     let Object::String(text) = self.heap.get(*value)? else {
                         return Err(Error::Type("print separator must be string"));
                     };
-                    match name.as_str() {
+                    match name.as_ref() {
                         "sep" => sep = text.clone(),
                         "end" => end = text.clone(),
                         _ => return Err(error("unexpected print keyword")),
@@ -1239,7 +1319,7 @@ impl Vm {
                 }
                 Ok(false)
             }
-            Object::Native(name) => Ok(match name.as_str() {
+            Object::Native(name) => Ok(match name.as_ref() {
                 "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
                 "bool" => matches!(value, Value::Bool(_)),
                 "float" => matches!(value, Value::Float(_)),
@@ -1280,7 +1360,7 @@ impl Vm {
         let mut key = Value::None;
         let mut reverse = false;
         for (name, value) in keywords {
-            match name.as_str() {
+            match name.as_ref() {
                 "key" => key = *value,
                 "reverse" => reverse = runtime::truth(&self.heap, *value)?,
                 _ => return Err(error("TypeError: invalid sort keyword")),
