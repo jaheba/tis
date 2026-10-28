@@ -17,6 +17,7 @@ pub struct Vm {
     pub heap: Heap,
     pub(crate) stack: Vec<Option<Value>>,
     pub tiering: crate::Tiering,
+    pub bytecode: crate::BytecodeMode,
     pub(crate) copy_artifacts: std::collections::BTreeMap<
         (crate::profile::FunctionId, u64),
         Rc<crate::copy_patch::CopyCode>,
@@ -198,7 +199,7 @@ impl Vm {
         match outcome {
             crate::tier::Outcome::Return(value) => Ok(value),
             crate::tier::Outcome::Deopt(frame) => {
-                let ip = code.resume_offset(frame.resume)?;
+                let ip = code.resume_in(self.bytecode, frame.resume)?;
                 self.stack[base..frame_end].copy_from_slice(&frame.slots);
                 self.local_frames
                     .last_mut()
@@ -238,7 +239,7 @@ impl Vm {
             }
         }
         let code = function.shared_bytecode()?;
-        let ip = code.resume_offset(frame.resume)?;
+        let ip = code.resume_in(self.bytecode, frame.resume)?;
         let handle = Rc::new(RefCell::new(function.clone()));
         {
             let function = handle.borrow();
@@ -397,6 +398,26 @@ impl Vm {
         code: &Code,
         base: usize,
         frame_end: usize,
+        ip: usize,
+        block: Option<usize>,
+    ) -> Result<Value> {
+        match self.bytecode {
+            crate::BytecodeMode::Stack => {
+                self.execute_stack(function, code, base, frame_end, ip, block)
+            }
+            crate::BytecodeMode::Register => {
+                self.execute_register(function, code, base, frame_end, ip, block)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_stack(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        base: usize,
+        frame_end: usize,
         mut ip: usize,
         mut current_block: Option<usize>,
     ) -> Result<Value> {
@@ -478,34 +499,11 @@ impl Vm {
                     let site = ValueId(read_operand(&code.body, &mut ip)?);
                     let rhs = self.pop(frame_end)?;
                     let lhs = self.pop(frame_end)?;
-                    let mut hir = function.borrow_mut();
-                    let feedback = hir
-                        .feedback_mut(site)
-                        .ok_or(Error::InvalidIr("addition has no feedback site"))?;
-                    let before = (feedback.fast_paths, feedback.guard_failures);
-                    let result = self.add(lhs, rhs, feedback);
-                    let delta = (
-                        feedback.fast_paths.saturating_sub(before.0),
-                        feedback.guard_failures.saturating_sub(before.1),
-                    );
-                    let mut profile = hir.profile.borrow_mut();
-                    if delta.1 > 0 && self.profiling.mode == crate::profile::ProfileMode::Staged {
-                        profile.start_window(self.profiling);
-                        collecting = self.profiling.collecting(profile.phase);
+                    let (value, force_observed) = self.adaptive_add(function, site, lhs, rhs)?;
+                    if force_observed {
+                        collecting = self.collecting(function);
                         observed = true;
-                        let failed = &mut profile.sites[site.0];
-                        failed.executions = failed.executions.saturating_add(1);
-                        failed.operands.resize_with(2, Default::default);
-                        failed.operands[0].observe(crate::profile::ValueKind::of(&self.heap, lhs));
-                        failed.operands[1].observe(crate::profile::ValueKind::of(&self.heap, rhs));
-                        self.requested.retain(|(id, revision, _)| {
-                            *id != hir.id() || *revision != hir.revision()
-                        });
                     }
-                    let site = &mut profile.sites[site.0];
-                    site.fast_paths = site.fast_paths.saturating_add(delta.0);
-                    site.guard_failures = site.guard_failures.saturating_add(delta.1);
-                    let value = result?;
                     self.push(value);
                 }
                 Opcode::Subtract | Opcode::Less => {
@@ -689,6 +687,43 @@ impl Vm {
             .ok_or(Error::InvalidIr("empty operand"))
     }
 
+    #[inline]
+    pub(crate) fn adaptive_add(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        site: ValueId,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<(Value, bool)> {
+        let mut force_observed = false;
+        let mut hir = function.borrow_mut();
+        let feedback = hir
+            .feedback_mut(site)
+            .ok_or(Error::InvalidIr("addition has no feedback site"))?;
+        let before = (feedback.fast_paths, feedback.guard_failures);
+        let result = self.add(lhs, rhs, feedback);
+        let delta = (
+            feedback.fast_paths.saturating_sub(before.0),
+            feedback.guard_failures.saturating_sub(before.1),
+        );
+        let mut profile = hir.profile.borrow_mut();
+        if delta.1 > 0 && self.profiling.mode == crate::profile::ProfileMode::Staged {
+            profile.start_window(self.profiling);
+            force_observed = true;
+            let failed = &mut profile.sites[site.0];
+            failed.executions = failed.executions.saturating_add(1);
+            failed.operands.resize_with(2, Default::default);
+            failed.operands[0].observe(crate::profile::ValueKind::of(&self.heap, lhs));
+            failed.operands[1].observe(crate::profile::ValueKind::of(&self.heap, rhs));
+            self.requested
+                .retain(|(id, revision, _)| *id != hir.id() || *revision != hir.revision());
+        }
+        let site = &mut profile.sites[site.0];
+        site.fast_paths = site.fast_paths.saturating_add(delta.0);
+        site.guard_failures = site.guard_failures.saturating_add(delta.1);
+        result.map(|value| (value, force_observed))
+    }
+
     fn add(&mut self, lhs: Value, rhs: Value, feedback: &mut AddFeedback) -> Result<Value> {
         feedback.executions = feedback.executions.saturating_add(1);
         if feedback.strategy == AddStrategy::Integer {
@@ -717,14 +752,14 @@ impl Vm {
         result
     }
 
-    fn read(&self, base: usize, value: ValueId) -> Result<Value> {
+    pub(crate) fn read(&self, base: usize, value: ValueId) -> Result<Value> {
         self.stack
             .get(base + value.0)
             .ok_or(Error::InvalidIr("invalid value"))?
             .ok_or(Error::Uninitialized(value.0))
     }
 
-    fn write(&mut self, base: usize, value: ValueId, result: Value) -> Result<()> {
+    pub(crate) fn write(&mut self, base: usize, value: ValueId, result: Value) -> Result<()> {
         *self
             .stack
             .get_mut(base + value.0)

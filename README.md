@@ -1,7 +1,7 @@
 # tis
 
 A Rust interpreter for a Python subset, built around an explicit value IR.
-Ruff AST → HIR → stack bytecode → interpreter.
+Ruff AST → HIR → register bytecode → interpreter.
 Runtime profiles feed HIR → typed LIR → reference execution, Cranelift, or copy-and-patch native code.
 There is no stdlib or sandbox infrastructure.
 
@@ -82,7 +82,7 @@ The lower-level `Vm::run` API remains available for functions constructed throug
 
 ```sh
 cargo run --example ir -- --source examples/sum.py --function sum
-cargo run --example ir -- --source examples/sum.py --function sum --format bytecode
+cargo run --example ir -- --source examples/sum.py --function sum --format register
 cargo run --example ir -- --source examples/sum.py --function sum --format html --output /tmp/tis-ir.html
 cargo run --example ir -- --demo add --phase fallback
 cargo run --example ir -- --demo add --phase warm --format lir
@@ -93,7 +93,8 @@ cargo run --example hotspots -- tests/fixtures/game_nbody.py
 
 Source inspection does not execute the source.
 The standalone HTML viewer supports pan, zoom, block/value selection and feedback inspection; DOT export is available.
-Functions expose `dump()`, `to_dot()`, `to_html()` and `bytecode()?.disassemble()`.
+Functions expose `dump()`, `to_dot()`, `to_html()`, `bytecode()?.disassemble_register()` and
+`bytecode()?.disassemble()` (the stack encoding).
 
 ## Profiles and compilation requests
 
@@ -129,6 +130,15 @@ for request in vm.take_compilation_requests() {
 Bytecode is the default tier; set `vm.tiering = Tiering::Lir`, `Tiering::Native` or `Tiering::CopyPatch` to enable tiering.
 LIR is lowered from HIR, never reconstructed from bytecode.
 Immutable bytecode buffers are shared across calls.
+
+Register bytecode executes HIR values directly in frame slots. Each semantic operation has one fixed-size instruction;
+block edges copy parameters in parallel through reusable scratch storage. Constants, runtime services, feedback sites,
+GC roots and tier handoffs are shared with the stack interpreter. Detailed feedback still follows the staged policy.
+`Vm.bytecode = BytecodeMode::Stack` selects the original encoding; the run and nbody benchmark examples also accept
+`--bytecode stack|register`. Both encodings are retained in each code object for controlled comparisons, so compilation
+and resident code memory currently include both. `--format bytecode` inspects stack code; `--format register` inspects
+register code. HIR resume points select the appropriate encoding when a compiled tier exits.
+
 
 LIR has boxed, integer, float and boolean registers, explicit block arguments, runtime-helper calls and truth conversion.
 String construction and generic Python operations have safepoints, boxed root maps and conservative effect metadata.

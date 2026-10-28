@@ -4,7 +4,7 @@ use std::{env, fs, process};
 
 use tis::{Object, Value, Vm};
 
-const HELP: &str = "Usage: cargo run --example ir -- [OPTIONS]\n\n  --demo add|sum                Function to inspect (default: sum)\n  --phase cold|warm|fallback    Feedback to collect (default: warm)\n  --source PATH                Inspect Python source (always cold)\n  --function NAME              Function in source (default: <module>)\n  --no-promote                 Inspect slot HIR before SSA promotion\n  --format text|dot|html|bytecode|lir|profile        Output format (default: text)\n  --output PATH                Write to a file instead of stdout\n  --help                       Show this help\n\nExample:\n  cargo run --example ir -- --format html --output /tmp/tis-ir.html";
+const HELP: &str = "Usage: cargo run --example ir -- [OPTIONS]\n\n  --demo add|sum                Function to inspect (default: sum)\n  --phase cold|warm|fallback    Feedback to collect (default: warm)\n  --source PATH                Inspect Python source (always cold)\n  --function NAME              Function in source (default: <module>)\n  --no-promote                 Inspect slot HIR before SSA promotion\n  --format text|dot|html|bytecode|register|lir|profile        Output format (default: text)\n  --output PATH                Write to a file instead of stdout\n  --help                       Show this help\n\nExample:\n  cargo run --example ir -- --format html --output /tmp/tis-ir.html";
 
 fn main() {
     if let Err(error) = run() {
@@ -98,6 +98,11 @@ fn run() -> Result<(), String> {
             .bytecode()
             .map_err(|error| error.to_string())?
             .disassemble()
+            .map_err(|error| error.to_string())?,
+        "register" => function
+            .bytecode()
+            .map_err(|error| error.to_string())?
+            .disassemble_register()
             .map_err(|error| error.to_string())?,
         "lir" => function
             .lower_lir(tis::lir::LoweringMode::Profiled)

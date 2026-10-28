@@ -1,4 +1,5 @@
-//! Stack bytecode lowered exclusively from the value IR.
+//! Stack and register encodings lowered exclusively from HIR.
+pub(crate) mod register;
 
 use std::fmt::Write;
 
@@ -7,8 +8,16 @@ use crate::{
     hir::{BlockId, Constant, Edge, Function, Op, Terminator, ValueId},
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BytecodeMode {
+    Stack,
+    #[default]
+    Register,
+}
+
 #[derive(Debug, Clone)]
 pub struct Code {
+    pub(crate) register: register::RegisterCode,
     pub(crate) body: Vec<u8>,
     pub function: crate::profile::FunctionId,
     pub revision: u64,
@@ -26,6 +35,8 @@ pub struct Code {
 pub(crate) struct Site {
     pub inputs: Vec<ValueId>,
     pub call: bool,
+    pub constant: Option<usize>,
+    pub runtime: Option<usize>,
 }
 
 #[repr(u8)]
@@ -113,11 +124,14 @@ impl Code {
                 sites[instruction.result.0] = Some(Site {
                     inputs: instruction.op.inputs(),
                     call: matches!(&instruction.op, Op::Runtime(crate::hir::CoreOp::Call(_), _)),
+                    constant: None,
+                    runtime: None,
                 });
             }
         }
         let mut builder = Builder {
             code: Self {
+                register: register::RegisterCode::default(),
                 body: Vec::new(),
                 function: function.id(),
                 revision: function.revision(),
@@ -173,6 +187,7 @@ impl Code {
                     .ok_or(Error::InvalidIr("invalid block"))?,
             )?;
         }
+        builder.code.register = register::RegisterCode::lower(function, &builder.code)?;
         Ok(builder.code)
     }
 
@@ -193,6 +208,43 @@ impl Code {
 
     pub fn bytes(&self) -> &[u8] {
         &self.body
+    }
+
+    pub fn disassemble_register(&self) -> Result<String> {
+        self.register.disassemble(self)
+    }
+
+    pub fn register_instruction_count(&self) -> usize {
+        self.register.body.len()
+    }
+
+    pub fn stack_instruction_count(&self) -> Result<usize> {
+        let mut pc = 0;
+        let mut count = 0;
+        while pc < self.body.len() {
+            let op = Opcode::decode(self.body[pc])?;
+            pc += 1;
+            count += 1;
+            if op.has_operand() {
+                read_operand(&self.body, &mut pc)?;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn register_body_size(&self) -> usize {
+        self.register.body.len() * std::mem::size_of::<register::Instruction>()
+    }
+
+    pub(crate) fn resume_in(
+        &self,
+        mode: BytecodeMode,
+        point: crate::hir::ResumePoint,
+    ) -> Result<usize> {
+        match mode {
+            BytecodeMode::Stack => self.resume_offset(point),
+            BytecodeMode::Register => self.register.resume_offset(point),
+        }
     }
 
     pub fn disassemble(&self) -> Result<String> {
@@ -250,6 +302,7 @@ impl Builder {
         if let Op::Constant(value) = op {
             let id = self.code.constants.len();
             self.code.constants.push(value.clone());
+            self.code.sites[result.0].as_mut().unwrap().constant = Some(id);
             self.operand(Opcode::Constant, id)?;
             return Ok(());
         }
@@ -286,6 +339,7 @@ impl Builder {
             Op::Runtime(operation, values) => {
                 let id = self.code.operations.len();
                 self.code.operations.push((operation.clone(), values.len()));
+                self.code.sites[result.0].as_mut().unwrap().runtime = Some(id);
                 self.operand(Opcode::Runtime, id)?;
             }
             Op::Constant(_) => unreachable!(),

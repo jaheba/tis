@@ -15,12 +15,14 @@ mod copy_patch;
 mod native;
 mod native_abi;
 mod native_runtime;
+mod register_vm;
 mod runtime;
 mod scalar;
 mod sequence;
 mod tier;
 mod value;
 mod vm;
+pub use bytecode::BytecodeMode;
 pub use tier::{TierStats, Tiering};
 
 pub use error::{Error, Result};

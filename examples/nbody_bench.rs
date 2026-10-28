@@ -4,13 +4,21 @@ use std::{
     io::{self, BufRead, Write},
     time::Instant,
 };
-use tis::{Error, Object, Result, Tiering, Value, Vm, compile};
+use tis::{BytecodeMode, Error, Object, Result, Tiering, Value, Vm, compile};
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let mut tier = Tiering::Bytecode;
+    let mut bytecode = BytecodeMode::default();
     let mut warmups = 2usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--bytecode" => {
+                bytecode = match args.next().as_deref() {
+                    Some("stack") => BytecodeMode::Stack,
+                    Some("register") => BytecodeMode::Register,
+                    _ => return Err("--bytecode requires stack or register".into()),
+                };
+            }
             "--tier" => {
                 tier = match args.next().as_deref() {
                     Some("bytecode") => Tiering::Bytecode,
@@ -36,6 +44,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let compile_ns = start.elapsed().as_nanos();
     let mut vm = Vm::new();
     vm.tiering = tier;
+    vm.bytecode = bytecode;
     let start = Instant::now();
     vm.run_program(&mut program)?;
     assert_eq!(vm.get_global("DEFAULT_ITERATIONS")?, Value::Int(20_000));

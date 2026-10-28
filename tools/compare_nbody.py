@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--seed', type=int, default=20261028)
     parser.add_argument('--tiers', nargs='+', choices=['bytecode', 'lir', 'native', 'copy-patch'],
                         default=['bytecode', 'lir', 'native', 'copy-patch'])
+    parser.add_argument('--baseline-bytecode', choices=['stack', 'register'])
+    parser.add_argument('--candidate-bytecode', choices=['stack', 'register'])
     args = parser.parse_args()
     if args.samples < 10:
         parser.error('use at least 10 samples')
@@ -30,6 +32,7 @@ def main():
                    platform=platform.platform(), samples=args.samples, warmups=2, seed=args.seed, tiers=args.tiers,
                    binaries={name: dict(path=str(path), sha256=digest(path))
                              for name, path in binaries.items()},
+                   bytecode_modes={'baseline': args.baseline_bytecode, 'candidate': args.candidate_bytecode},
                    readiness={}, samples_raw=[])
     workers = {}
 
@@ -40,7 +43,11 @@ def main():
         for name, binary in binaries.items():
             for mode in args.tiers:
                 label = f'{name}/{mode}'
-                process = subprocess.Popen([str(binary), '--tier', mode, '--warmups', '2'],
+                command = [str(binary), '--tier', mode, '--warmups', '2']
+                encoding = results['bytecode_modes'][name]
+                if encoding:
+                    command += ['--bytecode', encoding]
+                process = subprocess.Popen(command,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE, text=True, bufsize=1)
                 workers[label] = process
