@@ -55,6 +55,7 @@ pub struct TierStats {
     pub native_field_hits: u64,
     pub bytecode_positional_calls: u64,
     pub bytecode_leaf_calls: u64,
+    pub bytecode_method_calls: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {

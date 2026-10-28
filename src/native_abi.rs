@@ -23,16 +23,16 @@ pub(crate) const NEST_ENTER: i32 = 8;
 pub(crate) struct Slot {
     pub(crate) tag: u64,
     pub(crate) a: u64,
-    pub(crate) b: u64,
-    pub(crate) c: u64,
 }
 impl Default for Slot {
     fn default() -> Self {
-        Self {
-            tag: EMPTY,
-            a: 0,
-            b: 0,
-            c: 0,
-        }
+        Self { tag: EMPTY, a: 0 }
     }
 }
+
+// Reference tags carry the 32-bit heap identity in their upper half; the payload
+// carries the slot index and generation. Float views pack length/feedback above their kind.
+pub(crate) const KIND_MASK: u64 = 0xff;
+pub(crate) const VIEW_LENGTH_SHIFT: u32 = 9;
+pub(crate) const VIEW_FEEDBACK: u64 = 1 << 8;
+const _: () = assert!(std::mem::size_of::<Slot>() == 16);

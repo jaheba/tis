@@ -1,7 +1,7 @@
 //! Allocation-free native loop regions. Heap views are usable only until the next runtime boundary.
 pub mod nest;
 pub mod schema;
-use crate::native_abi::{REF, Slot};
+use crate::native_abi::{KIND_MASK, REF, Slot};
 use crate::{
     Error, Heap, Object, ObjectId, Result, Value,
     hir::{BlockId, CoreOp},
@@ -217,7 +217,11 @@ impl HeapViews {
         self.visit_epoch += 1;
         while let Some(value) = self.queue.pop() {
             let Value::Ref(id) = value else { continue };
-            let cached = self.descriptors.get(id.index).copied().unwrap_or_default();
+            let cached = self
+                .descriptors
+                .get(id.index as usize)
+                .copied()
+                .unwrap_or_default();
             if cached.generation == id.generation as u64
                 && cached.heap == id.heap as u64
                 && cached.kind != ITERATOR
@@ -225,10 +229,10 @@ impl HeapViews {
                 continue;
             }
             let object = heap.get(value)?;
-            if self.visits[id.index] == self.visit_epoch {
+            if self.visits[id.index as usize] == self.visit_epoch {
                 continue;
             }
-            self.visits[id.index] = self.visit_epoch;
+            self.visits[id.index as usize] = self.visit_epoch;
             let mut d = Descriptor {
                 heap: id.heap as u64,
                 generation: id.generation as u64,
@@ -296,7 +300,7 @@ impl HeapViews {
                 Object::Done => d.kind = DONE,
                 _ => {}
             }
-            self.descriptors[id.index] = d;
+            self.descriptors[id.index as usize] = d;
         }
         // Rust helpers may have reborrowed float buffers. Renew every writable pointer at region entry.
         if self.floats_dirty {
@@ -308,21 +312,21 @@ impl HeapViews {
                 let Some(values) = list.float_view() else {
                     return Ok(false);
                 };
-                self.descriptors[id.index].data = values.as_mut_ptr() as u64;
-                self.descriptors[id.index].len = values.len() as u64;
+                self.descriptors[id.index as usize].data = values.as_mut_ptr() as u64;
+                self.descriptors[id.index as usize].len = values.len() as u64;
             }
             self.floats_dirty = false;
         }
         let Value::Ref(id) = iterator else {
             return Ok(false);
         };
-        let Some(d) = self.descriptors.get(id.index) else {
+        let Some(d) = self.descriptors.get(id.index as usize) else {
             return Ok(false);
         };
-        if d.kind != ITERATOR || d.source.tag != REF {
+        if d.kind != ITERATOR || d.source.tag & KIND_MASK != REF {
             return Ok(false);
         }
-        let Some(source) = self.descriptors.get(d.source.b as usize) else {
+        let Some(source) = self.descriptors.get(d.source.a as u32 as usize) else {
             return Ok(false);
         };
         Ok(matches!(source.kind, TUPLE | LIST | FLOATS | RANGE))

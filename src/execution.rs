@@ -803,6 +803,75 @@ impl Vm {
         Ok(None)
     }
 
+    /// Only builtin containers and strings bind through this path; instances retain normal lookup.
+    pub(crate) fn builtin_method(&self, object: Value, name: &str) -> Result<Option<&'static str>> {
+        let supported = match self.heap.get(object)? {
+            Object::List(_)
+                if [
+                    "append", "extend", "pop", "reverse", "copy", "clear", "insert", "count",
+                    "index", "remove", "sort",
+                ]
+                .contains(&name) =>
+            {
+                true
+            }
+            Object::Dict(_)
+                if [
+                    "values",
+                    "keys",
+                    "items",
+                    "get",
+                    "setdefault",
+                    "update",
+                    "pop",
+                    "copy",
+                    "clear",
+                ]
+                .contains(&name) =>
+            {
+                true
+            }
+            Object::Set(_) if ["add", "discard", "remove", "copy", "clear"].contains(&name) => true,
+            Object::String(_)
+                if [
+                    "join",
+                    "split",
+                    "upper",
+                    "lower",
+                    "strip",
+                    "startswith",
+                    "endswith",
+                    "replace",
+                ]
+                .contains(&name) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if supported {
+            Ok(Some(builtin_method_name(name)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn call_prepared_method(
+        &mut self,
+        receiver: Value,
+        name: &'static str,
+        arguments: &[Value],
+    ) -> Result<Value> {
+        self.tier_stats.bytecode_method_calls += 1;
+        self.tier_stats.bytecode_positional_calls += 1;
+        if name == "sort" {
+            self.sort_list(receiver, arguments, &[])
+        } else {
+            self.tier_stats.bytecode_leaf_calls += 1;
+            self.method(receiver, name, arguments)
+        }
+    }
+
     fn attribute(&mut self, object: Value, name: &str) -> Result<Value> {
         match self.heap.get(object)? {
             Object::Native(module) if module == "math" => {
@@ -843,54 +912,11 @@ impl Vm {
                     return Ok(value);
                 }
             }
-            Object::List(_)
-                if [
-                    "append", "extend", "pop", "reverse", "copy", "clear", "insert", "count",
-                    "index", "remove", "sort",
-                ]
-                .contains(&name) =>
-            {
-                let name = builtin_method_name(name)?;
-                return Ok(self.heap.allocate(Object::Bound(object, name.into())));
+            _ => {
+                if let Some(name) = self.builtin_method(object, name)? {
+                    return Ok(self.heap.allocate(Object::Bound(object, name.into())));
+                }
             }
-            Object::Dict(_)
-                if [
-                    "values",
-                    "keys",
-                    "items",
-                    "get",
-                    "setdefault",
-                    "update",
-                    "pop",
-                    "copy",
-                    "clear",
-                ]
-                .contains(&name) =>
-            {
-                let name = builtin_method_name(name)?;
-                return Ok(self.heap.allocate(Object::Bound(object, name.into())));
-            }
-            Object::Set(_) if ["add", "discard", "remove", "copy", "clear"].contains(&name) => {
-                let name = builtin_method_name(name)?;
-                return Ok(self.heap.allocate(Object::Bound(object, name.into())));
-            }
-            Object::String(_)
-                if [
-                    "join",
-                    "split",
-                    "upper",
-                    "lower",
-                    "strip",
-                    "startswith",
-                    "endswith",
-                    "replace",
-                ]
-                .contains(&name) =>
-            {
-                let name = builtin_method_name(name)?;
-                return Ok(self.heap.allocate(Object::Bound(object, name.into())));
-            }
-            _ => {}
         }
         Err(error(format!("AttributeError: {name}")))
     }

@@ -31,7 +31,7 @@ unsafe fn next(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> u64 {
 }
 #[inline(always)]
 fn scalar(tag: u64, a: u64) -> Slot {
-    Slot { tag, a, b: 0, c: 0 }
+    Slot { tag, a }
 }
 
 #[unsafe(no_mangle)]
@@ -42,16 +42,7 @@ pub unsafe extern "C" fn tis_stencil_constant(
 ) -> u64 {
     unsafe {
         let p = &*patch;
-        write(
-            slots,
-            p.dst,
-            Slot {
-                tag: p.tag,
-                a: p.a,
-                b: p.b,
-                c: p.c,
-            },
-        );
+        write(slots, p.dst, Slot { tag: p.tag, a: p.a });
         next(ctx, slots, p)
     }
 }
@@ -238,11 +229,11 @@ pub unsafe extern "C" fn tis_stencil_truth(
 unsafe fn float_element(slots: *mut Slot, p: &Patch) -> Option<*mut f64> {
     let view = unsafe { read(slots, p.left) };
     let index = if (p.a as i64) < 0 {
-        view.b.wrapping_add(p.a)
+        (view.tag >> VIEW_LENGTH_SHIFT).wrapping_add(p.a)
     } else {
         p.a
     };
-    if index >= view.b {
+    if index >= (view.tag >> VIEW_LENGTH_SHIFT) {
         return None;
     }
     // View creation validates contiguous float storage; verification bounds its lifetime to a call-free block region.
@@ -250,7 +241,7 @@ unsafe fn float_element(slots: *mut Slot, p: &Patch) -> Option<*mut f64> {
 }
 #[inline(always)]
 unsafe fn float_feedback(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> bool {
-    if p.tag != 0 && unsafe { read(slots, p.left) }.c != 0 {
+    if p.tag != 0 && unsafe { read(slots, p.left) }.tag & VIEW_FEEDBACK != 0 {
         let callback: extern "C" fn(*mut c_void, *mut Slot, i32, i32) -> i32 =
             unsafe { std::mem::transmute(p.callback) };
         return callback(ctx, slots, p.event, p.location) == 0;
@@ -340,7 +331,7 @@ pub unsafe extern "C" fn tis_stencil_float_unpack(
     unsafe {
         let p = &*patch;
         write(slots, p.dst, read(slots, p.left));
-        if p.tag != 0 && read(slots, p.right).c != 0 {
+        if p.tag != 0 && read(slots, p.right).tag & VIEW_FEEDBACK != 0 {
             let callback: extern "C" fn(*mut c_void, *mut Slot, i32, i32) -> i32 =
                 std::mem::transmute(p.callback);
             if callback(ctx, slots, p.event, p.location) != 0 {

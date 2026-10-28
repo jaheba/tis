@@ -187,8 +187,6 @@ impl Plan {
                         });
                         p.tag = value.tag;
                         p.a = value.a;
-                        p.b = value.b;
-                        p.c = value.c;
                         "constant"
                     }
                     Operation::GuardInt { value, exit } | Operation::GuardFloat { value, exit } => {

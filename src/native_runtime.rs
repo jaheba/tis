@@ -14,55 +14,37 @@ fn error(message: impl std::fmt::Display) -> Error {
 impl Slot {
     pub(crate) fn boxed(value: Value) -> Self {
         match value {
-            Value::Unbound => Self {
-                tag: UNBOUND,
-                a: 0,
-                b: 0,
-                c: 0,
-            },
-            Value::None => Self {
-                tag: NONE,
-                a: 0,
-                b: 0,
-                c: 0,
-            },
+            Value::Unbound => Self { tag: UNBOUND, a: 0 },
+            Value::None => Self { tag: NONE, a: 0 },
             Value::Bool(v) => Self {
                 tag: BOOL,
                 a: v as u64,
-                b: 0,
-                c: 0,
             },
             Value::Int(v) => Self {
                 tag: INT,
                 a: v as u64,
-                b: 0,
-                c: 0,
             },
             Value::Float(v) => Self {
                 tag: FLOAT,
                 a: v.to_bits(),
-                b: 0,
-                c: 0,
             },
             Value::Ref(id) => Self {
-                tag: REF,
-                a: id.heap as u64,
-                b: id.index as u64,
-                c: id.generation as u64,
+                tag: REF | ((id.heap as u64) << 32),
+                a: id.index as u64 | ((id.generation as u64) << 32),
             },
         }
     }
     pub(crate) fn value(self) -> Result<Value> {
-        Ok(match self.tag {
+        Ok(match self.tag & KIND_MASK {
             UNBOUND => Value::Unbound,
             NONE => Value::None,
             BOOL => Value::Bool(self.a != 0),
             INT => Value::Int(self.a as i64),
             FLOAT => Value::Float(f64::from_bits(self.a)),
             REF => Value::Ref(ObjectId {
-                heap: self.a as usize,
-                index: self.b as usize,
-                generation: self.c as usize,
+                heap: (self.tag >> 32) as u32,
+                index: self.a as u32,
+                generation: (self.a >> 32) as u32,
             }),
             _ => return Err(Error::InvalidIr("native register is not boxed")),
         })
@@ -113,8 +95,6 @@ pub(crate) fn execute(
                     registers[raw.0] = Slot {
                         tag: RAW_FLOAT,
                         a: value.to_bits(),
-                        b: 0,
-                        c: 0,
                     };
                 } else {
                     entry_failure = Some(*exit);
@@ -416,6 +396,8 @@ impl Context<'_> {
         };
         // SAFETY: an active region or nest always has a private metadata slot in this invocation.
         let metadata = unsafe { *self.registers.add(self.lir.registers.len() + 1) };
+        // SAFETY: the second metadata slot carries the descriptor length and loop count.
+        let counts = unsafe { *self.registers.add(self.lir.registers.len() + 2) };
         // SAFETY: generated code is suspended or returned; only this callback reborrows the VM.
         let vm = unsafe { &mut *self.vm };
         let function = self.function.borrow();
@@ -424,7 +406,7 @@ impl Context<'_> {
             let nest = self.nest.ok_or(Error::InvalidIr("active nest metadata"))?;
             for (i, (from, to)) in nest.edges(self.lir).into_iter().enumerate() {
                 // SAFETY: nest compilation reserves one initialized counter slot for every verified edge.
-                let count = unsafe { (*self.registers.add(self.lir.registers.len() + 3 + i)).a };
+                let count = unsafe { (*self.registers.add(self.lir.registers.len() + 4 + i)).a };
                 vm.tier_stats.native_region_iterations =
                     vm.tier_stats.native_region_iterations.saturating_add(count);
                 let edge = profile.backedges.entry((from.0, to.0)).or_default();
@@ -435,12 +417,12 @@ impl Context<'_> {
             vm.tier_stats.native_region_iterations = vm
                 .tier_stats
                 .native_region_iterations
-                .saturating_add(metadata.c);
+                .saturating_add(counts.a);
             let count = profile
                 .backedges
                 .entry((region.body.0, region.header.0))
                 .or_default();
-            *count = count.saturating_add(metadata.c);
+            *count = count.saturating_add(counts.a);
         }
         self.previous = Some(metadata.tag as usize);
         Ok(())
@@ -452,7 +434,7 @@ impl Context<'_> {
         let slots = unsafe {
             std::slice::from_raw_parts_mut(
                 self.registers,
-                self.lir.registers.len() + 3 + nest.edges(self.lir).len(),
+                self.lir.registers.len() + 4 + nest.edges(self.lir).len(),
             )
         };
         if vm.collecting(self.function) {
@@ -512,15 +494,18 @@ impl Context<'_> {
                 }
             }
         }
+        // Auxiliary region state uses two slots: header/pointer, then length/iteration count.
         slots[self.lir.registers.len() + 1] = Slot {
             tag: nest.header.0 as u64,
             a: self.views.descriptors.as_ptr() as u64,
-            b: self.views.descriptors.len() as u64,
-            c: 0,
         };
-        slots[self.lir.registers.len() + 2] = Slot::boxed(done);
+        slots[self.lir.registers.len() + 2] = Slot {
+            tag: self.views.descriptors.len() as u64,
+            a: 0,
+        };
+        slots[self.lir.registers.len() + 3] = Slot::boxed(done);
         for i in 0..nest.edges(self.lir).len() {
-            slots[self.lir.registers.len() + 3 + i] = Slot::default();
+            slots[self.lir.registers.len() + 4 + i] = Slot::default();
         }
         self.active_region = Some(usize::MAX);
         vm.tier_stats.native_region_entries += 1;
@@ -534,9 +519,9 @@ impl Context<'_> {
             .ok_or(Error::InvalidIr("region index"))?;
         // SAFETY: preparation is a synchronous callback into the exclusively borrowed VM.
         let vm = unsafe { &mut *self.vm };
-        // SAFETY: the native region backend allocated two extra slots beyond its ordinary return slot.
+        // SAFETY: the native region backend allocated three auxiliary slots beyond its ordinary return slot.
         let slots =
-            unsafe { std::slice::from_raw_parts_mut(self.registers, self.lir.registers.len() + 3) };
+            unsafe { std::slice::from_raw_parts_mut(self.registers, self.lir.registers.len() + 4) };
         let epoch = vm.heap.collection_epoch();
         let done = match self.region_done {
             Some((saved, value)) if saved == epoch => value,
@@ -563,16 +548,15 @@ impl Context<'_> {
             };
             let source = Slot::boxed(*source);
             self.schema_key.clear();
-            self.schema_key
-                .extend([index as u64, source.tag, source.a, source.b, source.c]);
+            self.schema_key.extend([index as u64, source.tag, source.a]);
             for register in &region.imports {
                 if *register == region.iterator {
                     continue;
                 }
                 let s = slots[register.0];
                 self.schema_key.extend([register.0 as u64, s.tag]);
-                if s.tag == REF {
-                    self.schema_key.extend([s.a, s.b, s.c]);
+                if s.tag & KIND_MASK == REF {
+                    self.schema_key.extend([s.a]);
                 }
             }
             if !self.views.schemas.contains(self.schema_key.as_slice()) {
@@ -589,13 +573,16 @@ impl Context<'_> {
                 self.views.schemas.insert(self.schema_key.clone());
             }
         }
+        // Auxiliary region state uses two slots: header/pointer, then length/iteration count.
         slots[self.lir.registers.len() + 1] = Slot {
             tag: region.header.0 as u64,
             a: self.views.descriptors.as_ptr() as u64,
-            b: self.views.descriptors.len() as u64,
-            c: 0,
         };
-        slots[self.lir.registers.len() + 2] = Slot::boxed(done);
+        slots[self.lir.registers.len() + 2] = Slot {
+            tag: self.views.descriptors.len() as u64,
+            a: 0,
+        };
+        slots[self.lir.registers.len() + 3] = Slot::boxed(done);
         self.active_region = Some(index);
         vm.tier_stats.native_region_entries += 1;
         Ok(())
@@ -649,10 +636,10 @@ impl Context<'_> {
         // The verifier forbids view access after callbacks or across block edges. The owner stays live
         // in the register image; no collection or resizing operation occurs while generated code uses it.
         registers[dst.0] = Slot {
-            tag: FLOAT_VIEW_TAG,
+            tag: FLOAT_VIEW_TAG
+                | ((length as u64) << VIEW_LENGTH_SHIFT)
+                | if self.collecting { VIEW_FEEDBACK } else { 0 },
             a: pointer as u64,
-            b: length as u64,
-            c: self.collecting as u64,
         };
         Ok(())
     }
@@ -890,8 +877,6 @@ impl Context<'_> {
                     Slot {
                         tag: RAW_BOOL,
                         a: crate::runtime::truth(&vm.heap, registers[value.0].value()?)? as u64,
-                        b: 0,
-                        c: 0,
                     }
                 }
                 _ => unreachable!(),
@@ -937,6 +922,47 @@ impl Context<'_> {
             vm.maybe_collect()
         } else {
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_value_tests {
+    use super::*;
+
+    #[test]
+    fn boxed_slots_preserve_all_value_bits() {
+        assert_eq!(std::mem::size_of::<Slot>(), 16);
+        for value in [
+            Value::Unbound,
+            Value::None,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::Ref(ObjectId {
+                heap: u32::MAX,
+                index: u32::MAX,
+                generation: u32::MAX,
+            }),
+        ] {
+            assert_eq!(Slot::boxed(value).value().unwrap(), value);
+        }
+        for bits in [
+            0,
+            1u64 << 63,
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_0000_0000_1234,
+            0xfff8_0000_0000_4321,
+        ] {
+            let Value::Float(result) = Slot::boxed(Value::Float(f64::from_bits(bits)))
+                .value()
+                .unwrap()
+            else {
+                panic!("float changed kind");
+            };
+            assert_eq!(result.to_bits(), bits);
         }
     }
 }

@@ -23,6 +23,7 @@ pub(crate) enum Opcode {
     Len,
     Runtime,
     CallPositional,
+    PrepareMethod,
     Numeric,
     LoadLocal,
     StoreLocal,
@@ -64,10 +65,48 @@ fn operand(value: usize) -> Result<u32> {
 impl RegisterCode {
     pub fn lower(function: &Function, code: &Code) -> Result<Self> {
         let mut output = Self::default();
+        let mut uses = vec![0usize; code.sites.len()];
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                for input in instruction.op.inputs() {
+                    uses[input.0] += 1;
+                }
+            }
+            match &block.terminator {
+                Some(Terminator::Return(value)) => uses[value.0] += 1,
+                Some(Terminator::Jump(edge)) => {
+                    for input in &edge.arguments {
+                        uses[input.0] += 1;
+                    }
+                }
+                Some(Terminator::Branch { condition, yes, no }) => {
+                    uses[condition.0] += 1;
+                    for input in yes.arguments.iter().chain(&no.arguments) {
+                        uses[input.0] += 1;
+                    }
+                }
+                None => {}
+            }
+        }
         for (id, block) in function.blocks.iter().enumerate() {
             output.blocks.push(output.body.len());
             output.emit(Opcode::EnterBlock, 0, id, 0, 0)?;
             let mut offsets = vec![];
+            // Only a single-use callee consumed in this block may carry an unboxed binding.
+            // Escaping methods and values crossing block edges retain ordinary Python objects.
+            let callees: std::collections::HashSet<_> = block
+                .instructions
+                .iter()
+                .filter_map(|instruction| {
+                    if let Op::Runtime(CoreOp::Call(names), inputs) = &instruction.op
+                        && names.iter().all(Option::is_none)
+                    {
+                        inputs.first().copied()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             for instruction in &block.instructions {
                 offsets.push(output.body.len());
                 let dst = instruction.result.0;
@@ -100,6 +139,16 @@ impl RegisterCode {
                     }
                     Op::Runtime(CoreOp::CheckLocal(slot), inputs) => {
                         (Opcode::CheckLocal, *slot, inputs[0].0, 0)
+                    }
+                    Op::Runtime(CoreOp::GetAttr(_), inputs)
+                        if uses[dst] == 1 && callees.contains(&instruction.result) =>
+                    {
+                        (
+                            Opcode::PrepareMethod,
+                            inputs[0].0,
+                            site.runtime.ok_or(Error::InvalidIr("method lookup"))?,
+                            0,
+                        )
                     }
                     Op::Runtime(CoreOp::Call(names), _) if names.iter().all(Option::is_none) => {
                         (Opcode::CallPositional, 0, 0, 0)
@@ -224,7 +273,7 @@ impl RegisterCode {
         for (id, edge) in self.body.iter().enumerate() {
             if matches!(
                 edge.op,
-                Opcode::Runtime | Opcode::Numeric | Opcode::CallPositional
+                Opcode::Runtime | Opcode::Numeric | Opcode::CallPositional | Opcode::PrepareMethod
             ) {
                 let (operation, _) = code
                     .operations
@@ -234,6 +283,8 @@ impl RegisterCode {
                                 .as_ref()
                                 .and_then(|site| site.runtime)
                                 .ok_or(Error::InvalidIr("runtime operation"))?
+                        } else if matches!(edge.op, Opcode::PrepareMethod) {
+                            edge.b as usize
                         } else {
                             edge.a as usize
                         },

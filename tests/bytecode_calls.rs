@@ -89,3 +89,54 @@ assert next(views[3])[0] is a"#,
     assert!(vm.collect_garbage(&[foreign]).is_err());
     assert_eq!(before, vm.heap.allocation_count());
 }
+
+#[test]
+fn immediate_builtin_methods_keep_receivers_alive_across_argument_calls() {
+    let source = r#"
+def churn():
+    for i in range(7000):
+        garbage=[i]
+    return 42
+# The temporary list is kept alive only by the prepared callee register.
+assert [].count(churn()) == 0
+xs=[]
+xs.append(xs.count(churn()))
+assert xs == [0]
+old=xs
+# Rebinding the receiver name during argument evaluation must not change the callee.
+def rebind():
+    global xs
+    xs=[]
+    return 123
+old.append(rebind())
+assert old == [0,123]
+assert xs == []
+# Escaping methods must remain real callable objects.
+f=old.append
+f(456)
+assert old == [0,123,456]
+"#;
+    let vm = run(source, BytecodeMode::Register);
+    assert!(vm.tier_stats.bytecode_method_calls > 0);
+}
+
+#[test]
+fn prepared_method_errors_precede_argument_side_effects() {
+    let mut vm = Vm::new();
+    let mut program =
+        compile("events=[]\ndef arg():\n    events.append(1)\n    return 2\n[].missing(arg())")
+            .unwrap();
+    assert!(vm.run_program(&mut program).is_err());
+    let mut check = compile("assert events == []").unwrap();
+    vm.run_program(&mut check).unwrap();
+}
+
+#[test]
+fn eager_feedback_materializes_builtin_callees() {
+    let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
+    let mut program = compile("xs=[]\nfor i in range(200):\n    xs.append(i)\nassert len(xs)==200\nxs.sort()\nassert xs[0]==0").unwrap();
+    vm.run_program(&mut program).unwrap();
+    assert_eq!(vm.tier_stats.bytecode_method_calls, 0);
+    assert!(vm.tier_stats.bytecode_leaf_calls > 0);
+}

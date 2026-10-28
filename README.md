@@ -60,6 +60,25 @@ An internal unbound marker crosses joins without becoming Python `None`.
 Names referenced anywhere in a nested scope conservatively stay in shared environments, even when shadowed there.
 Module/class namespaces and global/nonlocal bindings retain their named lookup rules.
 
+## Values and heap lifetimes
+
+`Value` and `Option<Value>` are 16 bytes, including full-width `i64` and `f64` payloads.
+A 32-bit enum discriminant leaves room for a reference's three 32-bit fields:
+heap identity, arena slot and slot generation. Heap identities never wrap; each reused slot
+advances its generation with checked arithmetic. Each field is limited to `u32::MAX`;
+exhaustion panics rather than accepting a stale or foreign reference. Generations count
+reuse of one slot, not total allocations across the heap.
+
+Values are non-owning copies. Tracing mark-and-sweep GC retains stack, environment and
+explicitly pinned roots; copying a reference performs no reference counting. Host-held
+values need `Vm::pin` or an explicit collection root to survive collection.
+
+The native ABI also uses 16-byte slots: a tag word and a payload word. References pack
+the heap identity into the tag's upper half and the slot/generation into the payload.
+Rust enum layout is not transmuted into this ABI; helpers explicitly encode and decode it.
+Both native backends use the same ABI. Float views pack their length and feedback flag
+into the tag; loop-region metadata uses separate auxiliary slots.
+
 ## Rust API
 
 ```rust

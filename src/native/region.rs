@@ -34,16 +34,24 @@ impl Emitter<'_, '_> {
             .ins()
             .load(types::I64, MemFlagsData::new(), p, offset as i32)
     }
-    fn resolve_words(&mut self, words: [ir::Value; 4], exit: lir::ExitId) -> Result<ir::Value> {
+    fn resolve_words(&mut self, words: [ir::Value; 2], exit: lir::ExitId) -> Result<ir::Value> {
         // A verified schema validates every source item and imported path before entry. The region
         // cannot allocate, collect, call Python or change container shapes, so those pointers stay valid.
-        let is_ref = self.b.ins().icmp_imm_s(IntCC::Equal, words[0], REF as i64);
+        let kind = self.b.ins().band_imm_s(words[0], KIND_MASK as i64);
+        let is_ref = self.b.ins().icmp_imm_s(IntCC::Equal, kind, REF as i64);
         if self.region.schema.is_none() {
             self.guard(is_ref, exit)?;
         }
         let meta = Register(self.lir.registers.len() + 1);
-        let len = load(self.b, self.registers, meta, 16, types::I64)?;
-        let bounds = self.b.ins().icmp(IntCC::UnsignedLessThan, words[2], len);
+        let len = load(
+            self.b,
+            self.registers,
+            Register(self.lir.registers.len() + 2),
+            0,
+            types::I64,
+        )?;
+        let index = self.b.ins().band_imm_s(words[1], u32::MAX as i64);
+        let bounds = self.b.ins().icmp(IntCC::UnsignedLessThan, index, len);
         if self.region.schema.is_none() {
             self.guard(bounds, exit)?;
         }
@@ -51,24 +59,24 @@ impl Emitter<'_, '_> {
         let offset = self
             .b
             .ins()
-            .imul_imm_s(words[2], size_of::<Descriptor>() as i64);
+            .imul_imm_s(index, size_of::<Descriptor>() as i64);
         let pointer = self.b.ins().iadd(base, offset);
         let heap = self.field(pointer, offset_of!(Descriptor, heap));
         let generation = self.field(pointer, offset_of!(Descriptor, generation));
-        let h = self.b.ins().icmp(IntCC::Equal, heap, words[1]);
-        let g = self.b.ins().icmp(IntCC::Equal, generation, words[3]);
+        let owner = self.b.ins().ushr_imm_s(words[0], 32);
+        let version = self.b.ins().ushr_imm_s(words[1], 32);
+        let h = self.b.ins().icmp(IntCC::Equal, heap, owner);
+        let g = self.b.ins().icmp(IntCC::Equal, generation, version);
         let valid = self.b.ins().band(h, g);
         if self.region.schema.is_none() {
             self.guard(valid, exit)?;
         }
         Ok(pointer)
     }
-    fn words(&mut self, r: Register) -> Result<[ir::Value; 4]> {
+    fn words(&mut self, r: Register) -> Result<[ir::Value; 2]> {
         Ok([
             load_cached(self.b, self.scalars, self.registers, r, 0, types::I64)?,
             load_cached(self.b, self.scalars, self.registers, r, 8, types::I64)?,
-            load_cached(self.b, self.scalars, self.registers, r, 16, types::I64)?,
-            load_cached(self.b, self.scalars, self.registers, r, 24, types::I64)?,
         ])
     }
     fn resolve(&mut self, r: Register, exit: lir::ExitId) -> Result<ir::Value> {
@@ -85,7 +93,7 @@ impl Emitter<'_, '_> {
             let bits = self.field(pointer, 8);
             store_scalar_cached(self.b, self.scalars, self.registers, dst, FLOAT, bits)?;
         } else {
-            for field in [0, 8, 16, 24] {
+            for field in [0, 8] {
                 let value = self.field(pointer, field as usize);
                 store_word_cached(self.b, self.scalars, self.registers, dst, field, value)?;
             }
@@ -142,7 +150,7 @@ impl Emitter<'_, '_> {
         store_scalar_cached(self.b, self.scalars, self.registers, dst, FLOAT, bits)?;
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(values);
-        let off = self.b.ins().ishl_imm_u(index, 5);
+        let off = self.b.ins().imul_imm_s(index, size_of::<Slot>() as i64);
         let p = self.b.ins().iadd(data, off);
         self.boxed_at(p, dst)?;
         self.b.ins().jump(done, &[]);
@@ -186,7 +194,8 @@ impl Emitter<'_, '_> {
         }
         // These references name freshly prepared, non-escaping iterator objects. No allocation, call or
         // collection can replace them while the closed nest executes.
-        let index = load_cached(self.b, self.scalars, self.registers, value, 16, types::I64)?;
+        let payload = load_cached(self.b, self.scalars, self.registers, value, 8, types::I64)?;
+        let index = self.b.ins().band_imm_s(payload, u32::MAX as i64);
         let base = load(
             self.b,
             self.registers,
@@ -243,13 +252,10 @@ impl Emitter<'_, '_> {
                 }
                 let data = self.field(p, offset_of!(Descriptor, data));
                 let dst = dst.unwrap();
-                for (field, value) in [(8, data), (16, len)] {
-                    store_word_cached(self.b, self.scalars, self.registers, dst, field, value)?;
-                }
-                let tag = self.b.ins().iconst(types::I64, FLOAT_VIEW_TAG as i64);
+                store_word_cached(self.b, self.scalars, self.registers, dst, 8, data)?;
+                let length = self.b.ins().ishl_imm_s(len, VIEW_LENGTH_SHIFT as i64);
+                let tag = self.b.ins().bor_imm_s(length, FLOAT_VIEW_TAG as i64);
                 store_word_cached(self.b, self.scalars, self.registers, dst, 0, tag)?;
-                let zero = self.b.ins().iconst(types::I64, 0);
-                store_word_cached(self.b, self.scalars, self.registers, dst, 24, zero)?;
             }
             Operation::SequenceUnpack {
                 value,
@@ -289,7 +295,7 @@ impl Emitter<'_, '_> {
                 }
                 if *kind == crate::sequence::SequenceKind::Tuple {
                     let data = self.field(p, offset_of!(Descriptor, data));
-                    let off = self.b.ins().ishl_imm_u(index, 5);
+                    let off = self.b.ins().imul_imm_s(index, size_of::<Slot>() as i64);
                     let pointer = self.b.ins().iadd(data, off);
                     self.boxed_at(pointer, dst.unwrap())?;
                 } else {
@@ -313,7 +319,7 @@ impl Emitter<'_, '_> {
                     let valid = self.b.ins().icmp_imm_s(IntCC::Equal, kind, ITERATOR as i64);
                     self.guard(valid, exit)?;
                     let mut words = vec![];
-                    for field in [0, 8, 16, 24] {
+                    for field in [0, 8] {
                         words.push(self.field(iterator, offset_of!(Descriptor, source) + field));
                     }
                     let source = self.resolve_words(words.try_into().unwrap(), exit)?;
@@ -388,7 +394,7 @@ impl Emitter<'_, '_> {
                     self.b,
                     self.scalars,
                     self.registers,
-                    &[(Register(self.lir.registers.len() + 2), dst.unwrap())],
+                    &[(Register(self.lir.registers.len() + 3), dst.unwrap())],
                 )?;
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -433,7 +439,8 @@ impl Emitter<'_, '_> {
                     return Ok(true);
                 }
                 let words = self.words(arguments[0])?;
-                let is_ref = self.b.ins().icmp_imm_s(IntCC::Equal, words[0], REF as i64);
+                let kind = self.b.ins().band_imm_s(words[0], KIND_MASK as i64);
+                let is_ref = self.b.ins().icmp_imm_s(IntCC::Equal, kind, REF as i64);
                 let reference = self.b.create_block();
                 let scalar = self.b.create_block();
                 let done = self.b.create_block();

@@ -68,7 +68,7 @@ impl NativeCode {
         allow_nest: bool,
     ) -> Result<Self> {
         lir.verify()?;
-        if std::mem::size_of::<usize>() != 8 || std::mem::size_of::<Slot>() != 32 {
+        if std::mem::size_of::<usize>() != 8 || std::mem::size_of::<Slot>() != 16 {
             return Err(error("native backend requires 64-bit pointers"));
         }
         // Region code exposes enough SSA to optimize; Cranelift's default skips its optimization pipeline.
@@ -318,7 +318,7 @@ impl NativeCode {
                             .unwrap()
                             .initialize(&mut b, registers, &owner.lir)?;
                         for (recipe, vars) in n.private_iterators.iter().zip(&private_vars) {
-                            for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                            for (field, var) in [0, 8].into_iter().zip(vars) {
                                 let value =
                                     load(&mut b, registers, recipe.result, field, types::I64)?;
                                 b.def_var(*var, value);
@@ -397,7 +397,7 @@ impl NativeCode {
                             .iter()
                             .position(|p| Some(p.result) == destination)
                             .ok_or(Error::InvalidIr("private iterator definition"))?;
-                        for (field, var) in [0, 8, 16, 24].into_iter().zip(private_vars[i]) {
+                        for (field, var) in [0, 8].into_iter().zip(private_vars[i]) {
                             let value = b.use_var(var);
                             store_word_cached(
                                 &mut b,
@@ -460,8 +460,9 @@ impl NativeCode {
                         } => {
                             let pointer =
                                 load_cached(&mut b, &scalars, registers, *view, 8, types::I64)?;
-                            let len =
-                                load_cached(&mut b, &scalars, registers, *view, 16, types::I64)?;
+                            let tag =
+                                load_cached(&mut b, &scalars, registers, *view, 0, types::I64)?;
+                            let len = b.ins().ushr_imm_s(tag, VIEW_LENGTH_SHIFT as i64);
                             let index = if *index < 0 {
                                 b.ins().iadd_imm_s(len, *index)
                             } else {
@@ -804,8 +805,8 @@ impl NativeCode {
                         | Operation::FloatListStore { view, .. }
                         | Operation::FloatListUnpack { view, .. } = &instruction.operation
                     {
-                        let sample =
-                            load_cached(&mut b, &scalars, registers, *view, 24, types::I64)?;
+                        let tag = load_cached(&mut b, &scalars, registers, *view, 0, types::I64)?;
+                        let sample = b.ins().band_imm_s(tag, VIEW_FEEDBACK as i64);
                         let record = b.create_block();
                         let done = b.create_block();
                         b.ins().brif(sample, record, &[], done, &[]);
@@ -1006,7 +1007,7 @@ impl NativeCode {
             Some(&self.root_states),
             !self.feedback && !self.lir.regions.is_empty(),
             self.nest.as_ref(),
-            2 + self.nest.as_ref().map_or(0, |n| n.edges(&self.lir).len()),
+            3 + self.nest.as_ref().map_or(0, |n| n.edges(&self.lir).len()),
             |context, registers, start| {
                 // SAFETY: the shared bridge keeps its Context and register allocation alive for this call.
                 unsafe { self.entry.unwrap()(context, registers, start) }
@@ -1023,10 +1024,15 @@ impl NativeCode {
 }
 
 fn offset(register: Register, field: i32) -> Result<i32> {
-    i32::try_from(register.0.checked_mul(32).ok_or(Error::IntegerOverflow)?)
-        .ok()
-        .and_then(|v| v.checked_add(field))
-        .ok_or(Error::IntegerOverflow)
+    i32::try_from(
+        register
+            .0
+            .checked_mul(std::mem::size_of::<Slot>())
+            .ok_or(Error::IntegerOverflow)?,
+    )
+    .ok()
+    .and_then(|v| v.checked_add(field))
+    .ok_or(Error::IntegerOverflow)
 }
 fn load(
     b: &mut FunctionBuilder<'_>,
@@ -1077,7 +1083,7 @@ fn copy_slots(
 ) -> Result<()> {
     let mut copies = vec![];
     for &(from, to) in pairs {
-        for field in [0, 8, 16, 24] {
+        for field in [0, 8] {
             copies.push((
                 to,
                 field,
@@ -1125,11 +1131,11 @@ fn edge_jump(
         } else {
             for (index, r) in lir.regions.iter().enumerate() {
                 if from == r.body.0 && edge.block == r.header {
-                    let meta = Register(lir.registers.len() + 1);
-                    let count = load(b, registers, meta, 24, types::I64)?;
+                    let meta = Register(lir.registers.len() + 2);
+                    let count = load(b, registers, meta, 8, types::I64)?;
                     let next = b.ins().iadd_imm_s(count, 1);
                     b.ins()
-                        .store(MemFlagsData::new(), next, registers, offset(meta, 24)?);
+                        .store(MemFlagsData::new(), next, registers, offset(meta, 8)?);
                 }
                 if (from == r.header.0 || from == r.body.0)
                     && edge.block != r.header
@@ -1169,7 +1175,7 @@ fn edge_jump(
 struct ScalarVars(
     Vec<Option<(Variable, ir::Type)>>,
     Vec<Option<Variable>>,
-    Vec<Option<[Variable; 4]>>,
+    Vec<Option<[Variable; 2]>>,
 );
 impl ScalarVars {
     fn new(b: &mut FunctionBuilder<'_>, lir: &lir::Function, defer: bool) -> Self {
@@ -1217,7 +1223,7 @@ impl ScalarVars {
                 let bits = b.ins().bitcast(types::I64, MemFlagsData::new(), value);
                 store_scalar(b, registers, register, FLOAT, bits)?;
             } else if let Some(vars) = self.2[register.0] {
-                for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                for (field, var) in [0, 8].into_iter().zip(vars) {
                     let value = b.use_var(var);
                     b.ins().store(
                         MemFlagsData::new(),
@@ -1255,7 +1261,7 @@ impl ScalarVars {
             if let Some(r) = instruction.result
                 && let Some(vars) = self.2[r.0]
             {
-                for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                for (field, var) in [0, 8].into_iter().zip(vars) {
                     let value = load(b, registers, r, field, types::I64)?;
                     b.def_var(var, value);
                 }
@@ -1285,7 +1291,7 @@ impl ScalarVars {
         }
         for (index, vars) in self.2.iter().enumerate() {
             if let Some(vars) = vars {
-                for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                for (field, var) in [0, 8].into_iter().zip(vars) {
                     let value = load(b, registers, Register(index), field, types::I64)?;
                     b.def_var(*var, value);
                 }
@@ -1320,9 +1326,6 @@ fn load_cached(
                 b.ins().bitcast(ty, MemFlagsData::new(), value)
             });
         }
-    }
-    if scalars.1.get(register.0).copied().flatten().is_some() && matches!(field, 16 | 24) {
-        return Ok(b.ins().iconst(ty, 0));
     }
     if let Some(vars) = scalars.2.get(register.0).copied().flatten() {
         let value = b.use_var(vars[field as usize / 8]);
@@ -1367,7 +1370,7 @@ fn store_constant_cached(
     r: Register,
     value: Slot,
 ) -> Result<()> {
-    for (field, word) in [(0, value.tag), (8, value.a), (16, value.b), (24, value.c)] {
+    for (field, word) in [(0, value.tag), (8, value.a)] {
         let word = b.ins().iconst(types::I64, word as i64);
         store_word_cached(b, scalars, registers, r, field, word)?;
     }
@@ -1401,9 +1404,6 @@ fn store_scalar_cached(
         let tag = b.ins().iconst(types::I64, tag as i64);
         store_word_cached(b, scalars, registers, register, 0, tag)?;
         store_word_cached(b, scalars, registers, register, 8, value)?;
-        let zero = b.ins().iconst(types::I64, 0);
-        store_word_cached(b, scalars, registers, register, 16, zero)?;
-        store_word_cached(b, scalars, registers, register, 24, zero)?;
         return Ok(());
     }
     store_scalar(b, registers, register, tag, value)

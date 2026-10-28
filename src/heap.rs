@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::{Error, ObjectId, Result, Value};
@@ -28,7 +28,7 @@ impl HeapId {
     }
 }
 
-static NEXT_HEAP: AtomicUsize = AtomicUsize::new(1);
+static NEXT_HEAP: AtomicU32 = AtomicU32::new(1);
 
 /// Dictionary keys are owned, so string keys do not depend on another object.
 #[derive(Debug, Clone)]
@@ -109,13 +109,18 @@ struct Entry {
     object: Object,
 }
 
+#[derive(Debug)]
+struct Generation {
+    version: u32,
+    live: bool,
+}
+
 /// Monty's stable paged arena, with generation-checked handles and explicit-root collection.
 #[derive(Debug)]
 pub struct Heap {
-    identity: usize,
+    identity: u32,
     entries: StableHeap<Entry>,
-    generations: RefCell<Vec<Option<usize>>>,
-    next_generation: Cell<usize>,
+    generations: RefCell<Vec<Generation>>,
     live: Cell<usize>,
     collection_epoch: usize,
 }
@@ -123,10 +128,11 @@ pub struct Heap {
 impl Heap {
     pub fn new() -> Self {
         Self {
-            identity: NEXT_HEAP.fetch_add(1, Ordering::Relaxed),
+            identity: NEXT_HEAP
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("heap identity exhausted"),
             entries: StableHeap::with_capacity(16),
             generations: RefCell::new(Vec::new()),
-            next_generation: Cell::new(1),
             live: Cell::new(0),
             collection_epoch: 0,
         }
@@ -134,24 +140,29 @@ impl Heap {
 
     /// Stable pages permit allocation while another object's shared reference is alive.
     pub fn allocate(&self, object: Object) -> Value {
-        let generation = self.next_generation.get();
-        self.next_generation.set(
-            generation
-                .checked_add(1)
-                .expect("heap generation exhausted"),
-        );
         let id = self.entries.allocate(Entry { object });
         self.live.set(self.live.get() + 1);
         let mut generations = self.generations.borrow_mut();
+        let index = u32::try_from(id.index()).expect("heap slot index exhausted");
         if id.index() == generations.len() {
-            generations.push(Some(generation));
+            generations.push(Generation {
+                version: 1,
+                live: true,
+            });
         } else {
-            generations[id.index()] = Some(generation);
+            let slot = &mut generations[id.index()];
+            // Count reuse per slot, rather than imposing a 32-bit allocation limit on the heap.
+            // Exhaustion must fail instead of making a stale identity valid again.
+            slot.version = slot
+                .version
+                .checked_add(1)
+                .expect("heap slot generation exhausted");
+            slot.live = true;
         }
         Value::Ref(ObjectId {
             heap: self.identity,
-            index: id.index(),
-            generation,
+            index,
+            generation: generations[id.index()].version,
         })
     }
 
@@ -290,12 +301,12 @@ impl Heap {
         // therefore leave all objects intact, without requiring a temporary garbage vector.
         let mut freed = 0;
         for (index, generation) in self.generations.get_mut().iter_mut().enumerate() {
-            if generation.is_some() && !marked[index] {
+            if generation.live && !marked[index] {
                 self.entries
                     .entry(HeapId::from_index(index))
                     .expect("live generation has an entry")
                     .free();
-                *generation = None;
+                generation.live = false;
                 freed += 1;
             }
         }
@@ -315,11 +326,15 @@ impl Heap {
             return Err(Error::Type("expected an object"));
         };
         if id.heap != self.identity
-            || self.generations.borrow().get(id.index).copied().flatten() != Some(id.generation)
+            || !self
+                .generations
+                .borrow()
+                .get(id.index as usize)
+                .is_some_and(|slot| slot.live && slot.version == id.generation)
         {
             return Err(Error::InvalidObject);
         }
-        Ok(HeapId::from_index(id.index))
+        Ok(HeapId::from_index(id.index as usize))
     }
 }
 

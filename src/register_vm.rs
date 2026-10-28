@@ -21,6 +21,8 @@ impl Vm {
         let register = &code.register;
         let mut collecting = self.collecting(function);
         let mut arguments = Vec::with_capacity(register.max_arguments.min(8));
+        // A prepared callee's register holds its receiver, so it remains a GC root.
+        let mut methods: Vec<(ValueId, Value, &'static str)> = Vec::new();
         let mut transfers = Vec::with_capacity(register.max_transfer);
         loop {
             let instruction = *register
@@ -35,6 +37,7 @@ impl Vm {
             let op = instruction.op;
             match op {
                 Opcode::EnterBlock => {
+                    self.materialize_methods(base, &mut methods)?;
                     let backedge = self.record_block(function, code, a, previous)?;
                     collecting = self.collecting(function);
                     previous = Some(a);
@@ -82,6 +85,9 @@ impl Vm {
                 }
                 Opcode::Return => return self.read(base, ValueId(a)),
                 _ => {}
+            }
+            if collecting && !methods.is_empty() {
+                self.materialize_methods(base, &mut methods)?;
             }
             let destination = ValueId(instruction.dst as usize);
             let mut observed =
@@ -179,6 +185,22 @@ impl Vm {
                         self.check_local(a, value)?;
                         value
                     }
+                    Opcode::PrepareMethod => {
+                        let receiver = self.read(base, ValueId(a))?;
+                        let (operation, _) = &code.operations[b];
+                        let crate::hir::CoreOp::GetAttr(name) = operation else {
+                            return Err(Error::InvalidIr("method lookup"));
+                        };
+                        if !collecting
+                            && self.tiering == crate::Tiering::Bytecode
+                            && let Some(name) = self.builtin_method(receiver, name)?
+                        {
+                            methods.push((destination, receiver, name));
+                            receiver
+                        } else {
+                            self.operation(operation, &[receiver])?
+                        }
+                    }
                     Opcode::CallPositional => {
                         let inputs = &code.sites[destination.0]
                             .as_ref()
@@ -192,7 +214,13 @@ impl Vm {
                         for &input in inputs {
                             arguments.push(self.read(base, input)?);
                         }
-                        self.call_from_registers(callable, &arguments)?
+                        if let Some(index) = methods.iter().position(|(slot, _, _)| *slot == callee)
+                        {
+                            let (_, receiver, name) = methods.swap_remove(index);
+                            self.call_prepared_method(receiver, name, &arguments)?
+                        } else {
+                            self.call_from_registers(callable, &arguments)?
+                        }
                     }
                     Opcode::Runtime
                     | Opcode::Numeric
@@ -256,6 +284,18 @@ impl Vm {
 }
 
 impl Vm {
+    fn materialize_methods(
+        &mut self,
+        base: usize,
+        methods: &mut Vec<(ValueId, Value, &'static str)>,
+    ) -> Result<()> {
+        for (slot, receiver, name) in methods.drain(..) {
+            let method = self.heap.allocate(Object::Bound(receiver, name.into()));
+            self.write(base, slot, method)?;
+        }
+        Ok(())
+    }
+
     fn numeric_miss(
         &mut self,
         function: &Rc<RefCell<Function>>,

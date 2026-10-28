@@ -48,7 +48,8 @@ impl NestVars {
         iterator: Register,
     ) -> Result<(ir::Value, ir::Value)> {
         // Physical slots contain entry-prepared references, even before their logical Iter definitions.
-        let index = load(b, registers, iterator, 16, types::I64)?;
+        let payload = load(b, registers, iterator, 8, types::I64)?;
+        let index = b.ins().band_imm_s(payload, u32::MAX as i64);
         let base = load(
             b,
             registers,
@@ -88,15 +89,17 @@ impl NestVars {
                 8,
                 types::I64,
             )?;
-            let id = load(b, registers, state.iterator, 16, types::I64)?;
+            let payload = load(b, registers, state.iterator, 8, types::I64)?;
+            let id = b.ins().band_imm_s(payload, u32::MAX as i64);
             let off = b.ins().imul_imm_s(id, size_of::<Descriptor>() as i64);
             let iterator = b.ins().iadd(base, off);
             let source_id = b.ins().load(
                 types::I64,
                 MemFlagsData::new(),
                 iterator,
-                (offset_of!(Descriptor, source) + 16) as i32,
+                (offset_of!(Descriptor, source) + 8) as i32,
             );
+            let source_id = b.ins().band_imm_s(source_id, u32::MAX as i64);
             let off = b
                 .ins()
                 .imul_imm_s(source_id, size_of::<Descriptor>() as i64);
@@ -147,7 +150,7 @@ impl NestVars {
                 MemFlagsData::new(),
                 count,
                 registers,
-                offset(Register(lir.registers.len() + 3 + i), 8)?,
+                offset(Register(lir.registers.len() + 4 + i), 8)?,
             );
         }
         b.ins().jump(done, &[]);
