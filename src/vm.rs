@@ -20,6 +20,7 @@ pub struct Vm {
     pub bytecode: crate::BytecodeMode,
     pub numeric: crate::NumericMode,
     pub capture_native_code: bool,
+    pub disable_native_nests: bool,
     pub(crate) copy_artifacts: std::collections::BTreeMap<
         (crate::profile::FunctionId, u64),
         Rc<crate::copy_patch::CopyCode>,

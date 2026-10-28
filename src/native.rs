@@ -1,5 +1,6 @@
 //! Cranelift gateway with guarded heap views and explicit runtime materialization boundaries.
 mod region;
+mod virtual_iter;
 use crate::{
     Error, Result, Value, Vm,
     bytecode::Code,
@@ -34,6 +35,7 @@ pub(crate) struct NativeCode {
     pub bytes: usize,
     pub feedback: bool,
     pub diagnostics: Option<NativeDiagnostics>,
+    pub nest: Option<crate::region::nest::LoopNest>,
 }
 impl fmt::Debug for NativeCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,7 +61,12 @@ fn error(message: impl fmt::Display) -> Error {
 }
 
 impl NativeCode {
-    pub fn compile(lir: Rc<lir::Function>, feedback: bool, capture: bool) -> Result<Self> {
+    pub fn compile(
+        lir: Rc<lir::Function>,
+        feedback: bool,
+        capture: bool,
+        allow_nest: bool,
+    ) -> Result<Self> {
         lir.verify()?;
         if std::mem::size_of::<usize>() != 8 || std::mem::size_of::<Slot>() != 32 {
             return Err(error("native backend requires 64-bit pointers"));
@@ -92,12 +99,15 @@ impl NativeCode {
         let mut owner = Self {
             module: Some(JITModule::new(jit)),
             entry: None,
-            lir,
+            lir: lir.clone(),
             locations: vec![],
             root_states,
             bytes: 0,
             feedback,
             diagnostics: None,
+            nest: (!feedback && allow_nest)
+                .then(|| lir.nest.clone())
+                .flatten(),
         };
         let module = owner.module.as_mut().unwrap();
         let ptr = module.target_config().pointer_type();
@@ -164,12 +174,52 @@ impl NativeCode {
                     v
                 })
                 .collect::<Vec<_>>();
+            let private_vars = owner
+                .nest
+                .as_ref()
+                .map(|n| {
+                    n.private_iterators
+                        .iter()
+                        .map(|_| {
+                            std::array::from_fn::<_, 4, _>(|_| {
+                                let v = b.declare_var(types::I64);
+                                let zero = b.ins().iconst(types::I64, 0);
+                                b.def_var(v, zero);
+                                v
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut region_active = region_active;
+            if owner.nest.is_some() {
+                let v = b.declare_var(types::I64);
+                let zero = b.ins().iconst(types::I64, 0);
+                b.def_var(v, zero);
+                region_active.push(v);
+            }
+            let nest_vars = owner.nest.as_ref().map(|n| {
+                virtual_iter::NestVars::new(&mut b, n, &owner.lir, *region_active.last().unwrap())
+            });
+            let outer_region = owner.nest.as_ref().map(|n| crate::region::LoopRegion {
+                header: n.header,
+                body: n.tail,
+                iterator: n.iterator,
+                entry: n.entry,
+                imports: n.imports.clone(),
+                schema: None,
+            });
             let power_ref = module.declare_func_in_func(power_id, b.func);
             let blocks = (0..owner.lir.blocks.len())
                 .map(|_| b.create_block())
                 .collect::<Vec<_>>();
             let failed = b.create_block();
             for (index, &target) in blocks.iter().enumerate() {
+                if owner.nest.as_ref().is_some_and(|n| {
+                    n.blocks.contains(&crate::hir::BlockId(index)) && n.header.0 != index
+                }) {
+                    continue;
+                }
                 // A region body requires its prepared header. Even the private entry dispatcher must not
                 // admit an unprepared jump past guards whose checks have been hoisted out of the loop.
                 if !feedback && owner.lir.regions.iter().any(|r| r.body.0 == index) {
@@ -221,6 +271,9 @@ impl NativeCode {
                     let failed = $builder.create_block();
                     $builder.ins().brif($passed, success, &[], failed, &[]);
                     $builder.switch_to_block(failed);
+                    if let Some(vars) = &nest_vars {
+                        vars.publish($builder, registers, &owner.lir)?;
+                    }
                     let state = &owner.lir.states[owner.lir.exits[exit.0].state.0];
                     scalars.materialize($builder, registers, state_values(state))?;
                     let status = $builder.ins().iconst(types::I64, exit.0 as i64 + 1);
@@ -239,7 +292,43 @@ impl NativeCode {
                             .position(|r| r.header.0 == block_index || r.body.0 == block_index)
                     })
                     .flatten();
-                if let Some(index) = region_index {
+                let in_nest = owner
+                    .nest
+                    .as_ref()
+                    .is_some_and(|n| n.blocks.contains(&crate::hir::BlockId(block_index)));
+                if in_nest {
+                    let n = owner.nest.as_ref().unwrap();
+                    if n.header.0 == block_index {
+                        let active = b.use_var(*region_active.last().unwrap());
+                        let prepare = b.create_block();
+                        let ready = b.create_block();
+                        b.ins().brif(active, ready, &[], prepare, &[]);
+                        b.switch_to_block(prepare);
+                        runtime_call!(&mut b, region_ref, host, registers, NEST_ENTER, 0, failed);
+                        nest_vars
+                            .as_ref()
+                            .unwrap()
+                            .initialize(&mut b, registers, &owner.lir)?;
+                        for (recipe, vars) in n.private_iterators.iter().zip(&private_vars) {
+                            for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                                let value =
+                                    load(&mut b, registers, recipe.result, field, types::I64)?;
+                                b.def_var(*var, value);
+                            }
+                        }
+                        let one = b.ins().iconst(types::I64, 1);
+                        b.def_var(*region_active.last().unwrap(), one);
+                        b.ins().jump(ready, &[]);
+                        b.switch_to_block(ready);
+                    }
+                    let block = b.ins().iconst(types::I64, block_index as i64);
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        block,
+                        registers,
+                        offset(Register(owner.lir.registers.len() + 1), 0)?,
+                    );
+                } else if let Some(index) = region_index {
                     let r = &owner.lir.regions[index];
                     if r.header.0 == block_index {
                         let active = b.use_var(region_active[index]);
@@ -288,13 +377,51 @@ impl NativeCode {
                         continue;
                     }
                     let destination = instruction.result;
-                    if let Some(index) = region_index {
+                    if in_nest
+                        && let Operation::Call {
+                            helper: lir::Helper::Python(crate::hir::CoreOp::Iter),
+                            ..
+                        } = &instruction.operation
+                    {
+                        let n = owner.nest.as_ref().unwrap();
+                        let i = n
+                            .private_iterators
+                            .iter()
+                            .position(|p| Some(p.result) == destination)
+                            .ok_or(Error::InvalidIr("private iterator definition"))?;
+                        for (field, var) in [0, 8, 16, 24].into_iter().zip(private_vars[i]) {
+                            let value = b.use_var(var);
+                            store_word_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                field,
+                                value,
+                            )?;
+                        }
                         let mut emitter = region::Emitter {
                             b: &mut b,
                             scalars: &scalars,
                             registers,
                             lir: &owner.lir,
-                            region: &owner.lir.regions[index],
+                            region: outer_region.as_ref().unwrap(),
+                            nest_vars: nest_vars.as_ref(),
+                        };
+                        emitter.reset_private(destination.unwrap())?;
+                        continue;
+                    }
+                    if region_index.is_some() || in_nest {
+                        let plan = region_index
+                            .map(|i| &owner.lir.regions[i])
+                            .unwrap_or_else(|| outer_region.as_ref().unwrap());
+                        let mut emitter = region::Emitter {
+                            b: &mut b,
+                            scalars: &scalars,
+                            registers,
+                            lir: &owner.lir,
+                            region: plan,
+                            nest_vars: if in_nest { nest_vars.as_ref() } else { None },
                         };
                         if emitter.emit(&instruction.operation, destination)? {
                             continue;
@@ -619,6 +746,7 @@ impl NativeCode {
                         ),
                     }
                     if !feedback
+                        && !in_nest
                         && region_index.is_none()
                         && let Operation::FloatListLoad { view, .. }
                         | Operation::FloatListStore { view, .. }
@@ -677,6 +805,17 @@ impl NativeCode {
                         b.ins().return_(&[status]);
                     }
                     Terminator::Jump(edge) => {
+                        if in_nest
+                            && owner
+                                .nest
+                                .as_ref()
+                                .is_some_and(|n| !n.blocks.contains(&edge.block))
+                        {
+                            nest_vars
+                                .as_ref()
+                                .unwrap()
+                                .publish(&mut b, registers, &owner.lir)?;
+                        }
                         edge_jump(
                             &mut b,
                             &scalars,
@@ -684,7 +823,12 @@ impl NativeCode {
                             &owner.lir,
                             edge,
                             &blocks,
-                            (!feedback).then_some((block_index, region_active.as_slice())),
+                            (!feedback).then_some((
+                                block_index,
+                                region_active.as_slice(),
+                                owner.nest.as_ref(),
+                                nest_vars.as_ref(),
+                            )),
                         )?;
                     }
                     Terminator::Branch { condition, yes, no } => {
@@ -694,6 +838,17 @@ impl NativeCode {
                         let no_block = b.create_block();
                         b.ins().brif(condition, yes_block, &[], no_block, &[]);
                         b.switch_to_block(yes_block);
+                        if in_nest
+                            && owner
+                                .nest
+                                .as_ref()
+                                .is_some_and(|n| !n.blocks.contains(&yes.block))
+                        {
+                            nest_vars
+                                .as_ref()
+                                .unwrap()
+                                .publish(&mut b, registers, &owner.lir)?;
+                        }
                         edge_jump(
                             &mut b,
                             &scalars,
@@ -701,9 +856,25 @@ impl NativeCode {
                             &owner.lir,
                             yes,
                             &blocks,
-                            (!feedback).then_some((block_index, region_active.as_slice())),
+                            (!feedback).then_some((
+                                block_index,
+                                region_active.as_slice(),
+                                owner.nest.as_ref(),
+                                nest_vars.as_ref(),
+                            )),
                         )?;
                         b.switch_to_block(no_block);
+                        if in_nest
+                            && owner
+                                .nest
+                                .as_ref()
+                                .is_some_and(|n| !n.blocks.contains(&no.block))
+                        {
+                            nest_vars
+                                .as_ref()
+                                .unwrap()
+                                .publish(&mut b, registers, &owner.lir)?;
+                        }
                         edge_jump(
                             &mut b,
                             &scalars,
@@ -711,7 +882,12 @@ impl NativeCode {
                             &owner.lir,
                             no,
                             &blocks,
-                            (!feedback).then_some((block_index, region_active.as_slice())),
+                            (!feedback).then_some((
+                                block_index,
+                                region_active.as_slice(),
+                                owner.nest.as_ref(),
+                                nest_vars.as_ref(),
+                            )),
                         )?;
                     }
                 }
@@ -758,6 +934,15 @@ impl NativeCode {
         start: usize,
         skip_probe: bool,
     ) -> Result<Outcome> {
+        if self
+            .nest
+            .as_ref()
+            .is_some_and(|n| n.blocks.contains(&crate::hir::BlockId(start)) && n.header.0 != start)
+        {
+            return Err(Error::InvalidIr(
+                "native nest entry must pass through its header",
+            ));
+        }
         if !self.feedback && self.lir.regions.iter().any(|r| r.body.0 == start) {
             return Err(Error::InvalidIr(
                 "native region entry must pass through its header",
@@ -768,7 +953,8 @@ impl NativeCode {
             &self.locations,
             Some(&self.root_states),
             !self.feedback && !self.lir.regions.is_empty(),
-            2,
+            self.nest.as_ref(),
+            2 + self.nest.as_ref().map_or(0, |n| n.edges(&self.lir).len()),
             |context, registers, start| {
                 // SAFETY: the shared bridge keeps its Context and register allocation alive for this call.
                 unsafe { self.entry.unwrap()(context, registers, start) }
@@ -852,6 +1038,13 @@ fn copy_slots(
     }
     Ok(())
 }
+type RegionEdge<'a> = (
+    usize,
+    &'a [Variable],
+    Option<&'a crate::region::nest::LoopNest>,
+    Option<&'a virtual_iter::NestVars>,
+);
+
 fn edge_jump(
     b: &mut FunctionBuilder<'_>,
     scalars: &ScalarVars,
@@ -859,27 +1052,43 @@ fn edge_jump(
     lir: &lir::Function,
     edge: &lir::Edge,
     blocks: &[ir::Block],
-    region_edge: Option<(usize, &[Variable])>,
+    region_edge: Option<RegionEdge<'_>>,
 ) -> Result<()> {
-    if let Some((from, active)) = region_edge {
-        for (index, r) in lir.regions.iter().enumerate() {
-            if from == r.body.0 && edge.block == r.header {
-                let meta = Register(lir.registers.len() + 1);
-                let count = load(b, registers, meta, 24, types::I64)?;
-                let next = b.ins().iadd_imm_s(count, 1);
-                b.ins()
-                    .store(MemFlagsData::new(), next, registers, offset(meta, 24)?);
+    if let Some((from, active, nest, virtuals)) = region_edge {
+        if let Some(n) = nest
+            && n.blocks.contains(&crate::hir::BlockId(from))
+        {
+            for (i, (source, target)) in n.edges(lir).into_iter().enumerate() {
+                if source.0 == from && target == edge.block {
+                    let state = &virtuals.unwrap().iterators[i];
+                    let count = b.use_var(state.count);
+                    let next = b.ins().iadd_imm_s(count, 1);
+                    b.def_var(state.count, next);
+                }
             }
-            if (from == r.header.0 || from == r.body.0)
-                && edge.block != r.header
-                && edge.block != r.body
-            {
+            if !n.blocks.contains(&edge.block) {
                 let zero = b.ins().iconst(types::I64, 0);
-                b.def_var(active[index], zero);
+                b.def_var(*active.last().unwrap(), zero);
+            }
+        } else {
+            for (index, r) in lir.regions.iter().enumerate() {
+                if from == r.body.0 && edge.block == r.header {
+                    let meta = Register(lir.registers.len() + 1);
+                    let count = load(b, registers, meta, 24, types::I64)?;
+                    let next = b.ins().iadd_imm_s(count, 1);
+                    b.ins()
+                        .store(MemFlagsData::new(), next, registers, offset(meta, 24)?);
+                }
+                if (from == r.header.0 || from == r.body.0)
+                    && edge.block != r.header
+                    && edge.block != r.body
+                {
+                    let zero = b.ins().iconst(types::I64, 0);
+                    b.def_var(active[index], zero);
+                }
             }
         }
     }
-
     let pairs = edge
         .arguments
         .iter()
@@ -1174,6 +1383,9 @@ fn callback_values(
     event: i32,
     location: i32,
 ) -> Vec<Register> {
+    if event == NEST_ENTER {
+        return lir.nest.as_ref().unwrap().imports.clone();
+    }
     if event == REGION_ENTER {
         return lir.regions[location as usize].imports.clone();
     }
@@ -1213,6 +1425,9 @@ fn callback_failure_values(
     event: i32,
     location: i32,
 ) -> Vec<Register> {
+    if event == NEST_ENTER {
+        return state_values(&lir.states[lir.exits[lir.nest.as_ref().unwrap().entry.0].state.0]);
+    }
     if event == REGION_ENTER {
         return state_values(
             &lir.states[lir.exits[lir.regions[location as usize].entry.0].state.0],
@@ -1260,7 +1475,7 @@ mod region_entry_tests {
         let body = lir.regions.first().unwrap().body.0;
         let code = hir.code.clone().unwrap();
         let function = Rc::new(RefCell::new(hir));
-        let native = NativeCode::compile(lir, false, false).unwrap();
+        let native = NativeCode::compile(lir, false, false, false).unwrap();
         assert!(matches!(
             native.execute(&mut vm, &function, &code, 0, 0, body, true),
             Err(Error::InvalidIr(_))

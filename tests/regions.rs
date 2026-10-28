@@ -356,6 +356,7 @@ fn iterator_allocation_gc_preserves_views_and_bulk_backedge_counts() {
     let (mut vm, f) = setup(
         "def f(rows,n):\n    for i in range(n):\n        for xs in rows:\n            a,b=xs\n            xs[0]=a+1.0\n",
     );
+    vm.disable_native_nests = true;
     let x = floats(&vm, &[1.0, 2.0]);
     let input = rows(&vm, vec![x; 10]);
     for _ in 0..24 {
@@ -558,4 +559,145 @@ fn diagnostics_capture_the_live_compiled_image() {
     assert!(!d.machine_code.is_empty());
     assert!(d.clif.contains("block"));
     assert!(d.disassembly.contains("block"));
+}
+
+const NEST: &str = "def f(steps,rows,k):\n    for step in steps:\n        for xs in rows:\n            a,b=xs\n            xs[0]=a+1.0\n            xs[1]=b/k\n";
+#[test]
+fn closed_nest_keeps_iterator_progress_and_feedback_in_native_state() {
+    let (mut vm, f) = setup(NEST);
+    let xs = floats(&vm, &[0.0, 8.0]);
+    let input = rows(&vm, vec![xs; 3]);
+    let steps = rows(&vm, vec![Value::Int(0); 7]);
+    for _ in 0..24 {
+        vm.call(f, &[steps, input, Value::Float(1.0)]).unwrap();
+    }
+    vm.heap
+        .set_item(xs, Value::Int(0), Value::Float(0.0))
+        .unwrap();
+    let before = vm.tier_stats.clone();
+    vm.call(f, &[steps, input, Value::Float(1.0)]).unwrap();
+    assert_eq!(
+        vm.heap.get_item(xs, Value::Int(0)).unwrap(),
+        Value::Float(21.0)
+    );
+    assert_eq!(
+        vm.tier_stats.native_region_entries - before.native_region_entries,
+        1
+    );
+    assert_eq!(
+        vm.tier_stats.native_region_iterations - before.native_region_iterations,
+        28
+    );
+    assert!(vm.tier_stats.native_runtime_calls - before.native_runtime_calls < 20);
+    assert_eq!(vm.tier_stats.deoptimizations - before.deoptimizations, 0);
+    let lir = vm
+        .function_hir(f)
+        .unwrap()
+        .lower_lir(LoweringMode::Profiled)
+        .unwrap();
+    assert!(lir.nest.is_some());
+    let mut bad = lir.clone();
+    bad.nest.as_mut().unwrap().imports.clear();
+    assert!(bad.verify().is_err());
+    let mut bad = lir;
+    bad.nest.as_mut().unwrap().private_iterators[0].source = tis::lir::Register(usize::MAX);
+    assert!(bad.verify().is_err());
+}
+#[test]
+fn closed_nest_failure_preserves_partial_writes_and_consumed_outer_item() {
+    let source = "def f(steps,rows):\n    for step in steps:\n        for xs in rows:\n            a,b=xs\n            xs[0]=a+1.0\n            xs[1]=b-1.0\n            xs[0]=a+1.0/b\n";
+    let (mut vm, f) = setup(source);
+    let xs = floats(&vm, &[0.0, 10000.0]);
+    let input = rows(&vm, vec![xs; 3]);
+    let steps = rows(&vm, vec![Value::Int(0); 7]);
+    for _ in 0..24 {
+        vm.call(f, &[steps, input]).unwrap();
+    }
+    vm.heap
+        .set_item(xs, Value::Int(0), Value::Float(0.0))
+        .unwrap();
+    vm.heap
+        .set_item(xs, Value::Int(1), Value::Float(4.0))
+        .unwrap();
+    let steps = vm.heap.allocate(Object::Iterator {
+        source: steps,
+        index: 0,
+        size: 7,
+        exhausted: false,
+    });
+    let before = vm.tier_stats.clone();
+    let error = vm.call(f, &[steps, input]).unwrap_err();
+    assert!(error.to_string().contains("ZeroDivisionError"));
+    assert_eq!(
+        vm.heap.get_item(xs, Value::Int(0)).unwrap(),
+        Value::Float(0.25 + 1.0 / 3.0 + 0.5 + 1.0 + 1.0)
+    );
+    assert_eq!(
+        vm.heap.get_item(xs, Value::Int(1)).unwrap(),
+        Value::Float(-1.0)
+    );
+    assert_eq!(
+        vm.tier_stats.native_region_entries - before.native_region_entries,
+        1
+    );
+    assert!(vm.tier_stats.deoptimizations > before.deoptimizations);
+    assert!(matches!(
+        vm.heap.get(steps).unwrap(),
+        Object::Iterator {
+            index: 2,
+            exhausted: false,
+            ..
+        }
+    ));
+    assert_eq!(vm.stack_len(), 0);
+}
+
+#[test]
+fn empty_outer_nest_does_not_evaluate_invalid_inner_iterable() {
+    let (mut vm, f) = setup(NEST);
+    let xs = floats(&vm, &[0.0, 8.0]);
+    let input = rows(&vm, vec![xs; 3]);
+    let warm = rows(&vm, vec![Value::Int(0); 7]);
+    for _ in 0..24 {
+        vm.call(f, &[warm, input, Value::Float(1.0)]).unwrap();
+    }
+    let empty = rows(&vm, vec![]);
+    assert_eq!(
+        vm.call(f, &[empty, Value::Int(42), Value::Float(1.0)])
+            .unwrap(),
+        Value::None
+    );
+}
+
+#[test]
+fn inner_iterator_alias_preserves_shared_exhaustion() {
+    let (mut vm, f) = setup(NEST);
+    let xs = floats(&vm, &[0.0, 8.0]);
+    let input = rows(&vm, vec![xs; 3]);
+    let steps = rows(&vm, vec![Value::Int(0); 7]);
+    for _ in 0..24 {
+        vm.call(f, &[steps, input, Value::Float(1.0)]).unwrap();
+    }
+    vm.heap
+        .set_item(xs, Value::Int(0), Value::Float(0.0))
+        .unwrap();
+    let iterator = vm.heap.allocate(Object::Iterator {
+        source: input,
+        index: 0,
+        size: 3,
+        exhausted: false,
+    });
+    vm.call(f, &[steps, iterator, Value::Float(1.0)]).unwrap();
+    assert_eq!(
+        vm.heap.get_item(xs, Value::Int(0)).unwrap(),
+        Value::Float(3.0)
+    );
+    assert!(matches!(
+        vm.heap.get(iterator).unwrap(),
+        Object::Iterator {
+            index: 3,
+            exhausted: true,
+            ..
+        }
+    ));
 }

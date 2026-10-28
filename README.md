@@ -402,3 +402,26 @@ python3 tools/inspect_pypy.py --log /tmp/pypy-traces/pypy.log --tis-lir /tmp/adv
 The trace inspector separates loop backedge bodies from entry preambles and exit bridges.
 Its operation counts are static IR descriptions, not instruction timing or dynamic execution counts.
 The next loop work targets typed sequence access and primitive values across backedges; this comparison should track progress.
+
+## Native loop nests
+
+The Cranelift tier recognizes closed outer loops containing supported sequence loops.
+It prepares invariant source graphs once, reuses private builtin iterators, and keeps their
+positions, exhaustion flags and backedge counters in SSA. Normal exits and side exits publish
+those fields before interpreter execution resumes. Boxed register values also stay in SSA;
+frame slots are written only for runtime inputs, collection roots and exit reconstruction.
+
+Nest recognition requires invariant inner sources, nonescaping iterators and allocation-free
+bodies. Calls, container shape changes and iterator sources with shared identity use the ordinary
+path. Inner-loop OSR first uses a simple region; a later function entry can compile the complete nest.
+`Vm::disable_native_nests` and the benchmark worker's `--no-nests` flag retain the simple-region path
+for diagnostics. Eager profiling continues to observe instructions individually.
+
+Capture compiler IR, allocated assembly and the live relocated machine image outside timed runs:
+
+```sh
+target/release/examples/nbody_bench --tier native --warmups 10 --dump-native /tmp/advance < /dev/null
+```
+
+This writes `/tmp/advance.clif`, `.asm` and `.bin`. Set `Vm::capture_native_code` before compilation
+and use `Vm::native_diagnostics` when embedding tis. Capture is disabled by default.

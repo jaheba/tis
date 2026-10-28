@@ -76,6 +76,7 @@ pub(crate) fn execute(
     locations: &[(usize, usize)],
     root_states: Option<&[lir::FrameState]>,
     lazy_slots: bool,
+    nest: Option<&crate::region::nest::LoopNest>,
     extra_slots: usize,
     invoke: impl FnOnce(*mut c_void, *mut Slot, u32) -> u64,
     vm: &mut Vm,
@@ -133,6 +134,7 @@ pub(crate) fn execute(
         locations,
         root_states,
         lazy_slots,
+        nest,
         base,
         rooted,
         previous: None,
@@ -195,6 +197,7 @@ struct Context<'a> {
     // Deferred scalar recipes cannot contain references; GC reads only the remaining tagged values.
     root_states: Option<&'a [lir::FrameState]>,
     lazy_slots: bool,
+    nest: Option<&'a crate::region::nest::LoopNest>,
     base: usize,
     rooted: Vec<usize>,
     previous: Option<usize>,
@@ -312,10 +315,14 @@ pub(crate) extern "C" fn region_callback(
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         context.flush_region()?;
-        if event != REGION_ENTER || registers != context.registers {
+        if !matches!(event, REGION_ENTER | NEST_ENTER) || registers != context.registers {
             return Err(Error::InvalidIr("region entry ABI"));
         }
-        context.prepare_region(location as usize)
+        if event == NEST_ENTER {
+            context.prepare_nest()
+        } else {
+            context.prepare_region(location as usize)
+        }
     }));
     match result {
         Ok(Ok(())) => i32::from(context.side_exit.is_some()),
@@ -334,23 +341,116 @@ impl Context<'_> {
         let Some(index) = self.active_region.take() else {
             return Ok(());
         };
-        let region = &self.lir.regions[index];
-        // SAFETY: only Cranelift regions allocate and write these two additional slots.
+        // SAFETY: an active region or nest always has a private metadata slot in this invocation.
         let metadata = unsafe { *self.registers.add(self.lir.registers.len() + 1) };
-        // SAFETY: native code is suspended or returned; the VM is exclusively reborrowed here.
+        // SAFETY: generated code is suspended or returned; only this callback reborrows the VM.
         let vm = unsafe { &mut *self.vm };
-        vm.tier_stats.native_region_iterations = vm
-            .tier_stats
-            .native_region_iterations
-            .saturating_add(metadata.c);
         let function = self.function.borrow();
         let mut profile = function.profile.borrow_mut();
-        let count = profile
-            .backedges
-            .entry((region.body.0, region.header.0))
-            .or_default();
-        *count = count.saturating_add(metadata.c);
+        if index == usize::MAX {
+            let nest = self.nest.ok_or(Error::InvalidIr("active nest metadata"))?;
+            for (i, (from, to)) in nest.edges(self.lir).into_iter().enumerate() {
+                // SAFETY: nest compilation reserves one initialized counter slot for every verified edge.
+                let count = unsafe { (*self.registers.add(self.lir.registers.len() + 3 + i)).a };
+                vm.tier_stats.native_region_iterations =
+                    vm.tier_stats.native_region_iterations.saturating_add(count);
+                let edge = profile.backedges.entry((from.0, to.0)).or_default();
+                *edge = edge.saturating_add(count);
+            }
+        } else {
+            let region = &self.lir.regions[index];
+            vm.tier_stats.native_region_iterations = vm
+                .tier_stats
+                .native_region_iterations
+                .saturating_add(metadata.c);
+            let count = profile
+                .backedges
+                .entry((region.body.0, region.header.0))
+                .or_default();
+            *count = count.saturating_add(metadata.c);
+        }
         self.previous = Some(metadata.tag as usize);
+        Ok(())
+    }
+    fn prepare_nest(&mut self) -> Result<()> {
+        let nest = self.nest.ok_or(Error::InvalidIr("missing native nest"))?;
+        // SAFETY: the native invocation exclusively owns both the VM and this complete register/counter image.
+        let vm = unsafe { &mut *self.vm };
+        let slots = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.registers,
+                self.lir.registers.len() + 3 + nest.edges(self.lir).len(),
+            )
+        };
+        if vm.collecting(self.function) {
+            self.side_exit = Some(nest.entry);
+            return Ok(());
+        }
+        let mut roots = nest
+            .imports
+            .iter()
+            .map(|r| slots[r.0].value())
+            .collect::<Result<Vec<_>>>()?;
+        let done = vm.heap.allocate(crate::Object::Done);
+        roots.push(done);
+        for recipe in &nest.private_iterators {
+            let source = slots[recipe.source.0].value()?;
+            if !matches!(
+                vm.heap.get(source),
+                Ok(crate::Object::List(_) | crate::Object::Tuple(_) | crate::Object::Range { .. })
+            ) {
+                vm.tier_stats.native_region_failures += 1;
+                self.side_exit = Some(nest.entry);
+                return Ok(());
+            }
+            let size = vm.heap.len(source)?;
+            let iterator = vm.heap.allocate(crate::Object::Iterator {
+                source,
+                index: 0,
+                size,
+                exhausted: false,
+            });
+            slots[recipe.result.0] = Slot::boxed(iterator);
+            roots.push(iterator);
+        }
+        let iterator = slots[nest.iterator.0].value()?;
+        self.views.clear();
+        if !self
+            .views
+            .prepare(&mut vm.heap, roots.into_iter().map(Ok), iterator)?
+        {
+            vm.tier_stats.native_region_failures += 1;
+            self.side_exit = Some(nest.entry);
+            return Ok(());
+        }
+        for &child in &nest.children {
+            let region = &self.lir.regions[child];
+            let iterator = slots[region.iterator.0].value()?;
+            if let Some(schema) = &region.schema {
+                let imports = region
+                    .imports
+                    .iter()
+                    .map(|r| Ok((*r, slots[r.0].value()?)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+                if !schema.validate(&vm.heap, iterator, &imports)? {
+                    vm.tier_stats.native_region_failures += 1;
+                    self.side_exit = Some(nest.entry);
+                    return Ok(());
+                }
+            }
+        }
+        slots[self.lir.registers.len() + 1] = Slot {
+            tag: nest.header.0 as u64,
+            a: self.views.descriptors.as_ptr() as u64,
+            b: self.views.descriptors.len() as u64,
+            c: 0,
+        };
+        slots[self.lir.registers.len() + 2] = Slot::boxed(done);
+        for i in 0..nest.edges(self.lir).len() {
+            slots[self.lir.registers.len() + 3 + i] = Slot::default();
+        }
+        self.active_region = Some(usize::MAX);
+        vm.tier_stats.native_region_entries += 1;
         Ok(())
     }
     fn prepare_region(&mut self, index: usize) -> Result<()> {

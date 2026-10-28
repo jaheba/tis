@@ -708,8 +708,15 @@ impl Vm {
         } else if self.tiering == Tiering::Native {
             let key = (lir.source, lir.revision);
             let feedback = self.profiling.mode == crate::profile::ProfileMode::Eager;
+            let want_nest = !self.disable_native_nests
+                && !feedback
+                && lir
+                    .nest
+                    .as_ref()
+                    .is_some_and(|n| !n.blocks.contains(&start) || n.header == start);
             let native = if let Some(native) = self.native_artifacts.get(&key)
                 && (!feedback || native.feedback)
+                && native.nest.is_some() == want_nest
             {
                 native.clone()
             } else {
@@ -718,6 +725,7 @@ impl Vm {
                     lir.clone(),
                     feedback,
                     self.capture_native_code,
+                    want_nest,
                 );
                 self.tier_stats.native_compile_ns = self
                     .tier_stats

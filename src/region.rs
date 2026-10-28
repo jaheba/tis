@@ -1,4 +1,5 @@
 //! Allocation-free native loop regions. Heap views are usable only until the next runtime boundary.
+pub mod nest;
 pub mod schema;
 use crate::native_abi::{REF, Slot};
 use crate::{

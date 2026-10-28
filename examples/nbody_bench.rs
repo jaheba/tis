@@ -15,8 +15,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut warmups = 2usize;
     let mut dump_lir = None;
     let mut dump_native = None;
+    let mut no_nests = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--no-nests" => no_nests = true,
             "--dump-native" => {
                 dump_native = Some(args.next().ok_or("missing native output prefix")?)
             }
@@ -60,6 +62,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let compile_ns = start.elapsed().as_nanos();
     let mut vm = Vm::new();
     vm.tiering = tier;
+    vm.disable_native_nests = no_nests;
     vm.capture_native_code = dump_native.is_some();
     vm.bytecode = bytecode;
     vm.numeric = numeric;

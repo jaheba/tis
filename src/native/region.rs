@@ -8,6 +8,7 @@ pub(super) struct Emitter<'a, 'b> {
     pub registers: ir::Value,
     pub lir: &'a lir::Function,
     pub region: &'a LoopRegion,
+    pub nest_vars: Option<&'a super::virtual_iter::NestVars>,
 }
 impl Emitter<'_, '_> {
     fn guard(&mut self, passed: ir::Value, exit: lir::ExitId) -> Result<()> {
@@ -15,6 +16,9 @@ impl Emitter<'_, '_> {
         let failed = self.b.create_block();
         self.b.ins().brif(passed, success, &[], failed, &[]);
         self.b.switch_to_block(failed);
+        if let Some(vars) = self.nest_vars {
+            vars.publish(self.b, self.registers, self.lir)?;
+        }
         self.scalars.materialize(
             self.b,
             self.registers,
@@ -162,8 +166,53 @@ impl Emitter<'_, '_> {
         }
         Ok(p)
     }
+    pub fn reset_private(&mut self, value: Register) -> Result<()> {
+        if let Some(state) = self
+            .nest_vars
+            .and_then(|vars| vars.iterators.iter().find(|s| s.iterator == value))
+        {
+            let zero = self.b.ins().iconst(types::I64, 0);
+            self.b.def_var(state.index, zero);
+            self.b.def_var(state.exhausted, zero);
+            return Ok(());
+        }
+        // These references name freshly prepared, non-escaping iterator objects. No allocation, call or
+        // collection can replace them while the closed nest executes.
+        let index = load_cached(self.b, self.scalars, self.registers, value, 16, types::I64)?;
+        let base = load(
+            self.b,
+            self.registers,
+            Register(self.lir.registers.len() + 1),
+            8,
+            types::I64,
+        )?;
+        let off = self
+            .b
+            .ins()
+            .imul_imm_s(index, size_of::<Descriptor>() as i64);
+        let pointer = self.b.ins().iadd(base, off);
+        let indexptr = self.field(pointer, offset_of!(Descriptor, index));
+        let exhausted = self.field(pointer, offset_of!(Descriptor, exhausted));
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.ins().store(MemFlagsData::new(), zero, indexptr, 0);
+        let zero = self.b.ins().iconst(types::I8, 0);
+        self.b.ins().store(MemFlagsData::new(), zero, exhausted, 0);
+        Ok(())
+    }
     pub fn emit(&mut self, op: &Operation, dst: Option<Register>) -> Result<bool> {
         match op {
+            Operation::Truth { value, .. } => {
+                let bits =
+                    load_cached(self.b, self.scalars, self.registers, *value, 8, types::I64)?;
+                store_scalar_cached(
+                    self.b,
+                    self.scalars,
+                    self.registers,
+                    dst.unwrap(),
+                    RAW_BOOL,
+                    bits,
+                )?;
+            }
             Operation::GuardInt { .. } | Operation::GuardFloat { .. }
                 if self.region.schema.is_some() => {}
             Operation::FloatListView {
@@ -264,13 +313,25 @@ impl Emitter<'_, '_> {
                 let range = self.b.ins().icmp_imm_s(IntCC::Equal, kind, RANGE as i64);
                 let valid = self.b.ins().bor(abc, range);
                 self.guard(valid, exit)?;
-                let indexptr = self.field(iterator, offset_of!(Descriptor, index));
-                let index = self.field(indexptr, 0);
-                let exhaustedptr = self.field(iterator, offset_of!(Descriptor, exhausted));
-                let exhausted = self
-                    .b
-                    .ins()
-                    .load(types::I8, MemFlagsData::new(), exhaustedptr, 0);
+                let virtual_state = self
+                    .nest_vars
+                    .and_then(|vars| vars.iterators.iter().find(|s| s.iterator == arguments[0]));
+                let (index, exhausted, indexptr, exhaustedptr) = if let Some(state) = virtual_state
+                {
+                    (
+                        self.b.use_var(state.index),
+                        self.b.use_var(state.exhausted),
+                        None,
+                        None,
+                    )
+                } else {
+                    let ip = self.field(iterator, offset_of!(Descriptor, index));
+                    let index = self.field(ip, 0);
+                    let ep = self.field(iterator, offset_of!(Descriptor, exhausted));
+                    let exhausted = self.b.ins().load(types::I8, MemFlagsData::new(), ep, 0);
+                    let exhausted = self.b.ins().uextend(types::I64, exhausted);
+                    (index, exhausted, Some(ip), Some(ep))
+                };
                 let exhausted = self.b.ins().icmp_imm_s(IntCC::NotEqual, exhausted, 0);
                 let len = self.field(source, offset_of!(Descriptor, len));
                 let end = self
@@ -285,13 +346,24 @@ impl Emitter<'_, '_> {
                 self.b.switch_to_block(item);
                 self.element(source, index, dst.unwrap(), exit)?;
                 let next = self.b.ins().iadd_imm_s(index, 1);
-                self.b.ins().store(MemFlagsData::new(), next, indexptr, 0);
+                if let Some(state) = virtual_state {
+                    self.b.def_var(state.index, next);
+                } else {
+                    self.b
+                        .ins()
+                        .store(MemFlagsData::new(), next, indexptr.unwrap(), 0);
+                }
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(done);
-                let yes = self.b.ins().iconst(types::I8, 1);
-                self.b
-                    .ins()
-                    .store(MemFlagsData::new(), yes, exhaustedptr, 0);
+                if let Some(state) = virtual_state {
+                    let yes = self.b.ins().iconst(types::I64, 1);
+                    self.b.def_var(state.exhausted, yes);
+                } else {
+                    let yes = self.b.ins().iconst(types::I8, 1);
+                    self.b
+                        .ins()
+                        .store(MemFlagsData::new(), yes, exhaustedptr.unwrap(), 0);
+                }
                 copy_slots(
                     self.b,
                     self.scalars,

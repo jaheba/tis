@@ -242,6 +242,7 @@ pub struct Function {
     pub scalar_sources: BTreeMap<Register, Register>,
     pub scalar_entries: BTreeMap<BlockId, ExitId>,
     pub regions: Vec<crate::region::LoopRegion>,
+    pub nest: Option<crate::region::nest::LoopNest>,
 }
 
 impl Function {
@@ -262,6 +263,7 @@ impl Function {
             scalar_sources: BTreeMap::new(),
             scalar_entries: BTreeMap::new(),
             regions: vec![],
+            nest: None,
         };
         let mut float_values = BTreeSet::new();
         let mut float_params = BTreeSet::new();
@@ -1030,6 +1032,10 @@ impl Function {
                 });
             }
         }
+        if let Some((mut nest, state)) = crate::region::nest::LoopNest::discover(&output) {
+            nest.entry = output.exit(state, ExitReason::TypeGuard);
+            output.nest = Some(nest);
+        }
         output.verify()?;
         Ok(output)
     }
@@ -1150,6 +1156,21 @@ impl Function {
                 || exit(region.entry)?.reason != ExitReason::TypeGuard
                 || !covered.insert(region.header)
                 || !covered.insert(region.body)
+            {
+                return Err(fail());
+            }
+        }
+        if let Some(nest) = &self.nest {
+            let (mut expected, snapshot) =
+                crate::region::nest::LoopNest::discover(self).ok_or_else(fail)?;
+            expected.entry = nest.entry;
+            if *nest != expected
+                || exit(nest.entry)?.state != snapshot
+                || exit(nest.entry)?.reason != ExitReason::TypeGuard
+                || nest
+                    .imports
+                    .iter()
+                    .any(|r| !self.states[snapshot.0].values.iter().any(|(_, v)| v == r))
             {
                 return Err(fail());
             }
@@ -1617,6 +1638,14 @@ impl Function {
                 region.entry.0,
                 region.imports,
                 region.schema.as_ref().map_or(0, |s| s.constraints.len())
+            )
+            .unwrap();
+        }
+        if let Some(n) = &self.nest {
+            writeln!(
+                text,
+                "nest b{} blocks={:?} private={:?} entry=exit{}",
+                n.header.0, n.blocks, n.private_iterators, n.entry.0
             )
             .unwrap();
         }
