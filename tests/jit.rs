@@ -320,6 +320,11 @@ fn root_maps_truth_conversion_and_string_allocation_are_explicit() {
         roots.clear();
     }
     assert!(invalid.verify().is_err());
+    let mut vm = Vm::new();
+    assert!(
+        vm.install_lir(program.function("<module>").unwrap(), invalid)
+            .is_err()
+    );
 }
 
 #[test]
