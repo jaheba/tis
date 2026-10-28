@@ -503,3 +503,23 @@ with the module cache, preserving identity across repeated lookup and collection
 Call entry initializes empty register windows directly on the VM stack. Parameter-to-local-slot
 indices are computed once with bytecode metadata, avoiding repeated name comparisons during binding.
 These runtime paths serve bytecode, LIR, Cranelift and copy-and-patch execution.
+
+## Matched Monty comparisons
+
+`tools/compare_monty.py` uses Flying Circus's Monty/CPython workers and the `request_bench` tis adapter.
+Run it with a Python environment that has Flying Circus installed:
+
+```sh
+cargo build --release --examples
+/path/to/flying-circus/python tools/compare_monty.py --monty /path/to/monty \
+  --monty-revision MONTY_COMMIT --tis-revision TIS_COMMIT --tis-run target/release/examples/run \
+  --tis-worker target/release/examples/request_bench --python /path/to/python3 --output /tmp/tis-monty
+```
+
+Ten samples per runtime/workload/protocol are collected serially. One-shot includes process startup
+and exit. Repeated measurements reuse processes but create fresh application sessions, timing the
+whole script including parsing/compilation and output delivery. They do not reuse a warmed function
+or JIT artifact from the previous request. Session reset, fixture file loading and worker startup are
+outside repeated timing. The tis adapter preloads source; Monty's worker transports it per request.
+All sources are identical and outputs are validated. Monty CLI summaries, when present, are checked
+using Flying Circus's legacy-output normalization and retained in raw results.
