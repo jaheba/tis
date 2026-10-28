@@ -118,6 +118,12 @@ impl Plan {
                     ..Patch::default()
                 };
                 let stencil = match &instruction.operation {
+                    Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => {
+                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.event = SEQUENCE;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        "callback"
+                    }
                     Operation::Constant(value) => {
                         let value = Slot::boxed(match value {
                             crate::hir::Constant::Unbound => Value::Unbound,
@@ -215,12 +221,17 @@ impl Plan {
                     }
                 };
                 plan.push(stencil, p);
-                // Pure boxed results contain no heap references and remain available in native registers.
+                // Scalar boxed results contain no heap references and remain available in native registers.
                 if feedback
                     && instruction
                         .result
                         .is_some_and(|register| lir.registers[register.0] == lir::Type::Boxed)
-                    && !matches!(instruction.operation, Operation::Call { .. })
+                    && !matches!(
+                        instruction.operation,
+                        Operation::Call { .. }
+                            | Operation::SequenceUnpack { .. }
+                            | Operation::SequenceGet { .. }
+                    )
                 {
                     plan.callback(FINISH, location)?;
                 }

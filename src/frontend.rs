@@ -830,8 +830,11 @@ impl Builder {
             },
             vec![value],
         );
-        for (index, target) in targets.iter().enumerate() {
-            let value = self.runtime(block, CoreOp::UnpackItem(index), vec![unpack]);
+        // Snapshot all outer elements before targets can mutate an aliased source.
+        let elements = (0..targets.len())
+            .map(|index| self.runtime(block, CoreOp::UnpackItem(index), vec![unpack]))
+            .collect::<Vec<_>>();
+        for (target, value) in targets.iter().zip(elements) {
             let target = if let Expr::Starred(expr) = target {
                 &expr.value
             } else {

@@ -114,6 +114,7 @@ pub(crate) fn execute(
         error: None,
         registers: registers.as_mut_ptr(),
         helper_arguments: Vec::new(),
+        side_exit: None,
     };
     // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
     // synchronous invocation. Generated memory offsets are bounds checked during emission.
@@ -127,12 +128,15 @@ pub(crate) fn execute(
     if let Some(error) = context.error {
         return Err(error);
     }
-    if status == 0 {
+    if status == 0 && context.side_exit.is_none() {
         return Ok(Outcome::Return(registers[lir.registers.len()].value()?));
     }
     let exit = lir
         .exits
-        .get(usize::try_from(status.wrapping_sub(1)).map_err(error)?)
+        .get(match context.side_exit {
+            Some(exit) => exit.0,
+            None => usize::try_from(status.wrapping_sub(1)).map_err(error)?,
+        })
         .ok_or(Error::InvalidIr("native exit status"))?;
     let environment = *vm
         .environments
@@ -162,6 +166,7 @@ struct Context<'a> {
     registers: *mut Slot,
     // Each native invocation owns its scratch buffer, including during recursive helper calls.
     helper_arguments: Vec<Value>,
+    side_exit: Option<lir::ExitId>,
 }
 pub(crate) extern "C" fn callback(
     raw: *mut c_void,
@@ -184,7 +189,7 @@ pub(crate) extern "C" fn callback(
         context.step(registers, event, location)
     }));
     match result {
-        Ok(Ok(())) => 0,
+        Ok(Ok(())) => i32::from(context.side_exit.is_some()),
         Ok(Err(error)) => {
             context.error = Some(error);
             1
@@ -235,6 +240,60 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
+        if event == SEQUENCE {
+            // These reads cannot call Python, mutate the heap or collect. Never retain payload borrows.
+            let (result, failure) = match &instruction.operation {
+                Operation::SequenceUnpack {
+                    value,
+                    kind,
+                    count,
+                    failure,
+                } => (
+                    crate::sequence::unpack(&vm.heap, registers[value.0].value()?, *kind, *count)?,
+                    *failure,
+                ),
+                Operation::SequenceGet {
+                    value,
+                    kind,
+                    index,
+                    failure,
+                } => {
+                    let index = match index {
+                        lir::SequenceIndex::Constant(i) => Value::Int(*i),
+                        lir::SequenceIndex::Value(r) => registers[r.0].value()?,
+                    };
+                    (
+                        crate::sequence::get(&vm.heap, registers[value.0].value()?, *kind, index)?,
+                        *failure,
+                    )
+                }
+                _ => return Err(Error::InvalidIr("native sequence instruction")),
+            };
+            let Some(value) = result else {
+                self.side_exit = Some(failure);
+                return Ok(());
+            };
+            let observed =
+                vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
+                    registers[v.0].value()
+                })?;
+            let result = instruction
+                .result
+                .ok_or(Error::InvalidIr("sequence result"))?;
+            registers[result.0] = Slot::boxed(value);
+            if matches!(value, Value::Ref(_)) {
+                if vm.stack[self.base + result.0].is_none() {
+                    self.rooted.push(result.0);
+                }
+                vm.stack[self.base + result.0] = Some(value);
+            }
+            if observed {
+                self.function.borrow().profile.borrow_mut().sites[instruction.origin.0]
+                    .result
+                    .observe(crate::profile::ValueKind::of(&vm.heap, value));
+            }
+            return Ok(());
+        }
         let mut observed = false;
         if event == HELPER {
             let (state, roots) = match &instruction.operation {

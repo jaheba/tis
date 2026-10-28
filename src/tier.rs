@@ -176,6 +176,44 @@ impl Vm {
             for instruction in &body.instructions {
                 let mut observed = false;
                 let result = match &instruction.operation {
+                    Operation::SequenceUnpack {
+                        value,
+                        kind,
+                        count,
+                        failure,
+                    } => {
+                        let Some(value) = crate::sequence::unpack(
+                            &self.heap,
+                            read(&registers, *value)?.boxed()?,
+                            *kind,
+                            *count,
+                        )?
+                        else {
+                            return self.lir_exit(function, lir, *failure, &registers);
+                        };
+                        Some(Datum::Boxed(value))
+                    }
+                    Operation::SequenceGet {
+                        value,
+                        kind,
+                        index,
+                        failure,
+                    } => {
+                        let index = match index {
+                            lir::SequenceIndex::Constant(i) => Value::Int(*i),
+                            lir::SequenceIndex::Value(r) => read(&registers, *r)?.boxed()?,
+                        };
+                        let Some(value) = crate::sequence::get(
+                            &self.heap,
+                            read(&registers, *value)?.boxed()?,
+                            *kind,
+                            index,
+                        )?
+                        else {
+                            return self.lir_exit(function, lir, *failure, &registers);
+                        };
+                        Some(Datum::Boxed(value))
+                    }
                     Operation::Constant(constant) => Some(Datum::Boxed(match constant {
                         hir::Constant::Unbound => Value::Unbound,
                         hir::Constant::None => Value::None,

@@ -45,6 +45,7 @@ pub enum ExitReason {
     TypeGuard,
     IntegerOverflow,
     FloatArithmetic,
+    SequenceGuard,
 }
 #[derive(Debug, Clone)]
 pub struct SideExit {
@@ -84,8 +85,26 @@ pub enum Helper {
     Python(CoreOp),
 }
 pub use crate::scalar::FloatOperator;
+pub use crate::sequence::SequenceKind;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceIndex {
+    Constant(i64),
+    Value(Register),
+}
 #[derive(Debug, Clone)]
 pub enum Operation {
+    SequenceUnpack {
+        value: Register,
+        kind: SequenceKind,
+        count: usize,
+        failure: ExitId,
+    },
+    SequenceGet {
+        value: Register,
+        kind: SequenceKind,
+        index: SequenceIndex,
+        failure: ExitId,
+    },
     Constant(Constant),
     Truth {
         value: Register,
@@ -196,6 +215,7 @@ impl Function {
         };
         for (block_id, body) in hir.blocks.iter().enumerate() {
             let mut instructions = vec![];
+            let mut sequences = BTreeMap::<hir::ValueId, SequenceKind>::new();
             // Scalar SSA values survive helper calls; their boxed shadows still support frame reconstruction.
             let mut scalars = BTreeMap::<hir::ValueId, (ValueKind, Register)>::new();
             for (index, instruction) in body.instructions.iter().enumerate() {
@@ -273,7 +293,57 @@ impl Function {
                     }
                     _ => None,
                 };
-                if let Some(signature) = float_signature
+                let sequence_kind = |input: hir::ValueId| {
+                    if let Some(kind) = sequences.get(&input) {
+                        return Some(*kind);
+                    }
+                    profile
+                        .site(origin)
+                        .filter(|site| {
+                            mode == LoweringMode::Profiled
+                                && site.executions >= hir::AddFeedback::WARMUP as u64
+                        })
+                        .and_then(|site| site.operands.first()?.monomorphic())
+                        .and_then(|kind| match kind {
+                            ValueKind::List => Some(SequenceKind::List),
+                            ValueKind::Tuple => Some(SequenceKind::Tuple),
+                            _ => None,
+                        })
+                };
+                let specialized = match &instruction.op {
+                    hir::Op::Runtime(CoreOp::Unpack(count), inputs)
+                        if unpack_bundle(hir, block_id, index, *count) =>
+                    {
+                        sequence_kind(inputs[0]).map(|kind| Operation::SequenceUnpack {
+                            value: Register(inputs[0].0),
+                            kind,
+                            count: *count,
+                            failure: output.exit(state, ExitReason::SequenceGuard),
+                        })
+                    }
+                    hir::Op::Runtime(CoreOp::UnpackItem(index), inputs) => sequence_kind(inputs[0])
+                        .map(|kind| Operation::SequenceGet {
+                            value: Register(inputs[0].0),
+                            kind,
+                            index: SequenceIndex::Constant(*index as i64),
+                            failure: output.exit(state, ExitReason::SequenceGuard),
+                        }),
+                    hir::Op::GetItem(value, index) => {
+                        sequence_kind(*value).map(|kind| Operation::SequenceGet {
+                            value: Register(value.0),
+                            kind,
+                            index: SequenceIndex::Value(Register(index.0)),
+                            failure: output.exit(state, ExitReason::SequenceGuard),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(operation) = specialized {
+                    if let Operation::SequenceUnpack { kind, .. } = operation {
+                        sequences.insert(origin, kind);
+                    }
+                    emit(&mut instructions, Some(result), operation);
+                } else if let Some(signature) = float_signature
                     && (float_operator.is_some()
                         || (float_compare.is_some()
                             && signature == [ValueKind::Float, ValueKind::Float]))
@@ -455,6 +525,12 @@ impl Function {
                         },
                     );
                 }
+                if matches!(
+                    instruction.op,
+                    hir::Op::Runtime(CoreOp::Unpack(_) | CoreOp::UnpackStar(..), _)
+                ) {
+                    sequences.entry(origin).or_insert(SequenceKind::Tuple);
+                }
             }
             let edge = |edge: &hir::Edge| Edge {
                 block: edge.block,
@@ -580,6 +656,22 @@ impl Function {
             let mut unboxed_sources = BTreeMap::new();
             for instruction in &body.instructions {
                 let expected = match &instruction.operation {
+                    Operation::SequenceUnpack { failure, .. }
+                    | Operation::SequenceGet { failure, .. } => {
+                        let snapshot = state(exit(*failure)?.state)?;
+                        if exit(*failure)?.reason != ExitReason::SequenceGuard
+                            || snapshot.resume != instruction.point
+                        {
+                            return Err(fail());
+                        }
+                        for input in instruction.operation.inputs() {
+                            kind(input, Type::Boxed)?;
+                            if !snapshot.values.iter().any(|(_, r)| *r == input) {
+                                return Err(fail());
+                            }
+                        }
+                        Some(Type::Boxed)
+                    }
                     Operation::Constant(Constant::String(_)) => return Err(fail()),
                     Operation::Constant(_) => Some(Type::Boxed),
                     Operation::Truth {
@@ -827,6 +919,53 @@ impl Function {
                 }
             }
         }
+        // A mutable unpack view is legal only while its eager reads cannot run Python or mutate the source.
+        for body in &self.blocks {
+            for (index, instruction) in body.instructions.iter().enumerate() {
+                if let Operation::SequenceUnpack { kind, count, .. } = instruction.operation {
+                    let result = instruction.result.ok_or_else(fail)?;
+                    let start = index + 1;
+                    let end = start.checked_add(count).ok_or_else(fail)?;
+                    let items = body.instructions.get(start..end).ok_or_else(fail)?;
+                    if !items.iter().enumerate().all(|(index,item)|matches!(item.operation,
+                        Operation::SequenceGet {value,kind:k,index:SequenceIndex::Constant(i),..} if value==result && k==kind && i128::from(i)==index as i128)) {
+                        return Err(fail());
+                    }
+                    let mut uses = 0;
+                    for block in &self.blocks {
+                        uses += block
+                            .instructions
+                            .iter()
+                            .flat_map(|i| i.operation.inputs())
+                            .filter(|r| *r == result)
+                            .count();
+                        match &block.terminator {
+                            Terminator::Return(r) => uses += usize::from(*r == result),
+                            Terminator::Jump(edge) => {
+                                uses += edge.arguments.iter().filter(|r| **r == result).count()
+                            }
+                            Terminator::Branch { condition, yes, no } => {
+                                uses += usize::from(*condition == result)
+                                    + yes
+                                        .arguments
+                                        .iter()
+                                        .chain(&no.arguments)
+                                        .filter(|r| **r == result)
+                                        .count()
+                            }
+                        }
+                    }
+                    if uses != count
+                        || self
+                            .states
+                            .iter()
+                            .any(|s| s.local_values.contains(&Some(result)))
+                    {
+                        return Err(fail());
+                    }
+                }
+            }
+        }
         for entry in &self.osr_entries {
             if state(entry.state)?.resume.block != entry.header {
                 return Err(fail());
@@ -956,6 +1095,11 @@ impl Function {
 impl Operation {
     fn inputs(&self) -> Vec<Register> {
         match self {
+            Self::SequenceUnpack { value, .. } => vec![*value],
+            Self::SequenceGet { value, index, .. } => match index {
+                SequenceIndex::Constant(_) => vec![*value],
+                SequenceIndex::Value(index) => vec![*value, *index],
+            },
             Self::Constant(_) => vec![],
             Self::GuardInt { value, .. }
             | Self::GuardFloat { value, .. }
@@ -1048,6 +1192,10 @@ impl Function {
                     | Operation::CheckedAdd { overflow: exit, .. } => {
                         Some(self.exits[exit.0].state)
                     }
+                    Operation::SequenceGet { failure, .. }
+                    | Operation::SequenceUnpack { failure, .. } => {
+                        Some(self.exits[failure.0].state)
+                    }
                     Operation::Call { state, .. } | Operation::Truth { state, .. } => Some(*state),
                     _ => None,
                 };
@@ -1115,4 +1263,49 @@ impl Helper {
             },
         }
     }
+}
+
+fn unpack_bundle(hir: &hir::Function, block: usize, index: usize, count: usize) -> bool {
+    let body = &hir.blocks[block];
+    let result = body.instructions[index].result;
+    let Some(end) = (index + 1).checked_add(count) else {
+        return false;
+    };
+    if body.instructions.get(index+1..end).is_none_or(|items|
+        !items.iter().enumerate().all(|(index,item)|matches!(&item.op,hir::Op::Runtime(CoreOp::UnpackItem(i),inputs) if *i==index && inputs==&[result]))) {return false;}
+    let uses = hir
+        .blocks
+        .iter()
+        .map(|body| {
+            let mut uses = body
+                .instructions
+                .iter()
+                .flat_map(|i| i.op.inputs())
+                .filter(|v| *v == result)
+                .count();
+            match body.terminator.as_ref().unwrap() {
+                hir::Terminator::Return(v) => uses += usize::from(*v == result),
+                hir::Terminator::Jump(edge) => {
+                    uses += edge.arguments.iter().filter(|v| **v == result).count()
+                }
+                hir::Terminator::Branch { condition, yes, no } => {
+                    uses += usize::from(*condition == result)
+                        + yes
+                            .arguments
+                            .iter()
+                            .chain(&no.arguments)
+                            .filter(|v| **v == result)
+                            .count();
+                }
+            }
+            uses
+        })
+        .sum::<usize>();
+    uses == count
+        && !hir
+            .local_states
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|v| *v == Some(result))
 }

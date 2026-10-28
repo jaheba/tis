@@ -17,6 +17,7 @@ mod native_abi;
 mod native_runtime;
 mod runtime;
 mod scalar;
+mod sequence;
 mod tier;
 mod value;
 mod vm;

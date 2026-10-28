@@ -542,7 +542,21 @@ impl Vm {
             CoreOp::Next => self.next(values[0])?,
             CoreOp::IsDone => Value::Bool(self.is_done(values[0])),
             CoreOp::Unpack(count) => {
-                let items = self.collect_iter(values[0])?;
+                let items = match self.heap.get(values[0]) {
+                    Ok(Object::Tuple(items)) => {
+                        if items.len() != *count {
+                            return Err(error("ValueError: unpacking length mismatch"));
+                        }
+                        return Ok(values[0]);
+                    }
+                    Ok(Object::List(items)) => {
+                        if items.len() != *count {
+                            return Err(error("ValueError: unpacking length mismatch"));
+                        }
+                        items.clone()
+                    }
+                    _ => self.collect_iter(values[0])?,
+                };
                 if items.len() != *count {
                     return Err(error("ValueError: unpacking length mismatch"));
                 }

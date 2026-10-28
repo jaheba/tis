@@ -137,6 +137,15 @@ impl NativeCode {
                     owner.locations.push((block_index, instruction_index));
                     let destination = instruction.result;
                     match &instruction.operation {
+                        Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => call(
+                            &mut b,
+                            callback_ref,
+                            host,
+                            registers,
+                            SEQUENCE,
+                            location,
+                            failed,
+                        ),
                         Operation::Constant(value) => {
                             let value = match value {
                                 crate::hir::Constant::Unbound => Value::Unbound,
@@ -264,12 +273,17 @@ impl NativeCode {
                             failed,
                         ),
                     }
-                    // Non-helper boxed results are primitive; only eager diagnostics need a callback here.
+                    // Arithmetic/constant results are primitive; eager diagnostics retain their finish callbacks.
                     if feedback
                         && destination.is_some_and(|register| {
                             owner.lir.registers[register.0] == lir::Type::Boxed
                         })
-                        && !matches!(instruction.operation, Operation::Call { .. })
+                        && !matches!(
+                            instruction.operation,
+                            Operation::Call { .. }
+                                | Operation::SequenceUnpack { .. }
+                                | Operation::SequenceGet { .. }
+                        )
                     {
                         call(
                             &mut b,

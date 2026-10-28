@@ -163,12 +163,21 @@ An executable module is owned until its last active native frame returns, includ
 The Cranelift emitter is in `src/native.rs`; both native backends use `src/native_runtime.rs` and the same C-layout slots.
 The Cranelift emitter follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
 
-Helper results publish heap references at runtime boundaries; scalar-only instructions need no callback in staged native code.
+Helper and checked sequence results publish heap references; scalar-only instructions need no callback in staged native code.
 Safepoints read register images directly and publish only heap references to the collector.
 Eager diagnostics retain scalar-result callbacks; switching to eager mode rebuilds an artifact that omitted them.
 Within a block, typed arithmetic reuses existing primitive SSA registers across operations and helper calls.
 Boxed shadow values remain for reconstruction; boxing is not yet deferred to helper calls and side exits.
 Per-scalar native fast-path counts are available in eager mode; staged code keeps tier-entry, backedge and failure counts.
+
+Hot list/tuple unpacking and indexing lower to `SequenceUnpack` and `SequenceGet` operations.
+They check exact container kinds, current lengths and integer bounds through non-allocating Rust heap accessors.
+Guard misses resume generic bytecode before the operation, preserving errors and earlier side effects.
+These reads cannot call Python, mutate containers or collect; they skip full root synchronization and publish result references.
+They still read mutable heap state and cannot be moved across writes or Python calls.
+Unpack views are limited to verified contiguous element reads before assignment targets can mutate the source.
+Tuples can be reused during generic unpacking; generic list unpacking copies a snapshot without creating an iterator.
+Iterators and starred targets retain generic collection behavior.
 LIR helper effects remain conservative; there is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
