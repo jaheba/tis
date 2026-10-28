@@ -23,9 +23,12 @@ fn main() {
         .unwrap();
         return;
     }
+    let source = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("src/copy_patch/stencils.rs");
     let status = Command::new(env::var_os("RUSTC").unwrap())
+        .current_dir(&out)
+        .arg(source)
         .args([
-            "src/copy_patch/stencils.rs",
             "--crate-name",
             "tis_stencils",
             "--crate-type",
