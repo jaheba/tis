@@ -19,6 +19,7 @@ FIXTURES = {'nbody': 'game_nbody', 'barnes-hut': 'barnes_hut', 'ticket-search': 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', type=Path, required=True)
+    parser.add_argument('--baseline-run',type=Path,help='also time an older tis executable in each round')
     parser.add_argument('--python', type=Path, default=Path(sys.executable))
     parser.add_argument('--pypy', type=Path)
     parser.add_argument('--output', type=Path, required=True)
@@ -33,6 +34,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[1] / 'tests/fixtures'
     binaries = {'tis': args.run.resolve(), 'cpython': args.python.resolve()}
+    if args.baseline_run:
+        binaries['baseline']=args.baseline_run.resolve()
     if args.pypy:
         binaries['pypy'] = args.pypy.resolve()
     results = dict(timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -40,7 +43,7 @@ def main():
                    timing='fresh subprocess wall time, including startup, parsing, compilation, execution and exit',
                    seed=20261028, timeout_seconds=args.timeout,
                    binaries={k: dict(path=str(v), sha256=digest(v)) for k, v in binaries.items()},
-                   runtimes={k: runtime_info(v) for k, v in binaries.items() if k != 'tis'},
+                   runtimes={k: runtime_info(v) for k, v in binaries.items() if k in ['cpython','pypy']},
                    sources={}, commands={}, raw={}, summary={})
     rng = random.Random(results['seed'])
 
@@ -52,7 +55,9 @@ def main():
         expected = EXPECTED if benchmark == 'nbody' else source.with_suffix('.out').read_text()
         results['sources'][benchmark] = dict(path=str(source), sha256=digest(source), expected_stdout=expected)
         commands = {tier: [str(binaries['tis']), '--tier', tier, str(source)] for tier in args.tiers}
-        commands.update({mode: [str(binary), str(source)] for mode, binary in binaries.items() if mode != 'tis'})
+        if args.baseline_run:
+            commands.update({f'baseline/{tier}':[str(binaries['baseline']),'--tier',tier,str(source)] for tier in args.tiers})
+        commands.update({mode: [str(binary), str(source)] for mode, binary in binaries.items() if mode in ['cpython','pypy']})
         results['commands'][benchmark] = commands
         for mode in commands:
             results['raw'][f'{benchmark}/{mode}'] = []

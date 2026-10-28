@@ -76,6 +76,10 @@ impl NativeCode {
             .map_err(error)?;
         jit.symbol("tis_callback", callback as *const u8);
         jit.symbol(
+            "tis_field",
+            crate::native_runtime::field_callback as *const u8,
+        );
+        jit.symbol(
             "tis_region",
             crate::native_runtime::region_callback as *const u8,
         );
@@ -122,6 +126,9 @@ impl NativeCode {
         let callback_id = module
             .declare_function("tis_callback", Linkage::Import, &callback_sig)
             .map_err(error)?;
+        let field_id = module
+            .declare_function("tis_field", Linkage::Import, &callback_sig)
+            .map_err(error)?;
         let view_id = module
             .declare_function("tis_float_view", Linkage::Import, &callback_sig)
             .map_err(error)?;
@@ -161,6 +168,7 @@ impl NativeCode {
             let (host, registers, start) = (params[0], params[1], params[2]);
             scalars.initialize(&mut b, registers, &owner.lir)?;
             let callback_ref = module.declare_func_in_func(callback_id, b.func);
+            let field_ref = module.declare_func_in_func(field_id, b.func);
             let view_ref = module.declare_func_in_func(view_id, b.func);
             let region_ref = module.declare_func_in_func(region_id, b.func);
             let region_active = owner
@@ -732,6 +740,50 @@ impl NativeCode {
                                 RAW_BOOL,
                                 value,
                             )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::Python(crate::hir::CoreOp::GetAttr(_)),
+                            arguments,
+                            ..
+                        } if !feedback => {
+                            // The miss path retains full observation, allocation and GC handling.
+                            // A successful field probe needs only its receiver published, not a root map.
+                            scalars.materialize(&mut b, registers, arguments.iter().copied())?;
+                            let event = b.ins().iconst(types::I32, HELPER as i64);
+                            let loc = b.ins().iconst(types::I32, location as i64);
+                            let call = b.ins().call(field_ref, &[host, registers, event, loc]);
+                            let status = b.inst_results(call)[0];
+                            let hit = b.create_block();
+                            let miss = b.create_block();
+                            let done = b.create_block();
+                            let success = b.ins().icmp_imm_s(IntCC::Equal, status, 0);
+                            b.ins().brif(success, hit, &[], miss, &[]);
+                            b.switch_to_block(hit);
+                            scalars.reload_callback(
+                                &mut b,
+                                registers,
+                                &owner.lir,
+                                &owner.locations,
+                                HELPER,
+                                location,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(miss);
+                            let fallback = b.create_block();
+                            let retry = b.ins().icmp_imm_s(IntCC::Equal, status, 1);
+                            b.ins().brif(retry, fallback, &[], failed, &[]);
+                            b.switch_to_block(fallback);
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
                             b.ins().jump(done, &[]);
                             b.switch_to_block(done);
                         }

@@ -80,3 +80,52 @@ fn sort_errors_restore_detached_items() {
     let mut p = compile("assert xs==[1,2,3]").unwrap();
     vm.run_program(&mut p).unwrap();
 }
+
+#[test]
+fn native_field_reads_preserve_aliases_method_fallbacks_and_missing_errors() {
+    let source = "class A:\n    def __init__(self):\n        self.x=[1]\n    def method(self):\n        return 42\ndef f(a):\n    return a.x\na=A()\nfor i in range(1000):\n    f(a)\n";
+    let mut vm = run(source, Tiering::Native);
+    let f = vm.get_global("f").unwrap();
+    let a = vm.get_global("a").unwrap();
+    let before = vm.tier_stats.native_field_hits;
+    let value = vm.call(f, &[a]).unwrap();
+    assert!(vm.tier_stats.native_field_hits > before);
+    vm.collect_garbage(&[]).unwrap();
+    assert_eq!(
+        vm.heap.get_item(value, tis::Value::Int(0)).unwrap(),
+        tis::Value::Int(1)
+    );
+    let mut p =
+        compile("a.x=[2]\nassert f(a)==[2]\nassert a.method()==42\nclass B:\n    pass\nb=B()")
+            .unwrap();
+    vm.run_program(&mut p).unwrap();
+    let b = vm.get_global("b").unwrap();
+    assert!(
+        vm.call(f, &[b])
+            .unwrap_err()
+            .to_string()
+            .contains("AttributeError")
+    );
+    assert_eq!(vm.stack_len(), 0);
+    assert!(vm.call(f, &[a]).is_ok());
+}
+
+#[test]
+fn native_field_results_remain_rooted_across_allocating_calls() {
+    let source = "class A:\n    def __init__(self,x):\n        self.x=x\ndef churn(a):\n    a.x=None\n    for i in range(6000):\n        garbage=[i]\ndef f(a):\n    saved=a.x\n    churn(a)\n    return saved[0]\nfor i in range(100):\n    assert f(A([123]))==123\n";
+    let vm = run(source, Tiering::Native);
+    assert!(vm.tier_stats.native_field_hits > 0);
+}
+
+#[test]
+fn slot_only_calls_keep_recursion_defaults_and_closure_environments_distinct() {
+    let source = "marker=7\ndef plain(x=3):\n    y=x+1\n    return y+marker\ndef recursive(n):\n    if n==0:\n        return [1]\n    saved=[n]\n    return [saved,recursive(n-1)]\ndef outer(x):\n    def middle():\n        def inner():\n            return x\n        return inner\n    return middle()\ndef defaults():\n    x=[123]\n    def inner(value=x):\n        return value\n    return inner\na=outer(10)\nb=outer(20)\nd=defaults()\nfor i in range(100):\n    assert plain()==11\n    assert plain(i)==i+8\n    assert a()==10\n    assert b()==20\n    assert d()==[123]\n    tree=recursive(4)\n    assert tree[0]==[4]\n    assert tree[1][0]==[3]\n";
+    for tier in [
+        Tiering::Bytecode,
+        Tiering::Lir,
+        Tiering::Native,
+        Tiering::CopyPatch,
+    ] {
+        run(source, tier);
+    }
+}

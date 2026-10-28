@@ -467,3 +467,22 @@ startup, source parsing, compilation, JIT work during that first execution, outp
 All stdout is validated. This is separate from the warmed worker protocol; OS file caches are not flushed.
 Use `--benchmarks` and `--tiers` to select workloads and tis execution tiers. Results retain commands,
 binary/source hashes, runtime versions, exact output, stderr and every timing sample.
+
+## Call and object fast paths
+
+Functions whose locals are all indexed frame slots can bind simple positional arguments directly
+into the frame and use their lexical parent without allocating an environment. Captured locals,
+nonlocal/global declarations, keyword binding and explicit namespace access retain the environment path.
+The eligibility check comes from HIR and is cached with immutable bytecode metadata.
+
+Cranelift probes existing instance fields through a small nonallocating gateway. Successful reads
+publish only the receiver and result; missing fields, methods, other receiver types and active
+feedback windows use the full runtime path. Attribute writes remain noncollecting under the current
+object model, which has no descriptors or Python setters. Other allocating/calling operations retain
+fresh root maps. Inactive native register buffers are cleared and reused; active nested frames always
+own distinct buffers. Retained buffer capacity follows the invocation high-water mark.
+
+For before/after measurement of object workloads, use the existing comparison runner with
+`--benchmark barnes-hut` or `--benchmark ticket-search` and generic `examples/bench` binaries.
+The one-shot runner accepts `--baseline-run /path/to/old-run` to interleave an older executable
+with the current one. The default nbody comparison and no-baseline one-shot protocols are unchanged.

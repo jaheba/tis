@@ -1913,7 +1913,9 @@ impl Helper {
                 | CoreOp::IsDone
                 | CoreOp::Compare(_)
                 | CoreOp::Unary(_) => readonly,
-                CoreOp::StoreLocal(_) | CoreOp::StoreName(_) => writing,
+                // Attribute setters only update instance/class maps; descriptors and Python setters
+                // are not supported, and these writes cannot trigger heap collection.
+                CoreOp::StoreLocal(_) | CoreOp::StoreName(_) | CoreOp::SetAttr(_) => writing,
                 CoreOp::Binary(op)
                     if matches!(op.as_str(), "/" | "//" | "%" | "**" | "&" | "|" | "^") =>
                 {

@@ -36,6 +36,8 @@ pub struct Vm {
     pub(crate) environments: Vec<Value>,
     pub(crate) local_frames: Vec<LocalFrame>,
     pub(crate) globals: Option<Value>,
+    // Inactive buffers contain no roots. Each active native frame owns a distinct allocation.
+    pub(crate) native_register_pool: Vec<Vec<crate::native_abi::Slot>>,
     pub(crate) modules: std::collections::BTreeMap<String, Value>,
     pub output: String,
     pub(crate) depth: usize,
@@ -77,6 +79,16 @@ impl Vm {
         environment: Value,
         arguments: &[Value],
     ) -> Result<Value> {
+        self.execute_bound_frame(function, environment, arguments, None)
+    }
+
+    pub(crate) fn execute_bound_frame(
+        &mut self,
+        function: Rc<RefCell<Function>>,
+        environment: Value,
+        arguments: &[Value],
+        bindings: Option<&[Value]>,
+    ) -> Result<Value> {
         if self.depth >= 256 {
             return Err(Error::Runtime(
                 "RecursionError: maximum recursion depth exceeded".into(),
@@ -92,7 +104,11 @@ impl Vm {
         self.consider_compilation(&function, crate::profile::Hotspot::Function);
         let collecting = self.collecting(&function);
         if collecting {
-            let values = self.bound_arguments(&function.borrow(), environment, arguments)?;
+            let values = if let Some(bindings) = bindings {
+                bindings.to_vec()
+            } else {
+                self.bound_arguments(&function.borrow(), environment, arguments)?
+            };
             let hir = function.borrow();
             let mut profile = hir.profile.borrow_mut();
             profile
@@ -110,7 +126,19 @@ impl Vm {
         for (&parameter, &value) in parameters.iter().zip(arguments) {
             slots[parameter.0] = Some(value);
         }
-        let locals = {
+        let locals = if let Some(bindings) = bindings {
+            let template = function.borrow();
+            code.local_names
+                .iter()
+                .map(|name| {
+                    template
+                        .parameter_names
+                        .iter()
+                        .position(|parameter| parameter == name)
+                        .map(|index| bindings[index])
+                })
+                .collect()
+        } else {
             let mut object = self.heap.get_mut(environment)?;
             let Object::Environment(env) = &mut *object else {
                 return Err(Error::InvalidIr("frame environment"));

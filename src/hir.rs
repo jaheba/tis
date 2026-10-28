@@ -197,6 +197,21 @@ impl Function {
         BlockId(0)
     }
 
+    pub(crate) fn environment_required(&self) -> bool {
+        if let Some(code) = &self.code {
+            return code.environment_required;
+        }
+        self.module
+            || self.local_names.len() != self.local_slots.len()
+            || !self.global_names.is_empty()
+            || !self.nonlocal_names.is_empty()
+            || self
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|i| matches!(i.op, Op::Runtime(CoreOp::Namespace, _)))
+    }
+
     pub fn local_slots(&self) -> &[String] {
         &self.local_slots
     }

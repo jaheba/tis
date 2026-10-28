@@ -19,7 +19,7 @@ pub(crate) const FLOAT_VIEW: i32 = 6;
 pub(crate) const REGION_ENTER: i32 = 7;
 pub(crate) const NEST_ENTER: i32 = 8;
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Slot {
     pub(crate) tag: u64,
     pub(crate) a: u64,

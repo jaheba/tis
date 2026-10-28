@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--samples', type=int, default=10)
     parser.add_argument('--fresh-processes', action='store_true',
                         help='warm a new worker for every sample to expose process layout variation')
+    parser.add_argument('--benchmark',choices=['barnes-hut','ticket-search'],help='compare generic bench workers instead of nbody')
     parser.add_argument('--seed', type=int, default=20261028)
     parser.add_argument('--tiers', nargs='+', choices=['bytecode', 'lir', 'native', 'copy-patch'],
                         default=['bytecode', 'lir', 'native', 'copy-patch'])
@@ -38,6 +39,7 @@ def main():
                              for name, path in binaries.items()},
                    bytecode_modes={'baseline': args.baseline_bytecode, 'candidate': args.candidate_bytecode},
                    numeric_modes={'baseline': args.baseline_numeric, 'candidate': args.candidate_numeric},
+                   benchmark=args.benchmark or 'nbody',
                    fresh_processes=args.fresh_processes, readiness={}, samples_raw=[])
     workers = {}
 
@@ -46,7 +48,7 @@ def main():
 
     def start(label):
         name, mode = label.split('/')
-        command = [str(binaries[name]), '--tier', mode, '--warmups', '2']
+        command = [str(binaries[name]), *([args.benchmark] if args.benchmark else []), '--tier', mode, '--warmups', '2']
         encoding = results['bytecode_modes'][name]
         if encoding:
             command += ['--bytecode', encoding]
@@ -97,12 +99,15 @@ def main():
                 if not line:
                     raise RuntimeError((label, process.stderr.read()))
                 sample = json.loads(line)
-                assert sample['energy'] == '-0.169089263'
-                assert sample['backend_compile_ns'] == sample['deoptimizations'] == 0
+                if args.benchmark:
+                    assert sample['validated']
+                else:
+                    assert sample['energy'] == '-0.169089263'
+                    assert sample['backend_compile_ns'] == sample['deoptimizations'] == 0
                 mode = label.split('/')[1]
                 entry = {'lir': 'lir_entries', 'native': 'native_entries',
                          'copy-patch': 'copy_patch_entries'}.get(mode)
-                if entry:
+                if entry and not args.benchmark:
                     assert sample[entry] == 1
                 results['samples_raw'].append(dict(label=label, round=round_index, **sample))
                 if args.fresh_processes:

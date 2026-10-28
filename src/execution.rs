@@ -240,19 +240,69 @@ impl Vm {
                 self.heap.get(value)?;
             }
         }
+        // Indexed, uncaptured locals already live in the frame. Such a positional call can
+        // use its lexical parent directly; no environment object or binding map is needed.
+        let names = &template.parameter_names;
+        if !template.environment_required()
+            && keywords.is_empty()
+            && template.keyword_only.is_empty()
+            && template.vararg.is_none()
+            && template.kwarg.is_none()
+            && arguments.len() <= names.len()
+            && arguments.len() + defaults.len() >= names.len()
+        {
+            let mut bound = arguments.to_vec();
+            for index in arguments.len()..names.len() {
+                bound.push(defaults[index + defaults.len() - names.len()]);
+            }
+            drop(template);
+            return self.execute_bound_frame(function, parent, arguments, Some(&bound));
+        }
         let environment = if template.module {
             parent
         } else {
             self.heap.allocate(Object::Environment(Environment {
                 parent: Some(parent),
                 values: BTreeMap::new(),
-                locals: template.local_names.iter().cloned().collect(),
+                // Slot locals are never looked up through this environment. Captured names retain
+                // their lexical membership so closures and nonlocal assignment keep working.
+                locals: template
+                    .local_names
+                    .iter()
+                    .filter(|name| template.local_slots.binary_search(name).is_err())
+                    .cloned()
+                    .collect(),
                 globals: template.global_names.iter().cloned().collect(),
                 nonlocals: template.nonlocal_names.iter().cloned().collect(),
                 class_scope: false,
             }))
         };
         let names = &template.parameter_names;
+        // Positional calls with only trailing defaults need neither a keyword dictionary nor
+        // a temporary binding map. Keep captured arguments in the environment as before.
+        if !names.is_empty()
+            && keywords.is_empty()
+            && template.keyword_only.is_empty()
+            && template.vararg.is_none()
+            && template.kwarg.is_none()
+            && arguments.len() <= names.len()
+            && arguments.len() + defaults.len() >= names.len()
+        {
+            let mut object = self.heap.get_mut(environment)?;
+            let Object::Environment(env) = &mut *object else {
+                return Err(Error::InvalidIr("call environment"));
+            };
+            for (index, name) in names.iter().enumerate() {
+                let value = arguments
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| defaults[index + defaults.len() - names.len()]);
+                env.values.insert(name.clone(), value);
+            }
+            drop(object);
+            drop(template);
+            return self.execute_frame(function, environment, arguments);
+        }
         if !names.is_empty()
             || template.vararg.is_some()
             || template.kwarg.is_some()
@@ -640,6 +690,20 @@ impl Vm {
     }
 
     fn class_attribute(&self, class: Value, name: &str) -> Result<Option<Value>> {
+        let Object::Class {
+            namespace, bases, ..
+        } = self.heap.get(class)?
+        else {
+            return Err(Error::Type("expected class"));
+        };
+        // Direct members and classes without bases need no traversal allocations. Keep the
+        // cycle-checked walk for inherited lookup when the class itself has no matching member.
+        if let Some(value) = self.env(*namespace)?.values.get(name) {
+            return Ok(Some(*value));
+        }
+        if bases.is_empty() {
+            return Ok(None);
+        }
         let mut pending = vec![class];
         let mut seen = std::collections::HashSet::new();
         while let Some(class) = pending.pop() {

@@ -89,100 +89,107 @@ pub(crate) fn execute(
 ) -> Result<Outcome> {
     // Call setup can allocate environments; the initial VM window is already fully rooted.
     vm.maybe_collect()?;
-    let mut registers = vec![
-        Slot::default();
-        lir.registers
-            .len()
-            .checked_add(1 + extra_slots)
-            .ok_or(Error::IntegerOverflow)?
-    ];
-    for (index, value) in vm.stack[base..frame_end].iter().enumerate() {
-        if let Some(value) = value {
-            registers[index] = Slot::boxed(*value);
-        }
-    }
-    let mut entry_failure = None;
-    if let Some(exit) = lir.scalar_entries.get(&crate::hir::BlockId(start)) {
-        let state = &lir.states[lir.exits[exit.0].state.0];
-        for (raw, source) in &lir.scalar_sources {
-            if !state.values.iter().any(|(_, r)| r == source) {
-                continue;
-            }
-            if let Value::Float(value) = registers[source.0].value()? {
-                registers[raw.0] = Slot {
-                    tag: RAW_FLOAT,
-                    a: value.to_bits(),
-                    b: 0,
-                    c: 0,
-                };
-            } else {
-                entry_failure = Some(*exit);
-                break;
+    let size = lir
+        .registers
+        .len()
+        .checked_add(1 + extra_slots)
+        .ok_or(Error::IntegerOverflow)?;
+    let mut registers = vm.native_register_pool.pop().unwrap_or_default();
+    registers.resize(size, Slot::default());
+    let result = (|| {
+        for (index, value) in vm.stack[base..frame_end].iter().enumerate() {
+            if let Some(value) = value {
+                registers[index] = Slot::boxed(*value);
             }
         }
-    }
-    let rooted = vm.stack[base..frame_end]
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.map(|_| index))
-        .collect();
-    let mut context = Context {
-        vm: vm as *mut Vm,
-        function,
-        code,
-        lir,
-        locations,
-        root_states,
-        lazy_slots,
-        nest,
-        base,
-        rooted,
-        previous: None,
-        skip_probe,
-        collecting: vm.collecting(function),
-        error: None,
-        registers: registers.as_mut_ptr(),
-        helper_arguments: Vec::new(),
-        side_exit: entry_failure,
-        views: crate::region::HeapViews::default(),
-        active_region: None,
-        region_done: None,
-        schema_key: vec![],
-    };
-    // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
-    // synchronous invocation. Generated memory offsets are bounds checked during emission.
-    let status = if context.side_exit.is_some() {
-        u64::MAX
-    } else {
-        invoke(
-            (&mut context as *mut Context<'_>).cast(),
-            registers.as_mut_ptr(),
-            u32::try_from(start).map_err(error)?,
-        )
-    };
-    context.flush_region()?;
-    if let Some(error) = context.error {
-        return Err(error);
-    }
-    if status == 0 && context.side_exit.is_none() {
-        return Ok(Outcome::Return(registers[lir.registers.len()].value()?));
-    }
-    let exit = lir
-        .exits
-        .get(match context.side_exit {
-            Some(exit) => exit.0,
-            None => usize::try_from(status.wrapping_sub(1)).map_err(error)?,
-        })
-        .ok_or(Error::InvalidIr("native exit status"))?;
-    let environment = *vm
-        .environments
-        .last()
-        .ok_or(Error::InvalidIr("native environment"))?;
-    let frame = lir.reconstruct(exit.state, environment, vm.local_values()?, |r| {
-        registers[r.0].value()
-    })?;
-    vm.mark_deoptimization(function, &frame, exit.reason);
-    Ok(Outcome::Deopt(frame))
+        let mut entry_failure = None;
+        if let Some(exit) = lir.scalar_entries.get(&crate::hir::BlockId(start)) {
+            let state = &lir.states[lir.exits[exit.0].state.0];
+            for (raw, source) in &lir.scalar_sources {
+                if !state.values.iter().any(|(_, r)| r == source) {
+                    continue;
+                }
+                if let Value::Float(value) = registers[source.0].value()? {
+                    registers[raw.0] = Slot {
+                        tag: RAW_FLOAT,
+                        a: value.to_bits(),
+                        b: 0,
+                        c: 0,
+                    };
+                } else {
+                    entry_failure = Some(*exit);
+                    break;
+                }
+            }
+        }
+        let rooted = vm.stack[base..frame_end]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.map(|_| index))
+            .collect();
+        let mut context = Context {
+            vm: vm as *mut Vm,
+            function,
+            code,
+            lir,
+            locations,
+            root_states,
+            lazy_slots,
+            nest,
+            base,
+            rooted,
+            previous: None,
+            skip_probe,
+            collecting: vm.collecting(function),
+            error: None,
+            registers: registers.as_mut_ptr(),
+            helper_arguments: Vec::new(),
+            side_exit: entry_failure,
+            views: crate::region::HeapViews::default(),
+            active_region: None,
+            region_done: None,
+            schema_key: vec![],
+        };
+        // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
+        // synchronous invocation. Generated memory offsets are bounds checked during emission.
+        let status = if context.side_exit.is_some() {
+            u64::MAX
+        } else {
+            invoke(
+                (&mut context as *mut Context<'_>).cast(),
+                registers.as_mut_ptr(),
+                u32::try_from(start).map_err(error)?,
+            )
+        };
+        context.flush_region()?;
+        if let Some(error) = context.error {
+            return Err(error);
+        }
+        if status == 0 && context.side_exit.is_none() {
+            return Ok(Outcome::Return(registers[lir.registers.len()].value()?));
+        }
+        let exit = lir
+            .exits
+            .get(match context.side_exit {
+                Some(exit) => exit.0,
+                None => usize::try_from(status.wrapping_sub(1)).map_err(error)?,
+            })
+            .ok_or(Error::InvalidIr("native exit status"))?;
+        let environment = *vm
+            .environments
+            .last()
+            .ok_or(Error::InvalidIr("native environment"))?;
+        let frame = lir.reconstruct(exit.state, environment, vm.local_values()?, |r| {
+            registers[r.0].value()
+        })?;
+        vm.mark_deoptimization(function, &frame, exit.reason);
+        Ok(Outcome::Deopt(frame))
+    })();
+    // Reuse only after reconstruction and every callback have finished. Clearing also prevents
+    // stale references from being read when a later function uses fewer registers.
+    registers.clear();
+    vm.native_register_pool.push(registers);
+    result
 }
 pub(crate) extern "C" fn power(left: f64, right: f64) -> f64 {
     left.powf(right)
@@ -213,6 +220,72 @@ struct Context<'a> {
     region_done: Option<(usize, Value)>,
     schema_key: Vec<u64>,
 }
+/// Probe only existing instance fields. No allocation, Python calls or collection may occur here.
+pub(crate) extern "C" fn field_callback(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    _event: i32,
+    location: i32,
+) -> i32 {
+    // SAFETY: the suspended native entry owns this Context, VM and complete register image.
+    let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
+        let vm = unsafe { &mut *context.vm };
+        vm.tier_stats.native_runtime_calls += 1;
+        if registers != context.registers {
+            return Err(Error::InvalidIr("field register image"));
+        }
+        if context.collecting {
+            return Ok(false);
+        }
+        let &(block, index) = context
+            .locations
+            .get(location as usize)
+            .ok_or(Error::InvalidIr("field location"))?;
+        let instruction = &context.lir.blocks[block].instructions[index];
+        let Operation::Call {
+            helper: lir::Helper::Python(crate::hir::CoreOp::GetAttr(name)),
+            arguments,
+            ..
+        } = &instruction.operation
+        else {
+            return Err(Error::InvalidIr("field operation"));
+        };
+        // Verification proves the operand and destination lie inside this invocation's image.
+        let receiver = unsafe { (*registers.add(arguments[0].0)).value()? };
+        let value = match vm.heap.get(receiver) {
+            Ok(crate::Object::Instance { attributes, .. }) => attributes.get(name).copied(),
+            _ => None,
+        };
+        if let Some(value) = value {
+            unsafe {
+                *registers.add(
+                    instruction
+                        .result
+                        .ok_or(Error::InvalidIr("field destination"))?
+                        .0,
+                ) = Slot::boxed(value);
+            }
+            vm.tier_stats.native_field_hits += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }));
+    match result {
+        Ok(Ok(true)) => 0,
+        Ok(Ok(false)) => 1,
+        Ok(Err(error)) => {
+            context.error = Some(error);
+            2
+        }
+        Err(_) => {
+            context.error = Some(Error::Runtime("panic in native field probe".into()));
+            2
+        }
+    }
+}
+
 pub(crate) extern "C" fn callback(
     raw: *mut c_void,
     registers: *mut Slot,
