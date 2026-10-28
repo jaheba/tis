@@ -19,7 +19,20 @@ EXPECTED = '-0.169075164\n-0.169089263\n'
 TAIL = '\noffset_momentum(BODIES[DEFAULT_REFERENCE])\n'
 
 
-def cpython_worker(source, warmups):
+def python_worker(source, warmups, jit_events=False):
+    pypy = sys.implementation.name == 'pypy'
+    events = []
+    if jit_events:
+        if not pypy:
+            raise ValueError('JIT event hooks require PyPy')
+        import pypyjit
+
+        def compiled(info):
+            events.append(dict(type=info.type, loop_no=info.loop_no,
+                               greenkey=repr(info.greenkey), asm_bytes=info.asmlen))
+
+        pypyjit.set_compile_hook(compiled, operations=False)
+    backend_compile_ns = None if pypy else 0
     text = Path(source).read_text()
     setup, _ = text.rsplit(TAIL, 1)
     start = time.perf_counter_ns()
@@ -43,15 +56,23 @@ def cpython_worker(source, warmups):
         assert f'{energy():.9f}' == '-0.169089263'
         return elapsed
 
-    warmup_ns = [sample() for _ in range(warmups)]
+    warmup_ns, warmup_events = [], []
+    for _ in range(warmups):
+        warmup_ns.append(sample())
+        warmup_events.append(len(events))
     print(json.dumps(dict(ready=True, compile_ns=compile_ns, setup_ns=setup_ns,
-                          warmup_ns=warmup_ns, backend_compile_ns=0)), flush=True)
+                          warmup_ns=warmup_ns, backend_compile_ns=backend_compile_ns,
+                          jit_events=events if jit_events else None,
+                          warmup_event_counts=warmup_events if jit_events else None)), flush=True)
     for line in sys.stdin:
         if line.strip() == 'quit':
             break
         assert line.strip() == 'run'
-        print(json.dumps(dict(run_ns=sample(), energy='-0.169089263', backend_compile_ns=0,
-                              deoptimizations=0)), flush=True)
+        before = len(events)
+        elapsed = sample()
+        print(json.dumps(dict(run_ns=elapsed, energy='-0.169089263', backend_compile_ns=backend_compile_ns,
+                              deoptimizations=None if pypy else 0,
+                              jit_new_events=events[before:] if jit_events else None)), flush=True)
 
 
 def command_output(command):
@@ -81,10 +102,11 @@ def main():
     parser.add_argument('--warmups', type=int, default=2)
     parser.add_argument('--cpu-label')
     parser.add_argument('--seed', type=int, default=20261028)
-    parser.add_argument('--cpython-worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--python-worker', '--cpython-worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--jit-events', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.cpython_worker:
-        cpython_worker(args.source, args.warmups)
+    if args.python_worker:
+        python_worker(args.source, args.warmups, args.jit_events)
         return
     if not all([args.run, args.worker, args.kernel, args.output]):
         parser.error('--run, --worker, --kernel and --output are required')

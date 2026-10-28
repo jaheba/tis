@@ -317,3 +317,32 @@ Sampling includes small scene resets and energy checks between advances; profile
 The summarizer reports exclusive counts and inclusive counts with recursive frames deduplicated.
 It accepts gzipped reports and an optional `--demangler /path/to/rustfilt` for Rust symbol names.
 Generated native code appears as anonymous frames; Rust callback stacks remain visible.
+
+## PyPy performance target
+
+Compare the installed runtimes using the same nbody input, with fresh-process and warmed measurements kept separate:
+
+```sh
+cargo build --release --examples
+python3 tools/compare_runtimes.py --run target/release/examples/run \
+  --worker target/release/examples/nbody_bench --python /path/to/python3 --pypy /path/to/pypy3 \
+  --output /tmp/tis-runtimes
+```
+
+The default is ten fresh processes and ten steady samples per runtime, with ten kernel warmups before steady samples.
+The runner interleaves runtimes serially and validates stdout or energy after every execution.
+Readiness retains the first kernel call and the complete warmup sequence.
+PyPy backend compile time and deoptimization counts remain unknown in timing results.
+Only the known old-PyPy CPU-cache detection warning is accepted on stderr, and it is retained in the results.
+
+Capture optimized PyPy traces and compile events separately from timing, then inspect them alongside warmed tis LIR:
+
+```sh
+python3 tools/trace_pypy.py --pypy /path/to/pypy3 --output /tmp/pypy-traces
+target/release/examples/nbody_bench --tier native --warmups 10 --dump-lir /tmp/advance.lir < /dev/null
+python3 tools/inspect_pypy.py --log /tmp/pypy-traces/pypy.log --tis-lir /tmp/advance.lir --output /tmp/loop-comparison
+```
+
+The trace inspector separates loop backedge bodies from entry preambles and exit bridges.
+Its operation counts are static IR descriptions, not instruction timing or dynamic execution counts.
+The next loop work targets typed sequence access and primitive values across backedges; this comparison should track progress.

@@ -11,8 +11,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut bytecode = BytecodeMode::default();
     let mut numeric = NumericMode::default();
     let mut warmups = 2usize;
+    let mut dump_lir = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--dump-lir" => dump_lir = Some(args.next().ok_or("missing LIR output path")?),
             "--numeric" => {
                 numeric = match args.next().as_deref() {
                     Some("adaptive") => NumericMode::Adaptive,
@@ -83,6 +85,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut warmup_ns = vec![];
     for _ in 0..warmups {
         warmup_ns.push(sample(&mut vm, advance, energy, &snapshot)?);
+    }
+    if let Some(path) = dump_lir {
+        std::fs::write(
+            path,
+            vm.function_hir(advance)?
+                .lower_lir(tis::lir::LoweringMode::Profiled)?
+                .dump(),
+        )?;
     }
     let backend_compile_ns = vm.tier_stats.native_compile_ns + vm.tier_stats.copy_patch_compile_ns;
     let profile = vm.function_hir(advance)?.profile();
