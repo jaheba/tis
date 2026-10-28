@@ -107,8 +107,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let elapsed = sample(&mut vm, advance, energy, &snapshot)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{elapsed},\"feedback_probes\":{},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
+            "{{\"run_ns\":{elapsed},\"feedback_probes\":{},\"root_syncs\":{},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
             stats.native_feedback_probes - before.native_feedback_probes,
+            stats.native_root_syncs - before.native_root_syncs,
             stats.numeric_fast_paths - before.numeric_fast_paths,
             stats.numeric_type_misses - before.numeric_type_misses,
             stats.numeric_arithmetic_fallbacks - before.numeric_arithmetic_fallbacks,

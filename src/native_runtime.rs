@@ -84,6 +84,8 @@ pub(crate) fn execute(
     start: usize,
     skip_probe: bool,
 ) -> Result<Outcome> {
+    // Call setup can allocate environments; the initial VM window is already fully rooted.
+    vm.maybe_collect()?;
     let mut registers = vec![
         Slot::default();
         lir.registers
@@ -236,7 +238,7 @@ impl Context<'_> {
             }
             self.collecting = vm.collecting(self.function);
             self.previous = Some(location as usize);
-            return vm.maybe_collect();
+            return Ok(());
         }
         let &(block, index) = self
             .locations
@@ -300,20 +302,34 @@ impl Context<'_> {
             return Ok(());
         }
         let mut observed = false;
+        let mut checkpoint = false;
         if event == HELPER {
-            let (state, roots) = match &instruction.operation {
-                Operation::Call { state, roots, .. } | Operation::Truth { state, roots, .. } => {
-                    (*state, roots)
+            let (state, roots, effects) = match &instruction.operation {
+                Operation::Call {
+                    state,
+                    roots,
+                    effects,
+                    ..
                 }
+                | Operation::Truth {
+                    state,
+                    roots,
+                    effects,
+                    ..
+                } => (*state, roots, *effects),
                 _ => return Err(Error::InvalidIr("native helper instruction")),
             };
-            vm.sync_lir_roots(
-                &self.lir.states[state.0],
-                roots,
-                self.base,
-                &mut self.rooted,
-                |r| registers[r.0].value(),
-            )?;
+            checkpoint = effects.needs_safepoint();
+            if checkpoint {
+                vm.tier_stats.native_root_syncs += 1;
+                vm.sync_lir_roots(
+                    &self.lir.states[state.0],
+                    roots,
+                    self.base,
+                    &mut self.rooted,
+                    |r| registers[r.0].value(),
+                )?;
+            }
             let result = match &instruction.operation {
                 Operation::Call {
                     helper, arguments, ..
@@ -329,11 +345,15 @@ impl Context<'_> {
                         })?
                     };
                     let roots = vm.transient_roots.len();
-                    vm.transient_roots.extend_from_slice(&self.helper_arguments);
+                    if effects.may_call {
+                        vm.transient_roots.extend_from_slice(&self.helper_arguments);
+                    }
                     let result = vm.lir_helper(helper, &self.helper_arguments);
                     vm.transient_roots.truncate(roots);
                     // A recursive call can reopen this function's observation window.
-                    self.collecting = vm.collecting(self.function);
+                    if effects.may_call {
+                        self.collecting = vm.collecting(self.function);
+                    }
                     Slot::boxed(result?)
                 }
                 Operation::Truth { value, .. } => Slot {
@@ -380,6 +400,11 @@ impl Context<'_> {
                 }
             }
         }
-        vm.maybe_collect()
+        // Only allocating/calling helpers are GC checkpoints; every such checkpoint has fresh roots.
+        if checkpoint {
+            vm.maybe_collect()
+        } else {
+            Ok(())
+        }
     }
 }

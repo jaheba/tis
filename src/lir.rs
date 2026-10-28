@@ -56,11 +56,29 @@ pub struct SideExit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Effects {
     pub may_raise: bool,
+    /// May allocate Python heap objects; Rust scratch allocations cannot trigger tracing GC.
     pub may_allocate: bool,
     pub may_call: bool,
     pub may_write: bool,
 }
 impl Effects {
+    pub const READ_ONLY: Self = Self {
+        may_raise: true,
+        may_allocate: false,
+        may_call: false,
+        may_write: false,
+    };
+
+    pub fn needs_safepoint(self) -> bool {
+        self.may_allocate || self.may_call
+    }
+
+    fn covers(self, required: Self) -> bool {
+        (!required.may_raise || self.may_raise)
+            && (!required.may_allocate || self.may_allocate)
+            && (!required.may_call || self.may_call)
+            && (!required.may_write || self.may_write)
+    }
     const CONSERVATIVE: Self = Self {
         may_raise: true,
         may_allocate: true,
@@ -479,7 +497,7 @@ impl Function {
                             arguments: vec![],
                             state,
                             roots,
-                            effects: Effects::CONSERVATIVE,
+                            effects: Helper::StringConstant(text.clone()).effects(),
                         },
                     );
                 } else if let hir::Op::Constant(constant) = &instruction.op {
@@ -508,11 +526,16 @@ impl Function {
                         .into_iter()
                         .map(|id| Register(id.0))
                         .collect();
-                    let roots = output.states[state.0]
-                        .values
-                        .iter()
-                        .map(|(_, register)| *register)
-                        .collect();
+                    let effects = helper.effects();
+                    let roots = if effects.needs_safepoint() {
+                        output.states[state.0]
+                            .values
+                            .iter()
+                            .map(|(_, register)| *register)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     emit(
                         &mut instructions,
                         Some(result),
@@ -521,7 +544,7 @@ impl Function {
                             arguments,
                             state,
                             roots,
-                            effects: Effects::CONSERVATIVE,
+                            effects,
                         },
                     );
                 }
@@ -545,11 +568,7 @@ impl Function {
                         instruction: body.instructions.len(),
                     };
                     let state = output.state(hir, point, &analysis.live_terminator[block_id]);
-                    let roots = output.states[state.0]
-                        .values
-                        .iter()
-                        .map(|(_, r)| *r)
-                        .collect();
+                    let roots = Vec::new();
                     let truth = output.register(Type::Bool);
                     instructions.push(Instruction {
                         result: Some(truth),
@@ -559,7 +578,7 @@ impl Function {
                             value: Register(condition.0),
                             state,
                             roots,
-                            effects: Effects::CONSERVATIVE,
+                            effects: Effects::READ_ONLY,
                         },
                     });
                     Terminator::Branch {
@@ -687,9 +706,13 @@ impl Function {
                             .iter()
                             .any(|(_, register)| register == value)
                             || snapshot.resume != instruction.point
-                            || !effects.may_raise
+                            || !effects.covers(Effects::READ_ONLY)
                             || roots.iter().copied().collect::<BTreeSet<_>>()
-                                != snapshot.values.iter().map(|(_, r)| *r).collect()
+                                != if effects.needs_safepoint() {
+                                    snapshot.values.iter().map(|(_, r)| *r).collect()
+                                } else {
+                                    BTreeSet::new()
+                                }
                         {
                             return Err(fail());
                         }
@@ -854,8 +877,13 @@ impl Function {
                             .iter()
                             .any(|argument| !required.contains(argument))
                             || !snapshot.environment_root
-                            || roots.iter().copied().collect::<BTreeSet<_>>() != required
-                            || !effects.may_raise
+                            || roots.iter().copied().collect::<BTreeSet<_>>()
+                                != if effects.needs_safepoint() {
+                                    required
+                                } else {
+                                    BTreeSet::new()
+                                }
+                            || !effects.covers(helper.effects())
                         {
                             return Err(fail());
                         }
@@ -1227,6 +1255,51 @@ impl Function {
 }
 
 impl Helper {
+    /// Adding a reentrant Python protocol here must also update its allocation/call effects.
+    pub fn effects(&self) -> Effects {
+        let readonly = Effects::READ_ONLY;
+        let allocating = Effects {
+            may_allocate: true,
+            ..readonly
+        };
+        let writing = Effects {
+            may_write: true,
+            ..readonly
+        };
+        match self {
+            Self::Subtract | Self::Less | Self::Len => readonly,
+            Self::SetItem => writing,
+            Self::StringConstant(_)
+            | Self::Add
+            | Self::List
+            | Self::Tuple
+            | Self::Dict
+            | Self::GetItem => allocating,
+            Self::Python(op) => match op {
+                CoreOp::LoadName(_)
+                | CoreOp::LoadLocal(_)
+                | CoreOp::CheckLocal(_)
+                | CoreOp::IsDone
+                | CoreOp::Compare(_)
+                | CoreOp::Unary(_) => readonly,
+                CoreOp::StoreLocal(_) | CoreOp::StoreName(_) => writing,
+                CoreOp::Binary(op)
+                    if matches!(op.as_str(), "/" | "//" | "%" | "**" | "&" | "|" | "^") =>
+                {
+                    readonly
+                }
+                CoreOp::Inplace(op)
+                    if matches!(op.as_str(), "-" | "/" | "//" | "%" | "**" | "&" | "|" | "^") =>
+                {
+                    readonly
+                }
+                CoreOp::Binary(op) if op == "*" => allocating,
+                CoreOp::Missing | CoreOp::Slice | CoreOp::UnpackItem(_) => allocating,
+                // Iteration, calls and attribute/format operations retain conservative effects.
+                _ => Effects::CONSERVATIVE,
+            },
+        }
+    }
     fn accepts(&self, count: usize) -> bool {
         match self {
             Self::StringConstant(_) => count == 0,

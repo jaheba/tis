@@ -19,7 +19,6 @@ pub enum Tiering {
 }
 #[derive(Debug, Clone, Default)]
 pub struct TierStats {
-    pub native_feedback_probes: u64,
     pub numeric_specializations: u64,
     pub numeric_fast_paths: u64,
     pub numeric_type_misses: u64,
@@ -43,6 +42,8 @@ pub struct TierStats {
     pub osr_entries: u64,
     pub deoptimizations: u64,
     pub retired: u64,
+    pub native_feedback_probes: u64,
+    pub native_root_syncs: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {
@@ -150,6 +151,8 @@ impl Vm {
         mut previous: Option<usize>,
         skip_first_probe: bool,
     ) -> Result<Outcome> {
+        // Retain a checkpoint for call-setup allocations even when the body cannot allocate.
+        self.maybe_collect()?;
         let mut registers = vec![None; lir.registers.len()];
         for (index, value) in self.stack[base..frame_end].iter().enumerate() {
             registers[index] = value.map(Datum::Boxed);
@@ -180,6 +183,7 @@ impl Vm {
                 .ok_or(Error::InvalidIr("invalid LIR block"))?;
             for instruction in &body.instructions {
                 let mut observed = false;
+                let mut checkpoint = false;
                 let result = match &instruction.operation {
                     Operation::SequenceUnpack {
                         value,
@@ -313,9 +317,12 @@ impl Vm {
                         value,
                         state,
                         roots,
-                        ..
+                        effects,
                     } => {
-                        self.lir_roots(lir, *state, roots, &registers, base, &mut rooted)?;
+                        checkpoint = effects.needs_safepoint();
+                        if checkpoint {
+                            self.lir_roots(lir, *state, roots, &registers, base, &mut rooted)?;
+                        }
                         Some(Datum::Bool(runtime::truth(
                             &self.heap,
                             read(&registers, *value)?.boxed()?,
@@ -326,9 +333,12 @@ impl Vm {
                         arguments,
                         state,
                         roots,
-                        ..
+                        effects,
                     } => {
-                        self.lir_roots(lir, *state, roots, &registers, base, &mut rooted)?;
+                        checkpoint = effects.needs_safepoint();
+                        if checkpoint {
+                            self.lir_roots(lir, *state, roots, &registers, base, &mut rooted)?;
+                        }
                         let args = arguments
                             .iter()
                             .map(|&r| read(&registers, r)?.boxed())
@@ -378,7 +388,9 @@ impl Vm {
                         }
                     }
                 }
-                self.maybe_collect()?;
+                if checkpoint {
+                    self.maybe_collect()?;
+                }
             }
             let edge = match &body.terminator {
                 Terminator::Return(value) => {

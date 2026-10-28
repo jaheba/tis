@@ -187,6 +187,9 @@ The Cranelift emitter follows the [Cranelift JIT API](https://docs.rs/cranelift-
 Helper and checked sequence results publish heap references; scalar-only instructions need no callback in staged native code.
 Safepoints read register images directly and publish only heap references to the collector.
 Eager diagnostics retain scalar-result callbacks; switching to eager mode rebuilds an artifact that omitted them.
+Native contexts cache whether detailed feedback is active, refreshing after block probes and reentrant helpers.
+Frozen callbacks skip observer calls and result-profile borrows; guard failures still reopen bounded observation windows.
+`TierStats.native_feedback_probes` and `native_root_syncs` count observer calls and GC root publications.
 Within a block, typed arithmetic reuses existing primitive SSA registers across operations and helper calls.
 Boxed shadow values remain for reconstruction; boxing is not yet deferred to helper calls and side exits.
 Per-scalar native fast-path counts are available in eager mode; staged code keeps tier-entry, backedge and failure counts.
@@ -199,7 +202,13 @@ They still read mutable heap state and cannot be moved across writes or Python c
 Unpack views are limited to verified contiguous element reads before assignment targets can mutate the source.
 Tuples can be reused during generic unpacking; generic list unpacking copies a snapshot without creating an iterator.
 Iterators and starred targets retain generic collection behavior.
-LIR helper effects remain conservative; there is no inlining or escape analysis yet.
+LIR helper effects distinguish Python heap allocation, Python calls and writes.
+Numeric reads, truth tests, local/name access, comparisons and indexed mutation do not allocate Python heap objects.
+Their complete deoptimization states are retained, while their GC maps are empty and no collection checkpoint runs there.
+Allocating or calling helpers retain full GC maps and publish roots before execution and collection afterwards.
+Generic iteration, calls, attributes and formatting retain conservative effects.
+The verifier rejects effects that understate a helper's requirements and checks each GC map against its effects.
+There is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
 `vm.tier_stats` exposes reference/native entries, OSR entries, compilation errors, deoptimizations and cumulative emitted bytes.
@@ -252,7 +261,7 @@ Native execution also uses unsafe Rust at the documented ABI and executable-memo
 The tis object layer uses generation-checked handles and tracing collection, including cycles and slot reuse.
 Monty's reference counting and HeapReader API are not part of this port.
 
-Collection runs between bytecode instructions and at LIR/native runtime boundaries.
+Collection runs between bytecode instructions, at fully rooted LIR/native entry, and at allocating or calling helpers.
 Temporary slots, local slots, active environments, in-flight calls and module globals are rooted.
 LIR/native safepoints include SSA local bindings in their root maps and retain the initial local frame.
 Host-held handles can be retained with `Vm::pin` and released with `Vm::unpin`.
