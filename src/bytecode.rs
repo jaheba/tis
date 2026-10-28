@@ -28,6 +28,7 @@ pub struct Code {
     offsets: Vec<Vec<usize>>,
     block_offsets: Vec<usize>,
     pub(crate) constants: Vec<Constant>,
+    pub(crate) literal_cache: Vec<std::cell::Cell<Option<crate::Value>>>,
     pub(crate) slots: usize,
     pub(crate) local_names: Vec<String>,
     pub(crate) local_parameters: Vec<Option<usize>>,
@@ -144,6 +145,7 @@ impl Code {
                 offsets: Vec::new(),
                 block_offsets: Vec::new(),
                 constants: Vec::new(),
+                literal_cache: Vec::new(),
                 slots: function.value_count,
                 local_names: function.local_slots.clone(),
                 local_parameters: function
@@ -202,6 +204,9 @@ impl Code {
                     .ok_or(Error::InvalidIr("invalid block"))?,
             )?;
         }
+        builder.code.literal_cache = (0..builder.code.constants.len())
+            .map(|_| std::cell::Cell::new(None))
+            .collect();
         builder.code.register = register::RegisterCode::lower(function, &builder.code)?;
         Ok(builder.code)
     }

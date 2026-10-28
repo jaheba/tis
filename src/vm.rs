@@ -39,6 +39,7 @@ pub struct Vm {
     // Inactive buffers contain no roots. Each active native frame owns a distinct allocation.
     pub(crate) native_register_pool: Vec<Vec<crate::native_abi::Slot>>,
     pub(crate) modules: std::collections::BTreeMap<String, Value>,
+    pub(crate) literal_pool: std::collections::HashMap<String, Value>,
     pub output: String,
     pub(crate) depth: usize,
     pub(crate) transient_roots: Vec<Value>,
@@ -53,6 +54,30 @@ pub struct Vm {
 }
 
 impl Vm {
+    pub(crate) fn intern_literal(
+        &mut self,
+        text: &str,
+        cache: &std::cell::Cell<Option<Value>>,
+    ) -> Value {
+        if let Some(value) = cache.get()
+            && self.heap.get(value).is_ok()
+        {
+            self.tier_stats.literal_hits += 1;
+            return value;
+        }
+        let value = match self.literal_pool.get(text).copied() {
+            Some(value) if self.heap.get(value).is_ok() => value,
+            _ => {
+                let value = self.heap.allocate(Object::String(text.into()));
+                self.literal_pool.insert(text.into(), value);
+                self.tier_stats.interned_literals += 1;
+                value
+            }
+        };
+        cache.set(Some(value));
+        value
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -322,6 +347,7 @@ impl Vm {
             .chain(self.transient_roots.iter().copied())
             .chain(self.pinned.values().copied())
             .chain(self.modules.values().copied())
+            .chain(self.literal_pool.values().copied())
             .chain(self.globals)
             .chain(external_roots.iter().copied())
             .filter(|value| matches!(value, Value::Ref(_)))
@@ -523,7 +549,7 @@ impl Vm {
                         Constant::Int(value) => Value::Int(*value),
                         Constant::Float(value) => Value::Float(*value),
                         Constant::String(value) => {
-                            self.heap.allocate(Object::String(value.clone()))
+                            self.intern_literal(value, &code.literal_cache[index])
                         }
                     };
                     self.push(value);

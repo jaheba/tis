@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run_ns = sample(&mut vm)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{}}}",
+            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{}}}",
             stats.native_compile_ns + stats.copy_patch_compile_ns
                 - before.native_compile_ns
                 - before.copy_patch_compile_ns,
@@ -97,7 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats.native_field_hits - before.native_field_hits,
             stats.bytecode_positional_calls - before.bytecode_positional_calls,
             stats.bytecode_leaf_calls - before.bytecode_leaf_calls,
-            stats.bytecode_method_calls - before.bytecode_method_calls
+            stats.bytecode_method_calls - before.bytecode_method_calls,
+            stats.literal_hits - before.literal_hits,
+            stats.interned_literals - before.interned_literals,
+            stats.name_cache_hits - before.name_cache_hits
         );
         io::stdout().flush()?;
     }

@@ -1,5 +1,7 @@
 //! A Python subset compiled through IR to bytecode, with an independent runtime.
 
+mod bindings;
+pub use bindings::Name;
 pub mod bytecode;
 mod dict;
 mod error;
@@ -34,5 +36,5 @@ pub use tier::{TierStats, Tiering};
 pub use error::{Error, Result};
 pub use frontend::{CompileOptions, Program, compile, compile_with_options};
 pub use heap::{Heap, Key, Object};
-pub use value::{ObjectId, Value};
+pub use value::{ObjectId, StringLiteral, Value};
 pub use vm::Vm;

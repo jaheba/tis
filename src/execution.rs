@@ -13,12 +13,12 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct Environment {
-    pub parent: Option<Value>,
-    pub values: BTreeMap<String, Value>,
-    pub locals: BTreeSet<String>,
-    pub globals: BTreeSet<String>,
-    pub nonlocals: BTreeSet<String>,
-    pub class_scope: bool,
+    pub(crate) parent: Option<Value>,
+    pub(crate) values: crate::bindings::Bindings,
+    pub(crate) locals: BTreeSet<String>,
+    pub(crate) globals: BTreeSet<String>,
+    pub(crate) nonlocals: BTreeSet<String>,
+    pub(crate) class_scope: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ impl Vm {
         if let Some(env) = self.globals {
             return env;
         }
-        let mut values = BTreeMap::new();
+        let mut values = crate::bindings::Bindings::new();
         for name in [
             "len",
             "range",
@@ -216,7 +216,91 @@ impl Vm {
         }
     }
 
-    fn lookup(&self, mut environment: Value, name: &str) -> Result<Value> {
+    pub(crate) fn load_name_slot(
+        &mut self,
+        name: &str,
+        cache: &std::cell::Cell<Option<crate::bindings::NameSlot>>,
+    ) -> Result<Value> {
+        let environment = *self
+            .environments
+            .last()
+            .ok_or(Error::InvalidIr("frame environment"))?;
+        if let Some(address) = cache.get()
+            && address.environment == environment
+            && let Some(&value) = self.env(address.namespace)?.values.at(address.slot)
+        {
+            self.tier_stats.name_cache_hits += 1;
+            return Ok(value);
+        }
+        let mut target = environment;
+        loop {
+            let namespace = self.env(target)?;
+            // Function-local membership is fixed by compilation. Class namespaces can gain
+            // nearer bindings during execution, so paths through them retain dynamic lookup.
+            if namespace.class_scope {
+                return self.lookup(environment, name);
+            }
+            if namespace.globals.contains(name) {
+                target = self.globals.ok_or(Error::InvalidIr("globals"))?;
+                continue;
+            }
+            if let Some(slot) = namespace.values.slot(name)
+                && let Some(&value) = namespace.values.at(slot)
+            {
+                cache.set(Some(crate::bindings::NameSlot {
+                    environment,
+                    namespace: target,
+                    slot,
+                }));
+                return Ok(value);
+            }
+            if namespace.locals.contains(name) {
+                return Err(error(format!("UnboundLocalError: {name}")));
+            }
+            target = namespace
+                .parent
+                .ok_or_else(|| error(format!("NameError: {name}")))?;
+        }
+    }
+
+    pub(crate) fn store_name_slot(
+        &mut self,
+        name: &str,
+        value: Value,
+        cache: &std::cell::Cell<Option<crate::bindings::NameSlot>>,
+    ) -> Result<()> {
+        let environment = *self
+            .environments
+            .last()
+            .ok_or(Error::InvalidIr("frame environment"))?;
+        if let Some(address) = cache
+            .get()
+            .filter(|address| address.environment == environment)
+        {
+            let mut object = self.heap.get_mut(address.namespace)?;
+            let Object::Environment(namespace) = &mut *object else {
+                return Err(Error::InvalidIr("name namespace"));
+            };
+            namespace.values.set(address.slot, value);
+            self.tier_stats.name_cache_hits += 1;
+            return Ok(());
+        }
+        let target = self.store_target(environment, name)?;
+        self.store(environment, name, value)?;
+        let slot = self
+            .env(target)?
+            .values
+            .slot(name)
+            .ok_or(Error::InvalidIr("stored name slot"))?;
+        cache.set(Some(crate::bindings::NameSlot {
+            environment,
+            namespace: target,
+            slot,
+        }));
+        Ok(())
+    }
+
+    pub(crate) fn lookup(&self, mut environment: Value, name: &str) -> Result<Value> {
         loop {
             let env = self.env(environment)?;
             if env.globals.contains(name) {
@@ -237,7 +321,7 @@ impl Vm {
         }
     }
 
-    fn store(&mut self, environment: Value, name: &str, value: Value) -> Result<()> {
+    fn store_target(&self, environment: Value, name: &str) -> Result<Value> {
         let env = self.env(environment)?;
         let target = if env.globals.contains(name) {
             self.globals.unwrap()
@@ -255,6 +339,11 @@ impl Vm {
         } else {
             environment
         };
+        Ok(target)
+    }
+
+    pub(crate) fn store(&mut self, environment: Value, name: &str, value: Value) -> Result<()> {
+        let target = self.store_target(environment, name)?;
         let mut guard = self.heap.get_mut(target)?;
         let Object::Environment(env) = &mut *guard else {
             unreachable!()
@@ -312,7 +401,7 @@ impl Vm {
         } else {
             self.heap.allocate(Object::Environment(Environment {
                 parent: Some(parent),
-                values: BTreeMap::new(),
+                values: crate::bindings::Bindings::new(),
                 // Slot locals are never looked up through this environment. Captured names retain
                 // their lexical membership so closures and nonlocal assignment keep working.
                 locals: template
@@ -644,7 +733,7 @@ impl Vm {
                     } else {
                         env
                     }),
-                    values: BTreeMap::new(),
+                    values: crate::bindings::Bindings::new(),
                     locals: BTreeSet::new(),
                     globals: BTreeSet::new(),
                     nonlocals: BTreeSet::new(),

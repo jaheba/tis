@@ -140,7 +140,7 @@ impl Vm {
                         crate::hir::Constant::Int(value) => Value::Int(*value),
                         crate::hir::Constant::Float(value) => Value::Float(*value),
                         crate::hir::Constant::String(value) => {
-                            self.heap.allocate(Object::String(value.clone()))
+                            self.intern_literal(value, &code.literal_cache[a])
                         }
                     },
                     Opcode::Add => {
@@ -175,6 +175,23 @@ impl Vm {
                         i64::try_from(self.heap.len(self.read(base, ValueId(a))?)?)
                             .map_err(|_| Error::IntegerOverflow)?,
                     ),
+                    Opcode::LoadName => {
+                        let (crate::hir::CoreOp::LoadName(name), _) = &code.operations[a] else {
+                            return Err(Error::InvalidIr("name load"));
+                        };
+                        self.load_name_slot(name, &register.names[c])?
+                    }
+                    Opcode::StoreName => {
+                        let (crate::hir::CoreOp::StoreName(name), _) = &code.operations[a] else {
+                            return Err(Error::InvalidIr("name store"));
+                        };
+                        self.store_name_slot(
+                            name,
+                            self.read(base, ValueId(b))?,
+                            &register.names[c],
+                        )?;
+                        Value::None
+                    }
                     Opcode::LoadLocal => self.load_local(a)?,
                     Opcode::StoreLocal => {
                         self.store_local(a, self.read(base, ValueId(b))?)?;

@@ -91,7 +91,9 @@ impl Effects {
 /// Helpers consume and return boxed values; environment and root maps are explicit call metadata.
 #[derive(Debug, Clone)]
 pub enum Helper {
-    StringConstant(String),
+    StringConstant(crate::StringLiteral),
+    LoadName(crate::Name),
+    StoreName(crate::Name),
     Add,
     Subtract,
     Less,
@@ -770,11 +772,11 @@ impl Function {
                         &mut instructions,
                         Some(result),
                         Operation::Call {
-                            helper: Helper::StringConstant(text.clone()),
+                            helper: Helper::StringConstant(text.clone().into()),
                             arguments: vec![],
                             state,
                             roots,
-                            effects: Helper::StringConstant(text.clone()).effects(),
+                            effects: Helper::StringConstant(text.clone().into()).effects(),
                         },
                     );
                 } else if let hir::Op::Constant(constant) = &instruction.op {
@@ -795,6 +797,12 @@ impl Function {
                         hir::Op::GetItem(..) => Helper::GetItem,
                         hir::Op::SetItem { .. } => Helper::SetItem,
                         hir::Op::Len(_) => Helper::Len,
+                        hir::Op::Runtime(CoreOp::LoadName(name), _) => {
+                            Helper::LoadName(name.clone().into())
+                        }
+                        hir::Op::Runtime(CoreOp::StoreName(name), _) => {
+                            Helper::StoreName(name.clone().into())
+                        }
                         hir::Op::Runtime(op, _) => Helper::Python(op.clone()),
                         hir::Op::Constant(_) => unreachable!(),
                     };
@@ -1898,8 +1906,8 @@ impl Helper {
             ..readonly
         };
         match self {
-            Self::Subtract | Self::Less | Self::Len => readonly,
-            Self::SetItem => writing,
+            Self::Subtract | Self::Less | Self::Len | Self::LoadName(_) => readonly,
+            Self::SetItem | Self::StoreName(_) => writing,
             Self::StringConstant(_)
             | Self::Add
             | Self::List
@@ -1935,7 +1943,8 @@ impl Helper {
     }
     fn accepts(&self, count: usize) -> bool {
         match self {
-            Self::StringConstant(_) => count == 0,
+            Self::StringConstant(_) | Self::LoadName(_) => count == 0,
+            Self::StoreName(_) => count == 1,
             Self::Add | Self::Subtract | Self::Less | Self::GetItem => count == 2,
             Self::SetItem => count == 3,
             Self::Len => count == 1,

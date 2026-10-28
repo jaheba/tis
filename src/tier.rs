@@ -56,6 +56,9 @@ pub struct TierStats {
     pub bytecode_positional_calls: u64,
     pub bytecode_leaf_calls: u64,
     pub bytecode_method_calls: u64,
+    pub literal_hits: u64,
+    pub interned_literals: u64,
+    pub name_cache_hits: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {
@@ -620,7 +623,12 @@ impl Vm {
     }
     pub(crate) fn lir_helper(&mut self, helper: &Helper, args: &[Value]) -> Result<Value> {
         Ok(match helper {
-            Helper::StringConstant(text) => self.heap.allocate(Object::String(text.clone())),
+            Helper::LoadName(name) => self.load_name_slot(&name.text, &name.cache)?,
+            Helper::StoreName(name) => {
+                self.store_name_slot(&name.text, args[0], &name.cache)?;
+                Value::None
+            }
+            Helper::StringConstant(literal) => self.intern_literal(&literal.text, &literal.cache),
             Helper::Add => runtime::add(&mut self.heap, args[0], args[1])?,
             Helper::Subtract => runtime::subtract(args[0], args[1])?,
             Helper::Less => runtime::less(args[0], args[1])?,

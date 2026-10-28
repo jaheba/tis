@@ -26,6 +26,8 @@ pub(crate) enum Opcode {
     PrepareMethod,
     Numeric,
     LoadLocal,
+    LoadName,
+    StoreName,
     StoreLocal,
     CheckLocal,
     Jump,
@@ -51,6 +53,7 @@ pub(crate) struct Transfer {
 pub(crate) struct RegisterCode {
     pub body: Vec<Instruction>,
     pub edges: Vec<Transfer>,
+    pub names: Vec<Cell<Option<crate::bindings::NameSlot>>>,
     // Cells allow recursive frames to share quickening without retaining a mutable code borrow.
     pub numeric: Vec<Cell<Option<Plan>>>,
     quickened_window: Cell<Option<u32>>,
@@ -133,6 +136,22 @@ impl RegisterCode {
                         (Opcode::SetItem, object.0, key.0, value.0)
                     }
                     Op::Len(a) => (Opcode::Len, a.0, 0, 0),
+                    Op::Runtime(CoreOp::LoadName(_), _) | Op::Runtime(CoreOp::StoreName(_), _) => {
+                        let cache = output.names.len();
+                        output.names.push(Cell::new(None));
+                        let (opcode, input) =
+                            if let Op::Runtime(CoreOp::StoreName(_), inputs) = &instruction.op {
+                                (Opcode::StoreName, inputs[0].0)
+                            } else {
+                                (Opcode::LoadName, 0)
+                            };
+                        (
+                            opcode,
+                            site.runtime.ok_or(Error::InvalidIr("name operation"))?,
+                            input,
+                            cache,
+                        )
+                    }
                     Op::Runtime(CoreOp::LoadLocal(slot), _) => (Opcode::LoadLocal, *slot, 0, 0),
                     Op::Runtime(CoreOp::StoreLocal(slot), inputs) => {
                         (Opcode::StoreLocal, *slot, inputs[0].0, 0)
@@ -273,7 +292,12 @@ impl RegisterCode {
         for (id, edge) in self.body.iter().enumerate() {
             if matches!(
                 edge.op,
-                Opcode::Runtime | Opcode::Numeric | Opcode::CallPositional | Opcode::PrepareMethod
+                Opcode::Runtime
+                    | Opcode::Numeric
+                    | Opcode::CallPositional
+                    | Opcode::PrepareMethod
+                    | Opcode::LoadName
+                    | Opcode::StoreName
             ) {
                 let (operation, _) = code
                     .operations

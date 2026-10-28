@@ -79,6 +79,22 @@ Rust enum layout is not transmuted into this ABI; helpers explicitly encode and 
 Both native backends use the same ABI. Float views pack their length and feedback flag
 into the tag; loop-region metadata uses separate auxiliary slots.
 
+## Names and source literals
+
+Namespaces store values in stable numeric slots with a name-to-slot index. Replacing a binding
+updates its slot; removing a binding leaves an empty slot, so cached addresses never shift.
+Register bytecode and LIR name helpers cache the activation environment, target namespace and slot.
+A hit reads the current value, including assignments through `global` or `nonlocal`.
+Lexical parents and local-name membership are compiler-owned metadata. Paths through class
+namespaces retain dynamic lookup because execution can introduce a nearer class binding.
+Name caches hold non-owning identities and do not keep environments alive.
+
+Immutable source-string constants are interned for the lifetime of one VM. Bytecode constants and
+LIR helpers have weak site caches checked against the current heap; the VM's literal pool roots
+the canonical objects during collection. Sharing compiled code between VMs does not share heap
+objects. Dynamically constructed strings are not interned. This changes neither the 16-byte value
+layout nor the tracing-GC ownership model.
+
 ## Rust API
 
 ```rust
