@@ -1,10 +1,11 @@
 //! Fixed-size register instructions share constants, runtime operations and profile identities with stack code.
 use super::Code;
+use super::numeric::{Operator, Plan};
 use crate::{
     Error, Result,
     hir::{CoreOp, Edge, Function, Op, ResumePoint, Terminator, ValueId},
 };
-use std::fmt::Write;
+use std::{cell::Cell, fmt::Write};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +22,7 @@ pub(crate) enum Opcode {
     SetItem,
     Len,
     Runtime,
+    Numeric,
     LoadLocal,
     StoreLocal,
     CheckLocal,
@@ -47,6 +49,9 @@ pub(crate) struct Transfer {
 pub(crate) struct RegisterCode {
     pub body: Vec<Instruction>,
     pub edges: Vec<Transfer>,
+    // Cells allow recursive frames to share quickening without retaining a mutable code borrow.
+    pub numeric: Vec<Cell<Option<Plan>>>,
+    quickened_window: Cell<Option<u32>>,
     pub max_arguments: usize,
     pub max_transfer: usize,
     offsets: Vec<Vec<usize>>,
@@ -95,6 +100,9 @@ impl RegisterCode {
                     Op::Runtime(CoreOp::CheckLocal(slot), inputs) => {
                         (Opcode::CheckLocal, *slot, inputs[0].0, 0)
                     }
+                    Op::Runtime(_, inputs) if Operator::from_hir(&instruction.op).is_some() => {
+                        (Opcode::Numeric, inputs[0].0, inputs[1].0, 0)
+                    }
                     Op::Runtime(_, _) => (
                         Opcode::Runtime,
                         site.runtime
@@ -133,6 +141,7 @@ impl RegisterCode {
         Ok(output)
     }
     fn emit(&mut self, op: Opcode, dst: usize, a: usize, b: usize, c: usize) -> Result<()> {
+        self.numeric.push(Cell::new(None));
         self.body.push(Instruction {
             op,
             dst: operand(dst)?,
@@ -163,6 +172,34 @@ impl RegisterCode {
         });
         Ok(id)
     }
+    pub fn quicken(&self, function: &Function) -> u64 {
+        let profile = function.profile.borrow();
+        if self.quickened_window.get() == Some(profile.windows) {
+            return 0;
+        }
+        self.quickened_window.set(Some(profile.windows));
+        let mut installed = 0;
+        for (instruction, slot) in self.body.iter().zip(&self.numeric) {
+            let plan = function
+                .instruction(ValueId(instruction.dst as usize))
+                .and_then(|instruction| Operator::from_hir(&instruction.op))
+                .and_then(|operator| {
+                    profile
+                        .sites
+                        .get(instruction.dst as usize)
+                        .and_then(|site| Plan::from_profile(operator, site))
+                });
+            if matches!(
+                instruction.op,
+                Opcode::Add | Opcode::Subtract | Opcode::Less | Opcode::Numeric
+            ) {
+                slot.set(plan);
+                installed += u64::from(plan.is_some());
+            }
+        }
+        installed
+    }
+
     pub fn resume_offset(&self, point: ResumePoint) -> Result<usize> {
         self.offsets
             .get(point.block.0)
@@ -181,10 +218,17 @@ impl RegisterCode {
             .unwrap();
         }
         for (id, edge) in self.body.iter().enumerate() {
-            if matches!(edge.op, Opcode::Runtime) {
+            if matches!(edge.op, Opcode::Runtime | Opcode::Numeric) {
                 let (operation, _) = code
                     .operations
-                    .get(edge.a as usize)
+                    .get(if matches!(edge.op, Opcode::Numeric) {
+                        code.sites[edge.dst as usize]
+                            .as_ref()
+                            .and_then(|site| site.runtime)
+                            .ok_or(Error::InvalidIr("numeric operation"))?
+                    } else {
+                        edge.a as usize
+                    })
                     .ok_or(Error::InvalidIr("register operation"))?;
                 writeln!(
                     text,
@@ -192,6 +236,11 @@ impl RegisterCode {
                     Op::Runtime(operation.clone(), vec![])
                 )
                 .unwrap();
+            }
+        }
+        for (id, plan) in self.numeric.iter().enumerate() {
+            if let Some(plan) = plan.get() {
+                writeln!(text, "specialized @{id}: {plan:?}").unwrap();
             }
         }
         for (id, edge) in self.edges.iter().enumerate() {

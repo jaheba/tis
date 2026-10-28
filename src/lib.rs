@@ -22,7 +22,7 @@ mod sequence;
 mod tier;
 mod value;
 mod vm;
-pub use bytecode::BytecodeMode;
+pub use bytecode::{BytecodeMode, NumericMode};
 pub use tier::{TierStats, Tiering};
 
 pub use error::{Error, Result};

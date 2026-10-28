@@ -22,6 +22,8 @@ def main():
                         default=['bytecode', 'lir', 'native', 'copy-patch'])
     parser.add_argument('--baseline-bytecode', choices=['stack', 'register'])
     parser.add_argument('--candidate-bytecode', choices=['stack', 'register'])
+    parser.add_argument('--baseline-numeric', choices=['disabled', 'adaptive'])
+    parser.add_argument('--candidate-numeric', choices=['disabled', 'adaptive'])
     args = parser.parse_args()
     if args.samples < 10:
         parser.error('use at least 10 samples')
@@ -33,6 +35,7 @@ def main():
                    binaries={name: dict(path=str(path), sha256=digest(path))
                              for name, path in binaries.items()},
                    bytecode_modes={'baseline': args.baseline_bytecode, 'candidate': args.candidate_bytecode},
+                   numeric_modes={'baseline': args.baseline_numeric, 'candidate': args.candidate_numeric},
                    readiness={}, samples_raw=[])
     workers = {}
 
@@ -47,6 +50,9 @@ def main():
                 encoding = results['bytecode_modes'][name]
                 if encoding:
                     command += ['--bytecode', encoding]
+                numeric = results['numeric_modes'][name]
+                if numeric:
+                    command += ['--numeric', numeric]
                 process = subprocess.Popen(command,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE, text=True, bufsize=1)

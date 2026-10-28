@@ -1,5 +1,5 @@
 use std::{env, fs, process};
-use tis::{BytecodeMode, Tiering, Vm, compile};
+use tis::{BytecodeMode, NumericMode, Tiering, Vm, compile};
 
 fn main() {
     if let Err(error) = run() {
@@ -11,10 +11,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let mut tier = Tiering::Bytecode;
     let mut bytecode = BytecodeMode::default();
+    let mut numeric = NumericMode::default();
     let mut path = None;
     let mut stats = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--numeric" => {
+                numeric = match args.next().as_deref() {
+                    Some("adaptive") => NumericMode::Adaptive,
+                    Some("disabled") => NumericMode::Disabled,
+                    _ => return Err("--numeric requires adaptive or disabled".into()),
+                };
+            }
             "--bytecode" => {
                 bytecode = match args.next().as_deref() {
                     Some("stack") => BytecodeMode::Stack,
@@ -37,13 +45,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let path = path.ok_or(
-        "usage: cargo run --example run -- [--tier bytecode|lir|native|copy-patch] [--bytecode stack|register] [--stats] FILE.py",
+        "usage: cargo run --example run -- [--tier bytecode|lir|native|copy-patch] [--bytecode stack|register] [--numeric adaptive|disabled] [--stats] FILE.py",
     )?;
     let source = fs::read_to_string(path)?;
     let mut program = compile(&source)?;
     let mut vm = Vm::new();
     vm.tiering = tier;
     vm.bytecode = bytecode;
+    vm.numeric = numeric;
     let result = vm.run_program(&mut program);
     print!("{}", vm.output);
     if stats {

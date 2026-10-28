@@ -27,6 +27,7 @@ impl Vm {
                 .body
                 .get(ip)
                 .ok_or(Error::InvalidIr("register instruction pointer"))?;
+            let instruction_index = ip;
             ip += 1;
             let a = instruction.a as usize;
             let b = instruction.b as usize;
@@ -85,100 +86,147 @@ impl Vm {
             let destination = ValueId(instruction.dst as usize);
             let mut observed =
                 collecting && self.observe_site(function, code, base, destination)?;
-            let result = match op {
-                Opcode::Constant => match code
-                    .constants
-                    .get(a)
-                    .ok_or(Error::InvalidIr("register constant"))?
-                {
-                    crate::hir::Constant::Unbound => Value::Unbound,
-                    crate::hir::Constant::None => Value::None,
-                    crate::hir::Constant::Bool(value) => Value::Bool(*value),
-                    crate::hir::Constant::Int(value) => Value::Int(*value),
-                    crate::hir::Constant::Float(value) => Value::Float(*value),
-                    crate::hir::Constant::String(value) => {
-                        self.heap.allocate(Object::String(value.clone()))
+            let specialized = if self.numeric == crate::NumericMode::Adaptive {
+                if let Some(plan) = register.numeric[instruction_index].get() {
+                    let left = self.read(base, ValueId(a))?;
+                    let right = self.read(base, ValueId(b))?;
+                    match plan.evaluate(left, right) {
+                        crate::bytecode::numeric::Outcome::Value(value) => {
+                            self.tier_stats.numeric_fast_paths =
+                                self.tier_stats.numeric_fast_paths.saturating_add(1);
+                            Some(value)
+                        }
+                        crate::bytecode::numeric::Outcome::TypeMiss => {
+                            register.numeric[instruction_index].set(None);
+                            self.tier_stats.numeric_type_misses =
+                                self.tier_stats.numeric_type_misses.saturating_add(1);
+                            self.numeric_miss(function, destination, left, right, observed);
+                            collecting = self.collecting(function);
+                            observed = true;
+                            None
+                        }
+                        crate::bytecode::numeric::Outcome::ArithmeticMiss => {
+                            self.tier_stats.numeric_arithmetic_fallbacks = self
+                                .tier_stats
+                                .numeric_arithmetic_fallbacks
+                                .saturating_add(1);
+                            None
+                        }
                     }
-                },
-                Opcode::Add => {
-                    let lhs = self.read(base, ValueId(a))?;
-                    let rhs = self.read(base, ValueId(b))?;
-                    let (result, force) = self.adaptive_add(function, destination, lhs, rhs)?;
-                    if force {
-                        collecting = self.collecting(function);
-                        observed = true;
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let result = if let Some(value) = specialized {
+                value
+            } else {
+                match op {
+                    Opcode::Constant => match code
+                        .constants
+                        .get(a)
+                        .ok_or(Error::InvalidIr("register constant"))?
+                    {
+                        crate::hir::Constant::Unbound => Value::Unbound,
+                        crate::hir::Constant::None => Value::None,
+                        crate::hir::Constant::Bool(value) => Value::Bool(*value),
+                        crate::hir::Constant::Int(value) => Value::Int(*value),
+                        crate::hir::Constant::Float(value) => Value::Float(*value),
+                        crate::hir::Constant::String(value) => {
+                            self.heap.allocate(Object::String(value.clone()))
+                        }
+                    },
+                    Opcode::Add => {
+                        let lhs = self.read(base, ValueId(a))?;
+                        let rhs = self.read(base, ValueId(b))?;
+                        let (result, force) = self.adaptive_add(function, destination, lhs, rhs)?;
+                        if force {
+                            collecting = self.collecting(function);
+                            observed = true;
+                        }
+                        result
                     }
-                    result
-                }
-                Opcode::Subtract => {
-                    runtime::subtract(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?
-                }
-                Opcode::Less => {
-                    runtime::less(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?
-                }
-                Opcode::GetItem => self
-                    .heap
-                    .get_item(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?,
-                Opcode::SetItem => {
-                    self.heap.set_item(
+                    Opcode::Subtract => runtime::subtract(
                         self.read(base, ValueId(a))?,
                         self.read(base, ValueId(b))?,
-                        self.read(base, ValueId(c))?,
-                    )?;
-                    Value::None
-                }
-                Opcode::Len => Value::Int(
-                    i64::try_from(self.heap.len(self.read(base, ValueId(a))?)?)
-                        .map_err(|_| Error::IntegerOverflow)?,
-                ),
-                Opcode::LoadLocal => self.load_local(a)?,
-                Opcode::StoreLocal => {
-                    self.store_local(a, self.read(base, ValueId(b))?)?;
-                    Value::None
-                }
-                Opcode::CheckLocal => {
-                    let value = self.read(base, ValueId(b))?;
-                    self.check_local(a, value)?;
-                    value
-                }
-                Opcode::Runtime | Opcode::List | Opcode::Tuple | Opcode::Dict => {
-                    let site = code
-                        .sites
-                        .get(destination.0)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidIr("register inputs"))?;
-                    arguments.clear();
-                    for input in &site.inputs {
-                        arguments.push(self.read(base, *input)?);
+                    )?,
+                    Opcode::Less => {
+                        runtime::less(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?
                     }
-                    match op {
-                        Opcode::List => self.heap.allocate(Object::List(arguments.clone())),
-                        Opcode::Tuple => self.heap.allocate(Object::Tuple(arguments.clone())),
-                        Opcode::Dict => {
-                            let dict = self.heap.allocate(Object::Dict(vec![]));
-                            for pair in arguments.as_chunks::<2>().0 {
-                                self.heap.set_item(dict, pair[0], pair[1])?;
-                            }
-                            dict
+                    Opcode::GetItem => self
+                        .heap
+                        .get_item(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?,
+                    Opcode::SetItem => {
+                        self.heap.set_item(
+                            self.read(base, ValueId(a))?,
+                            self.read(base, ValueId(b))?,
+                            self.read(base, ValueId(c))?,
+                        )?;
+                        Value::None
+                    }
+                    Opcode::Len => Value::Int(
+                        i64::try_from(self.heap.len(self.read(base, ValueId(a))?)?)
+                            .map_err(|_| Error::IntegerOverflow)?,
+                    ),
+                    Opcode::LoadLocal => self.load_local(a)?,
+                    Opcode::StoreLocal => {
+                        self.store_local(a, self.read(base, ValueId(b))?)?;
+                        Value::None
+                    }
+                    Opcode::CheckLocal => {
+                        let value = self.read(base, ValueId(b))?;
+                        self.check_local(a, value)?;
+                        value
+                    }
+                    Opcode::Runtime
+                    | Opcode::Numeric
+                    | Opcode::List
+                    | Opcode::Tuple
+                    | Opcode::Dict => {
+                        let site = code
+                            .sites
+                            .get(destination.0)
+                            .and_then(Option::as_ref)
+                            .ok_or(Error::InvalidIr("register inputs"))?;
+                        arguments.clear();
+                        for input in &site.inputs {
+                            arguments.push(self.read(base, *input)?);
                         }
-                        _ => {
-                            let (operation, count) = code
-                                .operations
-                                .get(a)
-                                .ok_or(Error::InvalidIr("register runtime operation"))?;
-                            if *count != arguments.len() {
-                                return Err(Error::InvalidIr("register runtime arity"));
+                        match op {
+                            Opcode::List => self.heap.allocate(Object::List(arguments.clone())),
+                            Opcode::Tuple => self.heap.allocate(Object::Tuple(arguments.clone())),
+                            Opcode::Dict => {
+                                let dict = self.heap.allocate(Object::Dict(vec![]));
+                                for pair in arguments.as_chunks::<2>().0 {
+                                    self.heap.set_item(dict, pair[0], pair[1])?;
+                                }
+                                dict
                             }
-                            let roots = self.transient_roots.len();
-                            self.transient_roots.extend_from_slice(&arguments);
-                            let result = self.operation(operation, &arguments);
-                            self.transient_roots.truncate(roots);
-                            result?
+                            _ => {
+                                let (operation, count) = code
+                                    .operations
+                                    .get(if matches!(op, Opcode::Numeric) {
+                                        site.runtime
+                                            .ok_or(Error::InvalidIr("numeric runtime pool"))?
+                                    } else {
+                                        a
+                                    })
+                                    .ok_or(Error::InvalidIr("register runtime operation"))?;
+                                if *count != arguments.len() {
+                                    return Err(Error::InvalidIr("register runtime arity"));
+                                }
+                                let roots = self.transient_roots.len();
+                                self.transient_roots.extend_from_slice(&arguments);
+                                let result = self.operation(operation, &arguments);
+                                self.transient_roots.truncate(roots);
+                                result?
+                            }
                         }
                     }
-                }
-                Opcode::EnterBlock | Opcode::Jump | Opcode::Branch | Opcode::Return => {
-                    unreachable!()
+                    Opcode::EnterBlock | Opcode::Jump | Opcode::Branch | Opcode::Return => {
+                        unreachable!()
+                    }
                 }
             };
             self.write(base, destination, result)?;
@@ -189,5 +237,31 @@ impl Vm {
             }
             self.maybe_collect()?;
         }
+    }
+}
+
+impl Vm {
+    fn numeric_miss(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        destination: ValueId,
+        left: Value,
+        right: Value,
+        observed: bool,
+    ) {
+        let function = function.borrow();
+        let mut profile = function.profile.borrow_mut();
+        profile.start_window(self.profiling);
+        let site = &mut profile.sites[destination.0];
+        site.guard_failures = site.guard_failures.saturating_add(1);
+        // A miss must record unexpected kinds even when the previous window exhausted its sample budget.
+        if !observed {
+            site.executions = site.executions.saturating_add(1);
+            site.operands.resize_with(2, Default::default);
+            site.operands[0].observe(crate::profile::ValueKind::of(&self.heap, left));
+            site.operands[1].observe(crate::profile::ValueKind::of(&self.heap, right));
+        }
+        self.requested
+            .retain(|(id, revision, _)| *id != function.id() || *revision != function.revision());
     }
 }

@@ -19,6 +19,10 @@ pub enum Tiering {
 }
 #[derive(Debug, Clone, Default)]
 pub struct TierStats {
+    pub numeric_specializations: u64,
+    pub numeric_fast_paths: u64,
+    pub numeric_type_misses: u64,
+    pub numeric_arithmetic_fallbacks: u64,
     pub lowered: u64,
     pub copy_patch_entries: u64,
     pub copy_patch_osr_entries: u64,

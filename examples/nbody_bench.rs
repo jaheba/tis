@@ -4,14 +4,22 @@ use std::{
     io::{self, BufRead, Write},
     time::Instant,
 };
-use tis::{BytecodeMode, Error, Object, Result, Tiering, Value, Vm, compile};
+use tis::{BytecodeMode, Error, NumericMode, Object, Result, Tiering, Value, Vm, compile};
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let mut tier = Tiering::Bytecode;
     let mut bytecode = BytecodeMode::default();
+    let mut numeric = NumericMode::default();
     let mut warmups = 2usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--numeric" => {
+                numeric = match args.next().as_deref() {
+                    Some("adaptive") => NumericMode::Adaptive,
+                    Some("disabled") => NumericMode::Disabled,
+                    _ => return Err("--numeric requires adaptive or disabled".into()),
+                };
+            }
             "--bytecode" => {
                 bytecode = match args.next().as_deref() {
                     Some("stack") => BytecodeMode::Stack,
@@ -45,6 +53,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut vm = Vm::new();
     vm.tiering = tier;
     vm.bytecode = bytecode;
+    vm.numeric = numeric;
     let start = Instant::now();
     vm.run_program(&mut program)?;
     assert_eq!(vm.get_global("DEFAULT_ITERATIONS")?, Value::Int(20_000));
@@ -80,8 +89,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let site_samples: u64 = profile.sites.iter().map(|site| site.executions).sum();
     let phase = profile.phase;
     let windows = profile.windows;
+    let numeric_specializations = vm.tier_stats.numeric_specializations;
+    let numeric_fast_paths = vm.tier_stats.numeric_fast_paths;
     println!(
-        "{{\"ready\":true,\"compile_ns\":{compile_ns},\"setup_ns\":{setup_ns},\"warmup_ns\":{warmup_ns:?},\"backend_compile_ns\":{backend_compile_ns},\"profile_phase\":\"{phase:?}\",\"profile_windows\":{windows},\"site_samples\":{site_samples}}}"
+        "{{\"ready\":true,\"numeric_specializations\":{numeric_specializations},\"numeric_fast_paths\":{numeric_fast_paths},\"compile_ns\":{compile_ns},\"setup_ns\":{setup_ns},\"warmup_ns\":{warmup_ns:?},\"backend_compile_ns\":{backend_compile_ns},\"profile_phase\":\"{phase:?}\",\"profile_windows\":{windows},\"site_samples\":{site_samples}}}"
     );
     io::stdout().flush()?;
     for line in io::stdin().lock().lines() {
@@ -96,7 +107,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let elapsed = sample(&mut vm, advance, energy, &snapshot)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{elapsed},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
+            "{{\"run_ns\":{elapsed},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
+            stats.numeric_fast_paths - before.numeric_fast_paths,
+            stats.numeric_type_misses - before.numeric_type_misses,
+            stats.numeric_arithmetic_fallbacks - before.numeric_arithmetic_fallbacks,
             stats.native_compile_ns + stats.copy_patch_compile_ns
                 - before.native_compile_ns
                 - before.copy_patch_compile_ns,

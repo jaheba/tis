@@ -139,6 +139,17 @@ GC roots and tier handoffs are shared with the stack interpreter. Detailed feedb
 and resident code memory currently include both. `--format bytecode` inspects stack code; `--format register` inspects
 register code. HIR resume points select the appropriate encoding when a compiled tier exits.
 
+Completed staged observation windows also install guarded numeric plans for register bytecode.
+Monomorphic integer and float arithmetic and comparisons read frame operands directly, avoiding generic argument
+collection and operator-string dispatch. Integer overflow and float domain errors fall back to the original operation;
+a type miss disables that site's plan, records the unexpected kinds and starts a bounded observation window.
+Mixed integer/float comparisons and integer power remain generic to preserve numeric semantics.
+Plans belong to the cached code revision, use shared scalar arithmetic, and permit recursive frames through `Cell` storage.
+`Vm.numeric = NumericMode::Disabled` or `--numeric disabled` keeps the generic path for comparisons.
+`TierStats.numeric_*` reports installed plans, successful executions, type misses and arithmetic fallbacks.
+Eager diagnostic profiling retains generic execution and its per-site feedback counters.
+
+
 
 LIR has boxed, integer, float and boolean registers, explicit block arguments, runtime-helper calls and truth conversion.
 String construction and generic Python operations have safepoints, boxed root maps and conservative effect metadata.

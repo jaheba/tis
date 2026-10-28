@@ -1,5 +1,7 @@
 //! Stack and register encodings lowered exclusively from HIR.
+pub(crate) mod numeric;
 pub(crate) mod register;
+pub use numeric::NumericMode;
 
 use std::fmt::Write;
 

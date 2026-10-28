@@ -18,6 +18,7 @@ pub struct Vm {
     pub(crate) stack: Vec<Option<Value>>,
     pub tiering: crate::Tiering,
     pub bytecode: crate::BytecodeMode,
+    pub numeric: crate::NumericMode,
     pub(crate) copy_artifacts: std::collections::BTreeMap<
         (crate::profile::FunctionId, u64),
         Rc<crate::copy_patch::CopyCode>,
@@ -339,6 +340,15 @@ impl Vm {
             );
         if !ready || threshold == 0 || count < threshold {
             return;
+        }
+        if self.numeric == crate::NumericMode::Adaptive
+            && self.profiling.mode == crate::profile::ProfileMode::Staged
+            && let Some(code) = &function.code
+        {
+            self.tier_stats.numeric_specializations = self
+                .tier_stats
+                .numeric_specializations
+                .saturating_add(code.register.quicken(&function));
         }
         if self.profiling.mode == crate::profile::ProfileMode::Staged {
             self.retired_versions

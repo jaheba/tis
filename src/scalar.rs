@@ -37,7 +37,7 @@ pub(crate) fn power_with(
     let result = power(left, right);
     if result.is_nan() { None } else { Some(result) }
 }
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum FloatCondition {
     Eq,
     Ne,
@@ -57,6 +57,17 @@ impl FloatCondition {
             ">=" => Self::Ge,
             _ => return None,
         })
+    }
+    #[inline(always)]
+    pub(crate) fn evaluate_int(self, left: i64, right: i64) -> bool {
+        match self {
+            Self::Eq => left == right,
+            Self::Ne => left != right,
+            Self::Lt => left < right,
+            Self::Le => left <= right,
+            Self::Gt => left > right,
+            Self::Ge => left >= right,
+        }
     }
     #[inline(always)]
     pub(crate) fn evaluate(self, left: f64, right: f64) -> bool {
