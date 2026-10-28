@@ -769,11 +769,21 @@ impl Vm {
         Ok(backedge)
     }
     pub(crate) fn observe_site(
-        &mut self,
+        &self,
         function: &Rc<RefCell<Function>>,
         code: &Code,
         base: usize,
         value: ValueId,
+    ) -> Result<bool> {
+        self.observe_site_with(function, code, value, |value| self.read(base, value))
+    }
+
+    pub(crate) fn observe_site_with(
+        &self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        value: ValueId,
+        mut read: impl FnMut(ValueId) -> Result<Value>,
     ) -> Result<bool> {
         if !self.collecting(function) {
             return Ok(false);
@@ -796,8 +806,7 @@ impl Vm {
                 .inputs
                 .first()
                 .map(|&input| {
-                    self.read(base, input)
-                        .map(|value| crate::profile::CallTarget::of(&self.heap, value))
+                    read(input).map(|value| crate::profile::CallTarget::of(&self.heap, value))
                 })
                 .transpose()?
         } else {
@@ -809,10 +818,7 @@ impl Vm {
         site.operands
             .resize_with(metadata.inputs.len(), Default::default);
         for (operand, &input) in site.operands.iter_mut().zip(&metadata.inputs) {
-            operand.observe(crate::profile::ValueKind::of(
-                &self.heap,
-                self.read(base, input)?,
-            ));
+            operand.observe(crate::profile::ValueKind::of(&self.heap, read(input)?));
         }
         if let Some(target) = target {
             site.call(target);

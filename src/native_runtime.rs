@@ -259,7 +259,9 @@ impl Context<'_> {
                         self.helper_arguments.push(registers[r.0].value()?);
                     }
                     observed =
-                        vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
+                        vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
+                            registers[v.0].value()
+                        })?;
                     let roots = vm.transient_roots.len();
                     vm.transient_roots.extend_from_slice(&self.helper_arguments);
                     let result = vm.lir_helper(helper, &self.helper_arguments);
@@ -283,7 +285,9 @@ impl Context<'_> {
         {
             if event == FINISH {
                 observed =
-                    vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
+                    vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
+                        registers[v.0].value()
+                    })?;
             }
             let value = registers[result.0].value()?;
             if vm.stack[self.base + result.0].is_none() {

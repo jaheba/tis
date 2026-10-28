@@ -176,7 +176,7 @@ fn detached_maps_reconstruct_bound_and_unbound_locals_from_ssa() {
     let env = namespace.append(entry, Op::Runtime(CoreOp::Namespace, vec![]));
     namespace.terminate(entry, tis::hir::Terminator::Return(env));
     let env = vm.run(&mut namespace, &[]).unwrap();
-    for spare in [Value::Unbound, Value::Int(99)] {
+    for spare in [Value::Unbound, Value::None, Value::Int(99)] {
         let values = f
             .local_slots()
             .iter()

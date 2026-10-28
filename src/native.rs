@@ -24,6 +24,7 @@ pub(crate) struct NativeCode {
     pub lir: Rc<lir::Function>,
     locations: Vec<(usize, usize)>,
     pub bytes: usize,
+    pub feedback: bool,
 }
 impl fmt::Debug for NativeCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -49,7 +50,7 @@ fn error(message: impl fmt::Display) -> Error {
 }
 
 impl NativeCode {
-    pub fn compile(lir: Rc<lir::Function>) -> Result<Self> {
+    pub fn compile(lir: Rc<lir::Function>, feedback: bool) -> Result<Self> {
         lir.verify()?;
         if std::mem::size_of::<usize>() != 8 || std::mem::size_of::<Slot>() != 32 {
             return Err(error("native backend requires 64-bit pointers"));
@@ -63,6 +64,7 @@ impl NativeCode {
             lir,
             locations: vec![],
             bytes: 0,
+            feedback,
         };
         let module = owner.module.as_mut().unwrap();
         let ptr = module.target_config().pointer_type();
@@ -262,8 +264,11 @@ impl NativeCode {
                             failed,
                         ),
                     }
-                    if destination
-                        .is_some_and(|register| owner.lir.registers[register.0] == lir::Type::Boxed)
+                    // Non-helper boxed results are primitive; only eager diagnostics need a callback here.
+                    if feedback
+                        && destination.is_some_and(|register| {
+                            owner.lir.registers[register.0] == lir::Type::Boxed
+                        })
                         && !matches!(instruction.operation, Operation::Call { .. })
                     {
                         call(

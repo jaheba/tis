@@ -87,7 +87,7 @@ impl Plan {
         self.nodes[jump].next = Target::Block(edge.block.0);
         Ok(start)
     }
-    fn lower(lir: &lir::Function) -> Result<Self> {
+    fn lower(lir: &lir::Function, feedback: bool) -> Result<Self> {
         lir.verify()?;
         let scratch = lir
             .blocks
@@ -215,9 +215,11 @@ impl Plan {
                     }
                 };
                 plan.push(stencil, p);
-                if instruction
-                    .result
-                    .is_some_and(|register| lir.registers[register.0] == lir::Type::Boxed)
+                // Pure boxed results contain no heap references and remain available in native registers.
+                if feedback
+                    && instruction
+                        .result
+                        .is_some_and(|register| lir.registers[register.0] == lir::Type::Boxed)
                     && !matches!(instruction.operation, Operation::Call { .. })
                 {
                     plan.callback(FINISH, location)?;
@@ -289,6 +291,7 @@ pub(crate) struct CopyCode {
     pub data_bytes: usize,
     pub stencils: usize,
     pub relocations: usize,
+    pub feedback: bool,
 }
 impl fmt::Debug for CopyCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -300,11 +303,11 @@ impl fmt::Debug for CopyCode {
     }
 }
 impl CopyCode {
-    pub fn compile(lir: Rc<lir::Function>) -> Result<Self> {
+    pub fn compile(lir: Rc<lir::Function>, feedback: bool) -> Result<Self> {
         if generated::STENCILS.is_empty() {
             return Err(error("stencils are available only for AArch64 and x86-64"));
         }
-        let plan = Plan::lower(&lir)?;
+        let plan = Plan::lower(&lir, feedback)?;
         let mut offsets = vec![];
         let mut size = 0;
         for node in &plan.nodes {
@@ -411,6 +414,7 @@ impl CopyCode {
             data_bytes,
             stencils: plan.nodes.len(),
             relocations,
+            feedback,
         })
     }
     #[allow(clippy::too_many_arguments)]

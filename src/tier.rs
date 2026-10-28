@@ -290,7 +290,10 @@ impl Vm {
                             .iter()
                             .map(|&r| read(&registers, r)?.boxed())
                             .collect::<Result<Vec<_>>>()?;
-                        observed = self.observe_site(function, code, base, instruction.origin)?;
+                        observed =
+                            self.observe_site_with(function, code, instruction.origin, |v| {
+                                read(&registers, Register(v.0))?.boxed()
+                            })?;
                         // Boxed operands remain rooted throughout nested calls; helpers return before the next collection.
                         let roots = self.transient_roots.len();
                         self.transient_roots.extend_from_slice(&args);
@@ -309,7 +312,9 @@ impl Vm {
                     if let Datum::Boxed(value) = result {
                         if !matches!(instruction.operation, Operation::Call { .. }) {
                             observed =
-                                self.observe_site(function, code, base, instruction.origin)?;
+                                self.observe_site_with(function, code, instruction.origin, |v| {
+                                    read(&registers, Register(v.0))?.boxed()
+                                })?;
                         }
                         if self.stack[base + destination.0].is_none() {
                             rooted.push(destination.0);
@@ -400,8 +405,12 @@ impl Vm {
             self.stack[base + index] = None;
         }
         for (value, register) in &state.values {
-            rooted.push(value.0);
-            self.stack[base + value.0] = Some(read(*register)?);
+            let root = read(*register)?;
+            // Scalars stay in the register image for reconstruction; only heap references need GC publication.
+            if matches!(root, Value::Ref(_)) {
+                rooted.push(value.0);
+                self.stack[base + value.0] = Some(root);
+            }
         }
         Ok(())
     }
@@ -510,11 +519,14 @@ impl Vm {
     ) -> Result<Outcome> {
         if self.tiering == Tiering::CopyPatch {
             let key = (lir.source, lir.revision);
-            let compiled = if let Some(compiled) = self.copy_artifacts.get(&key) {
+            let feedback = self.profiling.mode == crate::profile::ProfileMode::Eager;
+            let compiled = if let Some(compiled) = self.copy_artifacts.get(&key)
+                && (!feedback || compiled.feedback)
+            {
                 compiled.clone()
             } else {
                 let start = std::time::Instant::now();
-                let result = crate::copy_patch::CopyCode::compile(lir.clone());
+                let result = crate::copy_patch::CopyCode::compile(lir.clone(), feedback);
                 self.tier_stats.copy_patch_compile_ns = self
                     .tier_stats
                     .copy_patch_compile_ns
@@ -558,11 +570,14 @@ impl Vm {
             compiled.execute(self, function, code, base, frame_end, start.0, osr)
         } else if self.tiering == Tiering::Native {
             let key = (lir.source, lir.revision);
-            let native = if let Some(native) = self.native_artifacts.get(&key) {
+            let feedback = self.profiling.mode == crate::profile::ProfileMode::Eager;
+            let native = if let Some(native) = self.native_artifacts.get(&key)
+                && (!feedback || native.feedback)
+            {
                 native.clone()
             } else {
                 let start = std::time::Instant::now();
-                let result = crate::native::NativeCode::compile(lir.clone());
+                let result = crate::native::NativeCode::compile(lir.clone(), feedback);
                 self.tier_stats.native_compile_ns = self
                     .tier_stats
                     .native_compile_ns

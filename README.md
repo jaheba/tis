@@ -163,9 +163,12 @@ An executable module is owned until its last active native frame returns, includ
 The Cranelift emitter is in `src/native.rs`; both native backends use `src/native_runtime.rs` and the same C-layout slots.
 The Cranelift emitter follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
 
-Boxed results still invoke runtime callbacks for roots and optional feedback; registers are materialized in memory.
+Helper results publish heap references at runtime boundaries; scalar-only instructions need no callback in staged native code.
+Safepoints read register images directly and publish only heap references to the collector.
+Eager diagnostics retain scalar-result callbacks; switching to eager mode rebuilds an artifact that omitted them.
 Within a block, typed arithmetic reuses existing primitive SSA registers across operations and helper calls.
 Boxed shadow values remain for reconstruction; boxing is not yet deferred to helper calls and side exits.
+Per-scalar native fast-path counts are available in eager mode; staged code keeps tier-entry, backedge and failure counts.
 LIR helper effects remain conservative; there is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
