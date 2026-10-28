@@ -100,14 +100,24 @@ impl Emitter<'_, '_> {
         exit: lir::ExitId,
     ) -> Result<()> {
         let kind = self.field(desc, offset_of!(Descriptor, kind));
+        let data = self.field(desc, offset_of!(Descriptor, data));
+        let step = self.field(desc, offset_of!(Descriptor, index));
+        self.element_parts([kind, data, step], index, dst, exit)
+    }
+    fn element_parts(
+        &mut self,
+        [kind, data, step]: [ir::Value; 3],
+        index: ir::Value,
+        dst: Register,
+        exit: lir::ExitId,
+    ) -> Result<()> {
         let is_range = self.b.ins().icmp_imm_s(IntCC::Equal, kind, RANGE as i64);
         let range = self.b.create_block();
         let sequence = self.b.create_block();
         let finish = self.b.create_block();
         self.b.ins().brif(is_range, range, &[], sequence, &[]);
         self.b.switch_to_block(range);
-        let start = self.field(desc, offset_of!(Descriptor, data));
-        let step = self.field(desc, offset_of!(Descriptor, index));
+        let start = data;
         let start = self.b.ins().sextend(types::I128, start);
         let step = self.b.ins().sextend(types::I128, step);
         let wideindex = self.b.ins().uextend(types::I128, index);
@@ -126,14 +136,12 @@ impl Emitter<'_, '_> {
         let done = self.b.create_block();
         self.b.ins().brif(is_float, floats, &[], values, &[]);
         self.b.switch_to_block(floats);
-        let data = self.field(desc, offset_of!(Descriptor, data));
         let off = self.b.ins().ishl_imm_u(index, 3);
         let p = self.b.ins().iadd(data, off);
         let bits = self.field(p, 0);
         store_scalar_cached(self.b, self.scalars, self.registers, dst, FLOAT, bits)?;
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(values);
-        let data = self.field(desc, offset_of!(Descriptor, data));
         let off = self.b.ins().ishl_imm_u(index, 5);
         let p = self.b.ins().iadd(data, off);
         self.boxed_at(p, dst)?;
@@ -235,14 +243,13 @@ impl Emitter<'_, '_> {
                 }
                 let data = self.field(p, offset_of!(Descriptor, data));
                 let dst = dst.unwrap();
-                store_scalar(self.b, self.registers, dst, FLOAT_VIEW_TAG, data)?;
-                self.b
-                    .ins()
-                    .store(MemFlagsData::new(), len, self.registers, offset(dst, 16)?);
+                for (field, value) in [(8, data), (16, len)] {
+                    store_word_cached(self.b, self.scalars, self.registers, dst, field, value)?;
+                }
+                let tag = self.b.ins().iconst(types::I64, FLOAT_VIEW_TAG as i64);
+                store_word_cached(self.b, self.scalars, self.registers, dst, 0, tag)?;
                 let zero = self.b.ins().iconst(types::I64, 0);
-                self.b
-                    .ins()
-                    .store(MemFlagsData::new(), zero, self.registers, offset(dst, 24)?);
+                store_word_cached(self.b, self.scalars, self.registers, dst, 24, zero)?;
             }
             Operation::SequenceUnpack {
                 value,
@@ -295,27 +302,34 @@ impl Emitter<'_, '_> {
                 ..
             } => {
                 let exit = self.region.entry;
-                let iterator = self.resolve(arguments[0], exit)?;
-                let kind = self.field(iterator, offset_of!(Descriptor, kind));
-                let valid = self.b.ins().icmp_imm_s(IntCC::Equal, kind, ITERATOR as i64);
-                self.guard(valid, exit)?;
-                let mut words = vec![];
-                for field in [0, 8, 16, 24] {
-                    words.push(self.field(iterator, offset_of!(Descriptor, source) + field));
-                }
-                let source = self.resolve_words(words.try_into().unwrap(), exit)?;
-                let kind = self.field(source, offset_of!(Descriptor, kind));
-                let a = self.b.ins().icmp_imm_s(IntCC::Equal, kind, TUPLE as i64);
-                let b = self.b.ins().icmp_imm_s(IntCC::Equal, kind, LIST as i64);
-                let c = self.b.ins().icmp_imm_s(IntCC::Equal, kind, FLOATS as i64);
-                let ab = self.b.ins().bor(a, b);
-                let abc = self.b.ins().bor(ab, c);
-                let range = self.b.ins().icmp_imm_s(IntCC::Equal, kind, RANGE as i64);
-                let valid = self.b.ins().bor(abc, range);
-                self.guard(valid, exit)?;
                 let virtual_state = self
                     .nest_vars
                     .and_then(|vars| vars.iterators.iter().find(|s| s.iterator == arguments[0]));
+                let (iterator, source, len) = if let Some(state) = virtual_state {
+                    (None, None, self.b.use_var(state.source[1]))
+                } else {
+                    let iterator = self.resolve(arguments[0], exit)?;
+                    let kind = self.field(iterator, offset_of!(Descriptor, kind));
+                    let valid = self.b.ins().icmp_imm_s(IntCC::Equal, kind, ITERATOR as i64);
+                    self.guard(valid, exit)?;
+                    let mut words = vec![];
+                    for field in [0, 8, 16, 24] {
+                        words.push(self.field(iterator, offset_of!(Descriptor, source) + field));
+                    }
+                    let source = self.resolve_words(words.try_into().unwrap(), exit)?;
+                    let kind = self.field(source, offset_of!(Descriptor, kind));
+                    let a = self.b.ins().icmp_imm_s(IntCC::Equal, kind, TUPLE as i64);
+                    let b = self.b.ins().icmp_imm_s(IntCC::Equal, kind, LIST as i64);
+                    let c = self.b.ins().icmp_imm_s(IntCC::Equal, kind, FLOATS as i64);
+                    let ab = self.b.ins().bor(a, b);
+                    let abc = self.b.ins().bor(ab, c);
+                    let range = self.b.ins().icmp_imm_s(IntCC::Equal, kind, RANGE as i64);
+                    let valid = self.b.ins().bor(abc, range);
+                    self.guard(valid, exit)?;
+
+                    let len = self.field(source, offset_of!(Descriptor, len));
+                    (Some(iterator), Some(source), len)
+                };
                 let (index, exhausted, indexptr, exhaustedptr) = if let Some(state) = virtual_state
                 {
                     (
@@ -325,15 +339,14 @@ impl Emitter<'_, '_> {
                         None,
                     )
                 } else {
-                    let ip = self.field(iterator, offset_of!(Descriptor, index));
+                    let ip = self.field(iterator.unwrap(), offset_of!(Descriptor, index));
                     let index = self.field(ip, 0);
-                    let ep = self.field(iterator, offset_of!(Descriptor, exhausted));
+                    let ep = self.field(iterator.unwrap(), offset_of!(Descriptor, exhausted));
                     let exhausted = self.b.ins().load(types::I8, MemFlagsData::new(), ep, 0);
                     let exhausted = self.b.ins().uextend(types::I64, exhausted);
                     (index, exhausted, Some(ip), Some(ep))
                 };
                 let exhausted = self.b.ins().icmp_imm_s(IntCC::NotEqual, exhausted, 0);
-                let len = self.field(source, offset_of!(Descriptor, len));
                 let end = self
                     .b
                     .ins()
@@ -344,7 +357,14 @@ impl Emitter<'_, '_> {
                 let join = self.b.create_block();
                 self.b.ins().brif(end, done, &[], item, &[]);
                 self.b.switch_to_block(item);
-                self.element(source, index, dst.unwrap(), exit)?;
+                if let Some(state) = virtual_state {
+                    let kind = self.b.use_var(state.source[0]);
+                    let data = self.b.use_var(state.source[2]);
+                    let step = self.b.use_var(state.source[3]);
+                    self.element_parts([kind, data, step], index, dst.unwrap(), exit)?;
+                } else {
+                    self.element(source.unwrap(), index, dst.unwrap(), exit)?;
+                }
                 let next = self.b.ins().iadd_imm_s(index, 1);
                 if let Some(state) = virtual_state {
                     self.b.def_var(state.index, next);
@@ -378,6 +398,40 @@ impl Emitter<'_, '_> {
                 arguments,
                 ..
             } => {
+                // An item-root type constraint excludes the internal Done sentinel. In that case
+                // Next's exhaustion state is already the loop condition; resolving the result again
+                // would repeat descriptor loads on every backedge.
+                let item_typed = self.region.schema.as_ref().is_some_and(|schema| {
+                    use crate::region::schema::{Constraint, Root};
+                    schema.constraints.iter().any(|constraint| {
+                        let path = match constraint {
+                            Constraint::Float(p)
+                            | Constraint::Int(p)
+                            | Constraint::Sequence(p, ..)
+                            | Constraint::Floats(p, ..)
+                            | Constraint::Bounds(p, _) => p,
+                        };
+                        path.root == Root::Item && path.indices.is_empty()
+                    })
+                });
+                if item_typed
+                    && let Some(state) = self.nest_vars.and_then(|vars| {
+                        vars.iterators
+                            .iter()
+                            .find(|s| s.iterator == self.region.iterator)
+                    })
+                {
+                    let value = self.b.use_var(state.exhausted);
+                    store_scalar_cached(
+                        self.b,
+                        self.scalars,
+                        self.registers,
+                        dst.unwrap(),
+                        BOOL,
+                        value,
+                    )?;
+                    return Ok(true);
+                }
                 let words = self.words(arguments[0])?;
                 let is_ref = self.b.ins().icmp_imm_s(IntCC::Equal, words[0], REF as i64);
                 let reference = self.b.create_block();

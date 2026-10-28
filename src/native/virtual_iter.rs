@@ -7,6 +7,8 @@ pub(super) struct IteratorVars {
     pub index: Variable,
     pub exhausted: Variable,
     pub count: Variable,
+    /// Builtin source kind, length, data/start and range step, fixed until nest exit.
+    pub source: [Variable; 4],
 }
 pub(super) struct NestVars {
     pub active: Variable,
@@ -33,6 +35,7 @@ impl NestVars {
                     index: var(),
                     exhausted: var(),
                     count: var(),
+                    source: std::array::from_fn(|_| var()),
                 }
             })
             .collect();
@@ -76,6 +79,39 @@ impl NestVars {
         lir: &lir::Function,
     ) -> Result<()> {
         for state in &self.iterators {
+            // Preparation validates builtin iterator sources. Their shape and storage remain fixed
+            // throughout this allocation-free nest, while float elements may still change through aliases.
+            let base = load(
+                b,
+                registers,
+                Register(lir.registers.len() + 1),
+                8,
+                types::I64,
+            )?;
+            let id = load(b, registers, state.iterator, 16, types::I64)?;
+            let off = b.ins().imul_imm_s(id, size_of::<Descriptor>() as i64);
+            let iterator = b.ins().iadd(base, off);
+            let source_id = b.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                iterator,
+                (offset_of!(Descriptor, source) + 16) as i32,
+            );
+            let off = b
+                .ins()
+                .imul_imm_s(source_id, size_of::<Descriptor>() as i64);
+            let source = b.ins().iadd(base, off);
+            for (var, offset) in state.source.into_iter().zip([
+                offset_of!(Descriptor, kind),
+                offset_of!(Descriptor, len),
+                offset_of!(Descriptor, data),
+                offset_of!(Descriptor, index),
+            ]) {
+                let value = b
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), source, offset as i32);
+                b.def_var(var, value);
+            }
             let (index, exhausted) = Self::pointers(b, registers, lir, state.iterator)?;
             let index = b.ins().load(types::I64, MemFlagsData::new(), index, 0);
             b.def_var(state.index, index);

@@ -1142,8 +1142,10 @@ impl ScalarVars {
             lir.registers
                 .iter()
                 .map(|ty| {
-                    (defer && !lir.regions.is_empty() && *ty == lir::Type::Boxed)
-                        .then(|| std::array::from_fn(|_| b.declare_var(types::I64)))
+                    (defer
+                        && !lir.regions.is_empty()
+                        && matches!(ty, lir::Type::Boxed | lir::Type::FloatView))
+                    .then(|| std::array::from_fn(|_| b.declare_var(types::I64)))
                 })
                 .collect(),
         )
@@ -1185,7 +1187,7 @@ impl ScalarVars {
         event: i32,
         location: i32,
     ) -> Result<()> {
-        if !matches!(event, HELPER | SEQUENCE | UNPACK_BATCH) {
+        if !matches!(event, HELPER | SEQUENCE | UNPACK_BATCH | FLOAT_VIEW) {
             return Ok(());
         }
         let (block, index) = locations[location as usize];

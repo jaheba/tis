@@ -701,3 +701,58 @@ fn inner_iterator_alias_preserves_shared_exhaustion() {
         }
     ));
 }
+
+#[test]
+fn cached_nest_sources_support_ranges_tuples_and_float_aliases() {
+    let source = "def f(steps,indices,xs):\n    for step in steps:\n        for i in indices:\n            a,b=xs\n            xs[0]=a+1.0\n";
+    let (mut vm, f) = setup(source);
+    let xs = floats(&vm, &[0.0, 2.0]);
+    let steps = vm.heap.allocate(Object::Tuple(vec![Value::Int(0); 7]));
+    let indices = vm.heap.allocate(Object::Range {
+        start: 5,
+        stop: -2,
+        step: -2,
+    });
+    for _ in 0..24 {
+        vm.call(f, &[steps, indices, xs]).unwrap();
+    }
+    assert!(
+        vm.function_hir(f)
+            .unwrap()
+            .lower_lir(LoweringMode::Profiled)
+            .unwrap()
+            .nest
+            .is_some()
+    );
+    for input in [
+        indices,
+        vm.heap.allocate(Object::Tuple(vec![Value::Int(1); 4])),
+        floats(&vm, &[1.0, 2.0, 3.0, 4.0]),
+    ] {
+        vm.heap
+            .set_item(xs, Value::Int(0), Value::Float(0.0))
+            .unwrap();
+        let before = vm.tier_stats.clone();
+        vm.call(f, &[steps, input, xs]).unwrap();
+        assert_eq!(
+            vm.heap.get_item(xs, Value::Int(0)).unwrap(),
+            Value::Float(28.0)
+        );
+        assert_eq!(
+            vm.tier_stats.native_region_entries - before.native_region_entries,
+            1
+        );
+    }
+    // An unconstrained item can itself be the VM's sentinel; do not replace that check with
+    // iterator exhaustion unless entry validation proves an ordinary Python item type.
+    vm.heap
+        .set_item(xs, Value::Int(0), Value::Float(0.0))
+        .unwrap();
+    let sentinel = vm.heap.allocate(Object::Done);
+    let input = rows(&vm, vec![Value::Int(1), sentinel, Value::Int(2)]);
+    vm.call(f, &[steps, input, xs]).unwrap();
+    assert_eq!(
+        vm.heap.get_item(xs, Value::Int(0)).unwrap(),
+        Value::Float(7.0)
+    );
+}
