@@ -18,6 +18,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--samples', type=int, default=10)
     parser.add_argument('--seed', type=int, default=20261028)
+    parser.add_argument('--tiers', nargs='+', choices=['bytecode', 'lir', 'native', 'copy-patch'],
+                        default=['bytecode', 'lir', 'native', 'copy-patch'])
     args = parser.parse_args()
     if args.samples < 10:
         parser.error('use at least 10 samples')
@@ -25,7 +27,7 @@ def main():
     binaries = {name: path.resolve() for name, path in
                 [('baseline', args.baseline), ('candidate', args.candidate)]}
     results = dict(timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                   platform=platform.platform(), samples=args.samples, warmups=2, seed=args.seed,
+                   platform=platform.platform(), samples=args.samples, warmups=2, seed=args.seed, tiers=args.tiers,
                    binaries={name: dict(path=str(path), sha256=digest(path))
                              for name, path in binaries.items()},
                    readiness={}, samples_raw=[])
@@ -36,7 +38,7 @@ def main():
 
     try:
         for name, binary in binaries.items():
-            for mode in ['bytecode', 'lir', 'native', 'copy-patch']:
+            for mode in args.tiers:
                 label = f'{name}/{mode}'
                 process = subprocess.Popen([str(binary), '--tier', mode, '--warmups', '2'],
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
