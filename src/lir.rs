@@ -1941,6 +1941,7 @@ impl Helper {
             Self::Dict => count.is_multiple_of(2),
             Self::Python(op) => match op {
                 CoreOp::Missing
+                | CoreOp::Import(_)
                 | CoreOp::LoadName(_)
                 | CoreOp::LoadLocal(_)
                 | CoreOp::Namespace => count == 0,

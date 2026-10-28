@@ -36,6 +36,7 @@ pub struct Vm {
     pub(crate) environments: Vec<Value>,
     pub(crate) local_frames: Vec<LocalFrame>,
     pub(crate) globals: Option<Value>,
+    pub(crate) modules: std::collections::BTreeMap<String, Value>,
     pub output: String,
     pub(crate) depth: usize,
     pub(crate) transient_roots: Vec<Value>,
@@ -284,6 +285,7 @@ impl Vm {
             )
             .chain(self.transient_roots.iter().copied())
             .chain(self.pinned.values().copied())
+            .chain(self.modules.values().copied())
             .chain(self.globals)
             .chain(external_roots.iter().copied())
             .collect::<Vec<_>>();

@@ -338,7 +338,7 @@ Iterator and representation recursion have bounded depth and stack growth; class
 
 Integers are `i64`, with overflow errors; arithmetic with floats uses `f64`.
 This is a research implementation with trusted IR and no sandbox guarantees.
-Exceptions propagate to Rust; Python `try`/`except`, imports, generators/yield, async, decorators,
+Exceptions propagate to Rust; Python `try`/`except`, imports other than builtin `math`, generators/yield, async, decorators,
 multiple inheritance, descriptors and user-defined operator protocols are not implemented.
 Dictionary keys currently support None, bool, integer, non-NaN float, string and recursively hashable tuples.
 Containers and builtins implement a subset of Python's APIs.
@@ -425,3 +425,29 @@ target/release/examples/nbody_bench --tier native --warmups 10 --dump-native /tm
 
 This writes `/tmp/advance.clif`, `.asm` and `.bin`. Set `Vm::capture_native_code` before compilation
 and use `Vm::native_diagnostics` when embedding tis. Capture is disabled by default.
+
+## Object-heavy benchmark targets
+
+Barnes–Hut and ticket search complement the arithmetic-focused nbody target:
+
+- Barnes–Hut: recursive quadtrees, classes, methods, attributes and allocation; 200 particles, 100 steps.
+- Ticket search: strings, dictionaries, TF-IDF weights, comprehensions and keyed sorting; 1,600 tickets.
+
+Both run through HIR, bytecode and all native tiers. A builtin-only `math` import provides `pi`,
+`sqrt`, `sin`, `cos` and `log`; other imports remain unsupported. `list.sort` supports stable
+`key` and `reverse` sorting, evaluates keys once, and roots them across callback collections.
+Fixture provenance and the two source adaptations are documented in `tests/fixtures/README.md`.
+
+```sh
+cargo build --release --examples
+python3 tools/bench_suite.py --worker target/release/examples/bench \
+  --python /path/to/python3 --pypy /path/to/pypy3 --output /tmp/tis-object-benchmarks
+```
+
+The default runner warms each process twice, then collects ten serial, interleaved samples for
+bytecode, Cranelift, CPython and optional PyPy. Each call starts a fresh scene or index; input
+construction and Barnes–Hut energy calculations are included, matching the workload function.
+Compilation and module definitions precede timing. Complete output is validated against CPython
+on every sample; backend compilation and deoptimization are retained rather than assumed absent.
+Use `--tiers lir copy-patch` to measure the other execution tiers. The existing nbody harness remains
+separate so its reset-and-time-advance protocol does not change.

@@ -224,6 +224,16 @@ impl Builder {
 
     fn statement(&mut self, statement: &Stmt, mut block: BlockId) -> Result<Option<BlockId>> {
         match statement {
+            Stmt::Import(stmt) => {
+                for alias in &stmt.names {
+                    if alias.name.as_str() != "math" {
+                        return Err(Error::Unsupported("only builtin math imports"));
+                    }
+                    let value = self.runtime(block, CoreOp::Import(alias.name.to_string()), vec![]);
+                    let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                    self.store_target(Target::Name(name), value, block)?;
+                }
+            }
             Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_) => {}
             Stmt::Expr(expr) => {
                 block = self.expression(&expr.value, block)?.0;
@@ -1026,6 +1036,11 @@ fn bindings(
 ) {
     for statement in body {
         match statement {
+            Stmt::Import(stmt) => {
+                for alias in &stmt.names {
+                    locals.insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+                }
+            }
             Stmt::Assign(stmt) => {
                 for target in &stmt.targets {
                     target_names(target, locals);

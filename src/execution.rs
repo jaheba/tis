@@ -356,6 +356,9 @@ impl Vm {
             ),
             Object::Native(name) => self.builtin(&name, arguments, keywords),
             Object::Bound(receiver, name) => {
+                if name == "sort" {
+                    return self.sort_list(receiver, arguments, keywords);
+                }
                 if !keywords.is_empty() {
                     return Err(error("method keyword arguments unsupported"));
                 }
@@ -616,6 +619,18 @@ impl Vm {
                 }
                 Value::None
             }
+            CoreOp::Import(name) => {
+                if name != "math" {
+                    return Err(Error::Unsupported("builtin module"));
+                }
+                if let Some(&module) = self.modules.get(name) {
+                    module
+                } else {
+                    let module = self.heap.allocate(Object::Native("math".into()));
+                    self.modules.insert(name.clone(), module);
+                    module
+                }
+            }
             CoreOp::Namespace => env,
         })
     }
@@ -650,6 +665,15 @@ impl Vm {
 
     fn attribute(&mut self, object: Value, name: &str) -> Result<Value> {
         match self.heap.get(object)? {
+            Object::Native(module) if module == "math" => {
+                return match name {
+                    "pi" => Ok(Value::Float(std::f64::consts::PI)),
+                    "sqrt" | "sin" | "cos" | "log" => {
+                        Ok(self.heap.allocate(Object::Native(format!("math.{name}"))))
+                    }
+                    _ => Err(error(format!("AttributeError: math.{name}"))),
+                };
+            }
             Object::Instance { class, attributes } => {
                 if let Some(value) = attributes.get(name) {
                     return Ok(*value);
@@ -670,7 +694,7 @@ impl Vm {
             Object::List(_)
                 if [
                     "append", "extend", "pop", "reverse", "copy", "clear", "insert", "count",
-                    "index", "remove",
+                    "index", "remove", "sort",
                 ]
                 .contains(&name) =>
             {
@@ -1005,6 +1029,22 @@ impl Vm {
                 };
                 self.heap.allocate(Object::String(text))
             }
+            "math.sqrt" | "math.sin" | "math.cos" | "math.log" => {
+                arity(args, 1, 1)?;
+                let value = number(args[0])?;
+                if (name == "math.sqrt" && value < 0.0)
+                    || (name == "math.log" && value <= 0.0)
+                    || (matches!(name, "math.sin" | "math.cos") && value.is_infinite())
+                {
+                    return Err(error("ValueError: math domain error"));
+                }
+                Value::Float(match name {
+                    "math.sqrt" => value.sqrt(),
+                    "math.sin" => value.sin(),
+                    "math.log" => value.ln(),
+                    _ => value.cos(),
+                })
+            }
             "abs" => {
                 arity(args, 1, 1)?;
                 match args[0] {
@@ -1152,6 +1192,100 @@ impl Vm {
             }
             _ => Err(Error::Type("isinstance requires type")),
         }
+    }
+
+    fn sort_list(
+        &mut self,
+        receiver: Value,
+        args: &[Value],
+        keywords: &[(String, Value)],
+    ) -> Result<Value> {
+        arity(args, 0, 0)?;
+        let mut key = Value::None;
+        let mut reverse = false;
+        for (name, value) in keywords {
+            match name.as_str() {
+                "key" => key = *value,
+                "reverse" => reverse = runtime::truth(&self.heap, *value)?,
+                _ => return Err(error("TypeError: invalid sort keyword")),
+            }
+        }
+        let items = match self.heap.get(receiver)? {
+            Object::List(items) => items.to_vec(),
+            _ => return Err(Error::Type("sort requires list")),
+        };
+        // Key callbacks see an empty list. Detached items and callback-created keys must remain
+        // rooted until sorting finishes, including error paths and collections inside a key.
+        if let Object::List(list) = &mut *self.heap.get_mut(receiver)? {
+            *list = vec![].into();
+        }
+        let roots = self.transient_roots.len();
+        self.transient_roots.extend_from_slice(&items);
+        self.transient_roots.push(key);
+        let result = (|| {
+            let mut keys = Vec::with_capacity(items.len());
+            for &item in &items {
+                let value = if key == Value::None {
+                    item
+                } else {
+                    self.call(key, &[item])?
+                };
+                self.transient_roots.push(value);
+                keys.push(value);
+            }
+            // Stable bottom-up merging permits fallible Python comparisons without a Rust
+            // comparator that must invent an ordering after an exception.
+            let mut order = (0..items.len()).collect::<Vec<_>>();
+            let mut scratch = order.clone();
+            let mut width = 1;
+            while width < order.len() {
+                for start in (0..order.len()).step_by(width * 2) {
+                    let middle = (start + width).min(order.len());
+                    let end = (middle + width).min(order.len());
+                    let (mut left, mut right) = (start, middle);
+                    for slot in &mut scratch[start..end] {
+                        let take_right = if left == middle {
+                            true
+                        } else if right == end {
+                            false
+                        } else if reverse {
+                            compare(&self.heap, "<", keys[order[left]], keys[order[right]])?
+                        } else {
+                            compare(&self.heap, "<", keys[order[right]], keys[order[left]])?
+                        };
+                        *slot = if take_right {
+                            let i = order[right];
+                            right += 1;
+                            i
+                        } else {
+                            let i = order[left];
+                            left += 1;
+                            i
+                        };
+                    }
+                }
+                std::mem::swap(&mut order, &mut scratch);
+                width = width.saturating_mul(2);
+            }
+            Ok(order.into_iter().map(|i| items[i]).collect::<Vec<_>>())
+        })();
+        let modified = match self.heap.get(receiver)? {
+            Object::List(list) => !list.is_empty(),
+            _ => false,
+        };
+        let restored = match &result {
+            Ok(sorted) => sorted.clone(),
+            Err(_) => items,
+        };
+        if let Object::List(list) = &mut *self.heap.get_mut(receiver)? {
+            *list = restored.into();
+        }
+        self.transient_roots.truncate(roots);
+        result?;
+        if modified {
+            return Err(error("ValueError: list modified during sort"));
+        }
+        Ok(Value::None)
     }
 
     fn method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {

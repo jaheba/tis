@@ -113,6 +113,7 @@ pub struct Block {
 #[derive(Debug, Clone)]
 pub enum CoreOp {
     Missing,
+    Import(String),
     UnpackStar(usize, usize),
     LoadName(String),
     StoreName(String),
