@@ -18,6 +18,7 @@ fn add() -> (Function, ValueId) {
 fn profiles_arguments_results_errors_and_call_targets() {
     let mut program = compile("def f(a=2):\n    return a + 1\nf()\nf(1.5)\nf('x')\n").unwrap();
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     assert!(vm.run_program(&mut program).is_err());
     let f = vm.function_ir(vm.get_global("f").unwrap()).unwrap();
     let profile = f.profile();
@@ -41,6 +42,7 @@ fn profiles_arguments_results_errors_and_call_targets() {
 fn hot_requests_are_once_per_version_and_keep_a_detached_profile() {
     let (mut function, site) = add();
     let mut vm = Vm::new();
+    vm.profiling.window_ticks = 8;
     vm.thresholds = HotThresholds {
         function_entries: 10,
         loop_backedges: 0,
@@ -56,10 +58,10 @@ fn hot_requests_are_once_per_version_and_keep_a_detached_profile() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert_eq!(request.hotspot, Hotspot::Function);
-    assert_eq!(request.count, 10);
-    assert_eq!(request.hir().profile().entries, 10);
+    assert_eq!(request.count, 18);
+    assert_eq!(request.hir().profile().entries, 18);
     assert_eq!(function.profile().entries, 20);
-    assert_eq!(request.hir().profile().site(site).unwrap().executions, 9);
+    assert_eq!(request.hir().profile().site(site).unwrap().executions, 8);
     assert!(request.is_current(&function));
     request.lower().unwrap();
     function.terminate(
@@ -68,7 +70,7 @@ fn hot_requests_are_once_per_version_and_keep_a_detached_profile() {
     );
     assert!(!request.is_current(&function));
     assert_eq!(function.profile().entries, 0);
-    for _ in 0..10 {
+    for _ in 0..18 {
         vm.run(&mut function, &[Value::Int(1), Value::Int(2)])
             .unwrap();
     }
@@ -82,6 +84,7 @@ fn loops_are_hot_after_backedges_even_with_a_single_invocation() {
     )
     .unwrap();
     let mut vm = Vm::new();
+    vm.profiling.window_ticks = 8;
     vm.thresholds = HotThresholds {
         function_entries: 100,
         loop_backedges: 5,
@@ -91,7 +94,7 @@ fn loops_are_hot_after_backedges_even_with_a_single_invocation() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert!(matches!(request.hotspot, Hotspot::Loop { .. }));
-    assert_eq!(request.count, 5);
+    assert_eq!(request.count, 13);
     let function = vm.function_ir(vm.get_global("loop").unwrap()).unwrap();
     let profile = function.profile();
     assert_eq!(profile.entries, 1);
@@ -112,6 +115,7 @@ fn loops_are_hot_after_backedges_even_with_a_single_invocation() {
 fn closures_share_code_profiles_without_using_heap_identity() {
     let mut program=compile("def factory():\n    def inner(x):\n        return x + 1\n    return inner\na = factory()\nb = factory()\na(1)\nb(2.0)\n").unwrap();
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     vm.run_program(&mut program).unwrap();
     let a = vm.function_ir(vm.get_global("a").unwrap()).unwrap();
     let b = vm.function_ir(vm.get_global("b").unwrap()).unwrap();
@@ -129,6 +133,7 @@ fn closures_share_code_profiles_without_using_heap_identity() {
 fn profiled_integer_addition_has_explicit_guards_overflow_and_boxing() {
     let (mut function, _) = add();
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     for _ in 0..16 {
         vm.run(&mut function, &[Value::Int(1), Value::Int(2)])
             .unwrap();
@@ -180,6 +185,7 @@ fn cold_or_polymorphic_sites_keep_a_generic_runtime_call() {
     let lir = function.lower_lir(LoweringMode::Profiled).unwrap();
     assert!(lir.exits.is_empty());
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     for _ in 0..10 {
         vm.run(&mut function, &[Value::Int(1), Value::Int(2)])
             .unwrap();
@@ -222,6 +228,7 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
     let add = f.append(block, Op::Add(args[1], args[2]));
     f.terminate(block, Terminator::Return(add));
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     let list = vm.heap.allocate(Object::List(vec![Value::Int(0)]));
     let pin = vm.pin(list).unwrap();
     for _ in 0..10 {
@@ -321,6 +328,7 @@ fn root_maps_truth_conversion_and_string_allocation_are_explicit() {
     }
     assert!(invalid.verify().is_err());
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     assert!(
         vm.install_lir(program.function("<module>").unwrap(), invalid)
             .is_err()
@@ -331,6 +339,7 @@ fn root_maps_truth_conversion_and_string_allocation_are_explicit() {
 fn verifiers_reject_non_dominating_uses_and_unguarded_unboxing() {
     let (mut function, _) = add();
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     for _ in 0..10 {
         vm.run(&mut function, &[Value::Int(1), Value::Int(2)])
             .unwrap();
@@ -389,6 +398,7 @@ fn forward_layout_edges_can_still_be_loop_backedges() {
     assert!(body.0 < head.0);
     assert!(f.analyze().unwrap().is_backedge(body, head));
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     assert_eq!(vm.run(&mut f, &[]).unwrap(), Value::Int(10));
     assert_eq!(f.profile().backedges.get(&(body.0, head.0)), Some(&10));
     f.lower_lir(LoweringMode::Profiled).unwrap();
@@ -398,6 +408,7 @@ fn forward_layout_edges_can_still_be_loop_backedges() {
 fn call_profiles_are_bounded_and_native_methods_keep_receiver_kinds() {
     let mut program=compile("functions = [lambda: 1, lambda: 2, lambda: 3, lambda: 4, lambda: 5, lambda: 6]\nfor f in functions:\n    f()\nfor value in [[], {}]:\n    value.copy()\n").unwrap();
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     vm.run_program(&mut program).unwrap();
     let profile = program.function("<module>").unwrap().profile();
     let site = profile
@@ -437,6 +448,7 @@ fn stale_lir_cannot_resume_changed_hir() {
         .unwrap();
     f.terminate(f.entry(), Terminator::Return(f.parameters(f.entry())[0]));
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     assert!(vm.resume_hir(&mut f, frame).is_err());
     assert_eq!(vm.stack_len(), 0);
     assert!(lir.resume_offset(state, f.bytecode().unwrap()).is_err());

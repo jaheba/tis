@@ -33,6 +33,22 @@ The acceptance test checks its output against CPython and checks that collection
 - Core builtins, container methods, lazy `range`, `enumerate` and `zip`, and basic f-string formatting.
 
 The executing function retains its HIR and runtime profile.
+Detailed feedback follows `Cold → Profiling → Ready → Compiled` for each HIR identity and revision.
+Cold execution maintains function-entry and backedge counters without operand, result or call-target observations.
+Reaching a hotspot threshold opens a function-wide observation window, including inside a function's first invocation.
+The default window ends after 128 completed calls or backedges and records at most 32 samples per site.
+Ready bytecode and compiled tiers freeze detailed feedback while execution and failure counters continue.
+Guard misses bypass sampling, record unexpected types and side-exit reasons, and reopen a profiling window.
+At most three windows run per revision; further misses retire automatic compilation for that revision.
+Observations accumulate across windows, so repeatedly polymorphic sites lower to generic operations.
+
+`Vm::profiling` configures window and sampling budgets.
+`ProfileConfig::eager()` explicitly enables complete observations for diagnostics and manual lowering experiments.
+Site `executions` counts sampled executions, while function entries, returns, errors and backedges are lifetime counters.
+Block/edge metadata records visits during profiling windows.
+Existing adaptive bytecode addition also keeps its lightweight counters outside those windows.
+Argument and return types are sampled when calls enter or return during an active window.
+
 Eight successful integer observations select a guarded integer addition strategy.
 Type or overflow guard failure falls back to generic arithmetic without rewriting bytecode.
 Name loads, stores, calls and object operations remain explicit HIR operations.
@@ -142,8 +158,9 @@ An executable module is owned until its last active native frame returns, includ
 The Cranelift emitter is in `src/native.rs`; both native backends use `src/native_runtime.rs` and the same C-layout slots.
 The Cranelift emitter follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
 
-This is a correctness baseline: boxed results still invoke profiling callbacks, and registers are materialized in memory.
-LIR helper effects remain conservative; there is no inlining, escape analysis or automatic reoptimization yet.
+Boxed results still invoke runtime callbacks for roots and optional feedback; registers are materialized in memory.
+LIR helper effects remain conservative; there is no inlining or escape analysis yet.
+Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
 `vm.tier_stats` exposes reference/native entries, OSR entries, compilation errors, deoptimizations and cumulative emitted bytes.
 

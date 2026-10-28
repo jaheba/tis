@@ -117,6 +117,7 @@ impl Vm {
         self.retired_versions.remove(&(lir.source, lir.revision));
         self.artifacts
             .insert((lir.source, lir.revision), Rc::new(lir));
+        function.profile.borrow_mut().phase = crate::profile::ProfilePhase::Compiled;
         self.tier_stats.lowered = self.tier_stats.lowered.saturating_add(1);
         Ok(())
     }
@@ -173,6 +174,7 @@ impl Vm {
                 .get(block.0)
                 .ok_or(Error::InvalidIr("invalid LIR block"))?;
             for instruction in &body.instructions {
+                let mut observed = false;
                 let result = match &instruction.operation {
                     Operation::Constant(constant) => Some(Datum::Boxed(match constant {
                         hir::Constant::None => Value::None,
@@ -287,7 +289,7 @@ impl Vm {
                             .iter()
                             .map(|&r| read(&registers, r)?.boxed())
                             .collect::<Result<Vec<_>>>()?;
-                        self.observe_site(function, code, base, instruction.origin)?;
+                        observed = self.observe_site(function, code, base, instruction.origin)?;
                         // Boxed operands remain rooted throughout nested calls; helpers return before the next collection.
                         let roots = self.transient_roots.len();
                         self.transient_roots.extend_from_slice(&args);
@@ -305,7 +307,8 @@ impl Vm {
                         .ok_or(Error::InvalidIr("invalid LIR register"))? = Some(result);
                     if let Datum::Boxed(value) = result {
                         if !matches!(instruction.operation, Operation::Call { .. }) {
-                            self.observe_site(function, code, base, instruction.origin)?;
+                            observed =
+                                self.observe_site(function, code, base, instruction.origin)?;
                         }
                         if self.stack[base + destination.0].is_none() {
                             rooted.push(destination.0);
@@ -314,8 +317,10 @@ impl Vm {
                         let function = function.borrow();
                         let mut profile = function.profile.borrow_mut();
                         let site = &mut profile.sites[instruction.origin.0];
-                        site.result
-                            .observe(crate::profile::ValueKind::of(&self.heap, value));
+                        if observed {
+                            site.result
+                                .observe(crate::profile::ValueKind::of(&self.heap, value));
+                        }
                         if matches!(
                             instruction.operation,
                             Operation::BoxInt(_) | Operation::BoxFloat(_) | Operation::BoxBool(_)
@@ -416,13 +421,14 @@ impl Vm {
                 .ok_or(Error::InvalidIr("missing deoptimization value"))?
                 .boxed()
         })?;
-        self.mark_deoptimization(function, &frame);
+        self.mark_deoptimization(function, &frame, exit.reason);
         Ok(Outcome::Deopt(frame))
     }
     pub(crate) fn mark_deoptimization(
         &mut self,
         function: &Rc<RefCell<Function>>,
         frame: &lir::DeoptFrame,
+        reason: lir::ExitReason,
     ) {
         let hir = function.borrow();
         if self.artifacts.remove(&(hir.id(), hir.revision())).is_some() {
@@ -434,6 +440,13 @@ impl Vm {
         self.tier_stats.deoptimizations = self.tier_stats.deoptimizations.saturating_add(1);
         let mut profile = hir.profile.borrow_mut();
         profile.deoptimizations = profile.deoptimizations.saturating_add(1);
+        if self.profiling.mode == crate::profile::ProfileMode::Staged {
+            profile.start_window(self.profiling);
+            self.requested
+                .retain(|(id, revision, _)| *id != hir.id() || *revision != hir.revision());
+        } else {
+            profile.phase = crate::profile::ProfilePhase::Retired;
+        }
         if let Some(instruction) = hir.blocks[frame.resume.block.0]
             .instructions
             .get(frame.resume.instruction)
@@ -441,6 +454,17 @@ impl Vm {
             let site = &mut profile.sites[instruction.result.0];
             site.deoptimizations = site.deoptimizations.saturating_add(1);
             site.guard_failures = site.guard_failures.saturating_add(1);
+            let count = site.exit_reasons.entry(reason).or_default();
+            *count = count.saturating_add(1);
+            // Guard misses bypass sampling so new types are retained even after a window closes.
+            site.executions = site.executions.saturating_add(1);
+            let inputs = instruction.op.inputs();
+            site.operands.resize_with(inputs.len(), Default::default);
+            for (operand, input) in site.operands.iter_mut().zip(inputs) {
+                if let Some(Some(value)) = frame.slots.get(input.0) {
+                    operand.observe(crate::profile::ValueKind::of(&self.heap, *value));
+                }
+            }
         }
     }
     pub(crate) fn lir_helper(&mut self, helper: &Helper, args: &[Value]) -> Result<Value> {

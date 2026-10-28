@@ -134,7 +134,7 @@ pub(crate) fn execute(
     let frame = lir.reconstruct(exit.state, environment, vm.local_values()?, |r| {
         registers[r.0].value()
     })?;
-    vm.mark_deoptimization(function, &frame);
+    vm.mark_deoptimization(function, &frame, exit.reason);
     Ok(Outcome::Deopt(frame))
 }
 pub(crate) extern "C" fn power(left: f64, right: f64) -> f64 {
@@ -228,6 +228,7 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
+        let mut observed = false;
         if event == HELPER {
             let (state, roots) = match &instruction.operation {
                 Operation::Call { state, roots, .. } | Operation::Truth { state, roots, .. } => {
@@ -250,7 +251,8 @@ impl Context<'_> {
                     for r in arguments {
                         self.helper_arguments.push(registers[r.0].value()?);
                     }
-                    vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
+                    observed =
+                        vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
                     let roots = vm.transient_roots.len();
                     vm.transient_roots.extend_from_slice(&self.helper_arguments);
                     let result = vm.lir_helper(helper, &self.helper_arguments);
@@ -273,7 +275,8 @@ impl Context<'_> {
             && self.lir.registers[result.0] == lir::Type::Boxed
         {
             if event == FINISH {
-                vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
+                observed =
+                    vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
             }
             let value = registers[result.0].value()?;
             if vm.stack[self.base + result.0].is_none() {
@@ -283,8 +286,10 @@ impl Context<'_> {
             let function = self.function.borrow();
             let mut profile = function.profile.borrow_mut();
             let site = &mut profile.sites[instruction.origin.0];
-            site.result
-                .observe(crate::profile::ValueKind::of(&vm.heap, value));
+            if observed {
+                site.result
+                    .observe(crate::profile::ValueKind::of(&vm.heap, value));
+            }
             if matches!(
                 instruction.operation,
                 Operation::BoxInt(_) | Operation::BoxFloat(_) | Operation::BoxBool(_)

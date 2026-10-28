@@ -157,6 +157,7 @@ impl CallTarget {
 
 #[derive(Debug, Clone, Default)]
 pub struct SiteProfile {
+    /// Executions sampled during profiling, not the site's lifetime execution count.
     pub executions: u64,
     pub fast_paths: u64,
     pub guard_failures: u64,
@@ -165,8 +166,27 @@ pub struct SiteProfile {
     pub result: TypeProfile,
     pub call_targets: BTreeMap<CallTarget, u64>,
     pub other_targets: u64,
+    pub exit_reasons: BTreeMap<crate::lir::ExitReason, u64>,
+    window: u32,
+    window_samples: u32,
 }
 impl SiteProfile {
+    pub(crate) fn sample(&mut self, window: u32, config: ProfileConfig) -> bool {
+        if config.mode == ProfileMode::Eager {
+            self.executions = self.executions.saturating_add(1);
+            return true;
+        }
+        if self.window != window {
+            self.window = window;
+            self.window_samples = 0;
+        }
+        if self.window_samples >= config.site_samples.max(1) {
+            return false;
+        }
+        self.window_samples += 1;
+        self.executions = self.executions.saturating_add(1);
+        true
+    }
     pub(crate) fn call(&mut self, target: CallTarget) {
         if self.call_targets.contains_key(&target) || self.call_targets.len() < 4 {
             let count = self.call_targets.entry(target).or_default();
@@ -177,8 +197,60 @@ impl SiteProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProfilePhase {
+    #[default]
+    Cold,
+    Profiling,
+    Ready,
+    Compiled,
+    Retired,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProfileMode {
+    #[default]
+    Staged,
+    /// Collect every observation for diagnostics and explicit lowering experiments.
+    Eager,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileConfig {
+    pub mode: ProfileMode,
+    /// Completed calls or backedges in each function-wide observation window.
+    pub window_ticks: u32,
+    pub site_samples: u32,
+    /// Includes the first window; repeated guard failures eventually retire automatic compilation.
+    pub max_windows: u32,
+}
+impl Default for ProfileConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProfileMode::Staged,
+            window_ticks: 128,
+            site_samples: 32,
+            max_windows: 3,
+        }
+    }
+}
+impl ProfileConfig {
+    pub fn eager() -> Self {
+        Self {
+            mode: ProfileMode::Eager,
+            ..Self::default()
+        }
+    }
+    pub(crate) fn collecting(self, phase: ProfilePhase) -> bool {
+        self.mode == ProfileMode::Eager || phase == ProfilePhase::Profiling
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FunctionProfile {
+    pub phase: ProfilePhase,
+    pub windows: u32,
+    ticks: u32,
     pub entries: u64,
     pub returns: u64,
     pub errors: u64,
@@ -191,6 +263,42 @@ pub struct FunctionProfile {
     pub sites: Vec<SiteProfile>,
 }
 impl FunctionProfile {
+    pub(crate) fn start_window(&mut self, config: ProfileConfig) -> bool {
+        if self.phase == ProfilePhase::Profiling {
+            return true;
+        }
+        if self.windows >= config.max_windows.max(1) {
+            self.phase = ProfilePhase::Retired;
+            return false;
+        }
+        self.windows += 1;
+        self.ticks = 0;
+        self.phase = ProfilePhase::Profiling;
+        true
+    }
+
+    pub(crate) fn advance(&mut self, config: ProfileConfig) {
+        if self.phase == ProfilePhase::Profiling && config.mode == ProfileMode::Staged {
+            self.ticks = self.ticks.saturating_add(1);
+            if self.ticks >= config.window_ticks.max(1) {
+                self.phase = ProfilePhase::Ready;
+            }
+        }
+    }
+
+    pub(crate) fn probe(&mut self, hot: bool, backedge: bool, config: ProfileConfig) -> bool {
+        if config.mode == ProfileMode::Eager {
+            return hot;
+        }
+        match self.phase {
+            ProfilePhase::Cold if hot => {
+                self.start_window(config);
+            }
+            ProfilePhase::Profiling if backedge => self.advance(config),
+            _ => {}
+        }
+        self.phase == ProfilePhase::Ready
+    }
     pub(crate) fn layout(&mut self, blocks: usize, values: usize) {
         self.blocks.resize(blocks, 0);
         self.sites.resize_with(values, SiteProfile::default);
@@ -209,11 +317,11 @@ impl fmt::Display for FunctionProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "entries={} returns={} errors={}",
-            self.entries, self.returns, self.errors
+            "entries={} returns={} errors={} phase={:?} windows={}",
+            self.entries, self.returns, self.errors, self.phase, self.windows
         )?;
         for (block, count) in self.blocks.iter().enumerate() {
-            writeln!(f, "b{block}: {count} visits")?;
+            writeln!(f, "b{block}: {count} profiled visits")?;
         }
         for ((from, to), count) in &self.edges {
             writeln!(
@@ -232,7 +340,7 @@ impl fmt::Display for FunctionProfile {
             .enumerate()
             .filter(|(_, site)| site.executions > 0)
         {
-            write!(f, "%{id}: {} executions; result", site.executions)?;
+            write!(f, "%{id}: {} sampled executions; result", site.executions)?;
             for kind in ValueKind::ALL {
                 if site.result.count(kind) > 0 {
                     write!(f, " {kind:?}={}", site.result.count(kind))?;
@@ -240,6 +348,9 @@ impl fmt::Display for FunctionProfile {
             }
             if !site.call_targets.is_empty() {
                 write!(f, "; calls {:?}", site.call_targets)?;
+            }
+            if !site.exit_reasons.is_empty() {
+                write!(f, "; exits {:?}", site.exit_reasons)?;
             }
             writeln!(f)?;
         }

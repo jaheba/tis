@@ -67,8 +67,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         warmup_ns.push(sample(&mut vm, advance, energy, &snapshot)?);
     }
     let backend_compile_ns = vm.tier_stats.native_compile_ns + vm.tier_stats.copy_patch_compile_ns;
+    let profile = vm.function_hir(advance)?.profile();
+    let site_samples: u64 = profile.sites.iter().map(|site| site.executions).sum();
+    let phase = profile.phase;
+    let windows = profile.windows;
     println!(
-        "{{\"ready\":true,\"compile_ns\":{compile_ns},\"setup_ns\":{setup_ns},\"warmup_ns\":{warmup_ns:?},\"backend_compile_ns\":{backend_compile_ns}}}"
+        "{{\"ready\":true,\"compile_ns\":{compile_ns},\"setup_ns\":{setup_ns},\"warmup_ns\":{warmup_ns:?},\"backend_compile_ns\":{backend_compile_ns},\"profile_phase\":\"{phase:?}\",\"profile_windows\":{windows},\"site_samples\":{site_samples}}}"
     );
     io::stdout().flush()?;
     for line in io::stdin().lock().lines() {

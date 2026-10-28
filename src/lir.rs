@@ -39,7 +39,7 @@ pub struct FrameState {
     /// Mutable frame locals stay rooted independently of temporary register liveness.
     pub local_count: usize,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExitReason {
     TypeGuard,
     IntegerOverflow,

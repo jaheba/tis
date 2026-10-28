@@ -1,7 +1,11 @@
 use tis::{Object, Tiering, Value, Vm, compile, profile::HotThresholds};
 fn warm(source: &str) -> Vm {
+    warm_with_window(source, 8)
+}
+fn warm_with_window(source: &str, ticks: u32) -> Vm {
     let mut program = compile(source).unwrap();
     let mut vm = Vm::new();
+    vm.profiling.window_ticks = ticks;
     vm.tiering = Tiering::Native;
     vm.thresholds = HotThresholds {
         function_entries: 12,
@@ -94,7 +98,7 @@ fn native_module_lifetimes_survive_recompilation_and_retirement() {
 }
 #[test]
 fn native_nbody_acceptance() {
-    let mut vm = warm(include_str!("fixtures/game_nbody.py"));
+    let mut vm = warm_with_window(include_str!("fixtures/game_nbody.py"), 128);
     assert_eq!(vm.output, "-0.169075164\n-0.169089263\n");
     assert!(vm.tier_stats.native_osr_entries > 0);
     assert_eq!(vm.tier_stats.compilation_errors, 0);
@@ -104,8 +108,9 @@ fn native_nbody_acceptance() {
 
 #[test]
 fn retiring_recursive_code_does_not_free_active_native_callers() {
-    let mut vm = warm(
+    let mut vm = warm_with_window(
         "def f(n, x):\n    if n > 0:\n        return f(n - 1, x) + x\n    return x + x\nfor i in range(20):\n    f(4, 1)\n",
+        32,
     );
     let f = vm.get_global("f").unwrap();
     assert_eq!(

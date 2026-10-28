@@ -64,6 +64,7 @@ fn run() -> Result<(), String> {
         }
     };
     let mut vm = Vm::new();
+    vm.profiling = tis::profile::ProfileConfig::eager();
     if phase != "cold" {
         for _ in 0..16 {
             let arguments = if demo == "add" {

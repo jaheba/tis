@@ -39,8 +39,9 @@ pub struct Vm {
     next_root: usize,
     next_collection: usize,
     pub thresholds: crate::profile::HotThresholds,
+    pub profiling: crate::profile::ProfileConfig,
     compilation_requests: Vec<crate::profile::CompilationRequest>,
-    requested:
+    pub(crate) requested:
         std::collections::BTreeSet<(crate::profile::FunctionId, u64, crate::profile::Hotspot)>,
 }
 
@@ -77,23 +78,25 @@ impl Vm {
             ));
         }
         let code = function.borrow_mut().shared_bytecode()?;
-        let arguments_for_profile =
-            self.bound_arguments(&function.borrow(), environment, arguments)?;
-        let kinds = arguments_for_profile
-            .iter()
-            .map(|&value| crate::profile::ValueKind::of(&self.heap, value))
-            .collect::<Vec<_>>();
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
             profile.layout(function.blocks.len(), function.value_count);
             profile.entries = profile.entries.saturating_add(1);
-            profile.arguments.resize_with(kinds.len(), Default::default);
-            for (profile, kind) in profile.arguments.iter_mut().zip(kinds) {
-                profile.observe(kind);
-            }
         }
         self.consider_compilation(&function, crate::profile::Hotspot::Function);
+        let collecting = self.collecting(&function);
+        if collecting {
+            let values = self.bound_arguments(&function.borrow(), environment, arguments)?;
+            let hir = function.borrow();
+            let mut profile = hir.profile.borrow_mut();
+            profile
+                .arguments
+                .resize_with(values.len(), Default::default);
+            for (profile, value) in profile.arguments.iter_mut().zip(values) {
+                profile.observe(crate::profile::ValueKind::of(&self.heap, value));
+            }
+        }
         let parameters = function
             .borrow()
             .parameters(function.borrow().entry())
@@ -166,12 +169,16 @@ impl Vm {
             match &result {
                 Ok(value) => {
                     profile.returns = profile.returns.saturating_add(1);
-                    profile
-                        .return_types
-                        .observe(crate::profile::ValueKind::of(&self.heap, *value));
+                    if self.profiling.collecting(profile.phase) {
+                        profile
+                            .return_types
+                            .observe(crate::profile::ValueKind::of(&self.heap, *value));
+                    }
                 }
                 Err(_) => profile.errors = profile.errors.saturating_add(1),
             }
+            // Completed calls let recursive bodies contribute results before compilation freezes the window.
+            profile.advance(self.profiling);
         }
         self.environments.pop();
         self.local_frames.pop();
@@ -304,6 +311,14 @@ impl Vm {
         hotspot: crate::profile::Hotspot,
     ) {
         let function = function.borrow();
+        let compiled_profile =
+            function.profile.borrow().phase == crate::profile::ProfilePhase::Compiled;
+        if self.profiling.mode == crate::profile::ProfileMode::Staged
+            && compiled_profile
+            && (self.tiering == crate::Tiering::Bytecode || self.has_lir(&function))
+        {
+            return;
+        }
         let count = match hotspot {
             crate::profile::Hotspot::Function => function.profile.borrow().entries,
             crate::profile::Hotspot::Loop { header } => function
@@ -315,8 +330,18 @@ impl Vm {
             crate::profile::Hotspot::Function => self.thresholds.function_entries,
             crate::profile::Hotspot::Loop { .. } => self.thresholds.loop_backedges,
         };
-        if threshold == 0 || count < threshold {
+        let ready = compiled_profile
+            || function.profile.borrow_mut().probe(
+                threshold != 0 && count >= threshold,
+                matches!(hotspot, crate::profile::Hotspot::Loop { .. }),
+                self.profiling,
+            );
+        if !ready || threshold == 0 || count < threshold {
             return;
+        }
+        if self.profiling.mode == crate::profile::ProfileMode::Staged {
+            self.retired_versions
+                .remove(&(function.id(), function.revision()));
         }
         let notify = self
             .requested
@@ -332,8 +357,10 @@ impl Vm {
                     self.artifacts
                         .insert((function.id(), function.revision()), Rc::new(lir));
                     self.tier_stats.lowered = self.tier_stats.lowered.saturating_add(1);
+                    function.profile.borrow_mut().phase = crate::profile::ProfilePhase::Compiled;
                 }
                 Err(_) => {
+                    function.profile.borrow_mut().phase = crate::profile::ProfilePhase::Retired;
                     self.retired_versions
                         .insert((function.id(), function.revision()));
                     self.tier_stats.compilation_errors =
@@ -354,6 +381,11 @@ impl Vm {
             });
     }
 
+    pub(crate) fn collecting(&self, function: &Rc<RefCell<Function>>) -> bool {
+        self.profiling
+            .collecting(function.borrow().profile.borrow().phase)
+    }
+
     pub fn stack_len(&self) -> usize {
         self.stack.len()
     }
@@ -368,6 +400,8 @@ impl Vm {
         mut ip: usize,
         mut current_block: Option<usize>,
     ) -> Result<Value> {
+        let mut collecting = self.collecting(function);
+        let mut observed = false;
         loop {
             let opcode = Opcode::decode(
                 *code
@@ -380,6 +414,7 @@ impl Vm {
                 Opcode::EnterBlock => {
                     let block = read_operand(&code.body, &mut ip)?;
                     let is_backedge = self.record_block(function, code, block, current_block)?;
+                    collecting = self.collecting(function);
                     current_block = Some(block);
                     if is_backedge
                         && let Some(lir) = self.artifact(code.function, code.revision)
@@ -400,7 +435,8 @@ impl Vm {
                 }
                 Opcode::Observe => {
                     let site = read_operand(&code.body, &mut ip)?;
-                    self.observe_site(function, code, base, ValueId(site))?;
+                    observed =
+                        collecting && self.observe_site(function, code, base, ValueId(site))?;
                 }
                 Opcode::Constant => {
                     let index = read_operand(&code.body, &mut ip)?;
@@ -428,19 +464,21 @@ impl Vm {
                     let slot = ValueId(read_operand(&code.body, &mut ip)?);
                     let value = self.pop(frame_end)?;
                     self.write(base, slot, value)?;
-                    let function = function.borrow();
-                    if function.instruction(slot).is_some() {
-                        function.profile.borrow_mut().sites[slot.0]
-                            .result
-                            .observe(crate::profile::ValueKind::of(&self.heap, value));
+                    if observed {
+                        let function = function.borrow();
+                        if function.instruction(slot).is_some() {
+                            function.profile.borrow_mut().sites[slot.0]
+                                .result
+                                .observe(crate::profile::ValueKind::of(&self.heap, value));
+                        }
                     }
                 }
                 Opcode::Add => {
                     let site = ValueId(read_operand(&code.body, &mut ip)?);
                     let rhs = self.pop(frame_end)?;
                     let lhs = self.pop(frame_end)?;
-                    let mut function = function.borrow_mut();
-                    let feedback = function
+                    let mut hir = function.borrow_mut();
+                    let feedback = hir
                         .feedback_mut(site)
                         .ok_or(Error::InvalidIr("addition has no feedback site"))?;
                     let before = (feedback.fast_paths, feedback.guard_failures);
@@ -449,10 +487,23 @@ impl Vm {
                         feedback.fast_paths.saturating_sub(before.0),
                         feedback.guard_failures.saturating_sub(before.1),
                     );
-                    let mut profile = function.profile.borrow_mut();
-                    let profile = &mut profile.sites[site.0];
-                    profile.fast_paths = profile.fast_paths.saturating_add(delta.0);
-                    profile.guard_failures = profile.guard_failures.saturating_add(delta.1);
+                    let mut profile = hir.profile.borrow_mut();
+                    if delta.1 > 0 && self.profiling.mode == crate::profile::ProfileMode::Staged {
+                        profile.start_window(self.profiling);
+                        collecting = self.profiling.collecting(profile.phase);
+                        observed = true;
+                        let failed = &mut profile.sites[site.0];
+                        failed.executions = failed.executions.saturating_add(1);
+                        failed.operands.resize_with(2, Default::default);
+                        failed.operands[0].observe(crate::profile::ValueKind::of(&self.heap, lhs));
+                        failed.operands[1].observe(crate::profile::ValueKind::of(&self.heap, rhs));
+                        self.requested.retain(|(id, revision, _)| {
+                            *id != hir.id() || *revision != hir.revision()
+                        });
+                    }
+                    let site = &mut profile.sites[site.0];
+                    site.fast_paths = site.fast_paths.saturating_add(delta.0);
+                    site.guard_failures = site.guard_failures.saturating_add(delta.1);
                     let value = result?;
                     self.push(value);
                 }
@@ -671,18 +722,22 @@ impl Vm {
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
-            let count = profile
-                .blocks
-                .get_mut(block)
-                .ok_or(Error::InvalidIr("profile block"))?;
-            *count = count.saturating_add(1);
-            if let Some(previous) = previous {
-                let count = profile.edges.entry((previous, block)).or_default();
+            if self.profiling.collecting(profile.phase) {
+                let count = profile
+                    .blocks
+                    .get_mut(block)
+                    .ok_or(Error::InvalidIr("profile block"))?;
                 *count = count.saturating_add(1);
-                if backedge {
-                    let count = profile.backedges.entry((previous, block)).or_default();
+                if let Some(previous) = previous {
+                    let count = profile.edges.entry((previous, block)).or_default();
                     *count = count.saturating_add(1);
                 }
+            }
+            if let Some(previous) = previous
+                && backedge
+            {
+                let count = profile.backedges.entry((previous, block)).or_default();
+                *count = count.saturating_add(1);
             }
         }
         if backedge {
@@ -696,7 +751,18 @@ impl Vm {
         code: &Code,
         base: usize,
         value: ValueId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if !self.collecting(function) {
+            return Ok(false);
+        }
+        {
+            let function = function.borrow();
+            let mut profile = function.profile.borrow_mut();
+            let window = profile.windows;
+            if !profile.sites[value.0].sample(window, self.profiling) {
+                return Ok(false);
+            }
+        }
         let metadata = code
             .sites
             .get(value.0)
@@ -717,7 +783,6 @@ impl Vm {
         let function = function.borrow();
         let mut profile = function.profile.borrow_mut();
         let site = &mut profile.sites[value.0];
-        site.executions = site.executions.saturating_add(1);
         site.operands
             .resize_with(metadata.inputs.len(), Default::default);
         for (operand, &input) in site.operands.iter_mut().zip(&metadata.inputs) {
@@ -729,7 +794,7 @@ impl Vm {
         if let Some(target) = target {
             site.call(target);
         }
-        Ok(())
+        Ok(true)
     }
     pub(crate) fn maybe_collect(&mut self) -> Result<()> {
         if self.heap.allocation_count() >= self.next_collection.max(4096) {

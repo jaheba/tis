@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         let mut program = compile("def kernel(x,y):\n    a=x+y\n    b=a*y\n    return b-x\n")?;
         let mut vm = Vm::new();
+        vm.profiling = tis::profile::ProfileConfig::eager();
         vm.thresholds = HotThresholds {
             function_entries: 0,
             loop_backedges: 0,

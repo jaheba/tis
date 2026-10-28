@@ -5,8 +5,12 @@ use tis::{
 };
 
 fn run(source: &str, tiering: Tiering) -> (Vm, tis::Result<Value>) {
+    run_with_window(source, tiering, 8)
+}
+fn run_with_window(source: &str, tiering: Tiering, ticks: u32) -> (Vm, tis::Result<Value>) {
     let mut program = compile(source).unwrap();
     let mut vm = Vm::new();
+    vm.profiling.window_ticks = ticks;
     vm.tiering = tiering;
     vm.thresholds = HotThresholds {
         function_entries: 12,
@@ -175,7 +179,8 @@ fn float_comparison_keeps_nan_semantics() {
 }
 #[test]
 fn nbody_runs_through_the_executable_lir_tier() {
-    let (mut vm, result) = run(include_str!("fixtures/game_nbody.py"), Tiering::Lir);
+    let (mut vm, result) =
+        run_with_window(include_str!("fixtures/game_nbody.py"), Tiering::Lir, 128);
     result.unwrap();
     assert_eq!(vm.output, "-0.169075164\n-0.169089263\n");
     assert!(vm.tier_stats.osr_entries > 0);

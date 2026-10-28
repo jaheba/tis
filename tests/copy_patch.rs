@@ -4,8 +4,12 @@ use tis::{
     profile::HotThresholds,
 };
 fn warm(source: &str) -> Vm {
+    warm_with_window(source, 8)
+}
+fn warm_with_window(source: &str, ticks: u32) -> Vm {
     let mut program = compile(source).unwrap();
     let mut vm = Vm::new();
+    vm.profiling.window_ticks = ticks;
     vm.tiering = Tiering::CopyPatch;
     vm.thresholds = HotThresholds {
         function_entries: 12,
@@ -141,8 +145,9 @@ fn tail_threading_does_not_grow_the_stack_per_iteration() {
 }
 #[test]
 fn recursive_retirement_preserves_active_stencil_images() {
-    let mut vm = warm(
+    let mut vm = warm_with_window(
         "def f(n,x):\n    if n>0:\n        return f(n-1,x)+x\n    return x+x\nfor i in range(20):\n    f(4,1)\n",
+        32,
     );
     assert_eq!(
         vm.call(
@@ -175,7 +180,7 @@ fn helper_panics_stay_inside_the_shared_gateway() {
 }
 #[test]
 fn copy_patch_nbody_acceptance() {
-    let mut vm = warm(include_str!("fixtures/game_nbody.py"));
+    let mut vm = warm_with_window(include_str!("fixtures/game_nbody.py"), 128);
     assert_eq!(vm.output, "-0.169075164\n-0.169089263\n");
     assert!(vm.tier_stats.copy_patch_osr_entries > 0);
     assert_eq!(vm.tier_stats.native_compilations, 0);

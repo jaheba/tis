@@ -15,6 +15,7 @@ const TIERS: [Tiering; 4] = [
 fn execute(source: &str, tier: Tiering) -> Vm {
     let mut program = compile(source).unwrap();
     let mut vm = Vm::new();
+    vm.profiling.window_ticks = 8;
     vm.tiering = tier;
     vm.thresholds = HotThresholds {
         function_entries: 2,
