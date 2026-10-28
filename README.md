@@ -284,3 +284,21 @@ node tests/viewer.mjs /tmp/tis-ir.html
 
 The full n-body acceptance test runs in bytecode, reference LIR, Cranelift and copy-and-patch modes with `cargo test`.
 The Node check exercises viewer logic with a minimal DOM model; it does not verify browser layout.
+
+## CPU sampling on macOS
+
+Build an optimized worker with symbols, then sample it after warmup:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release --example nbody_bench
+python3 tools/profile_nbody.py --worker target/release/examples/nbody_bench --output /tmp/tis-cpu
+python3 tools/summarize_sample.py /tmp/tis-cpu/bytecode-1.sample.txt \
+  /tmp/tis-cpu/bytecode-2.sample.txt --output /tmp/tis-bytecode-summary.json
+```
+
+The runner alternates bytecode and native workers for two ten-second passes, validates energy after each advance,
+and retains raw `sample` reports and worker responses. No compilation runs inside the recorded workload.
+Sampling includes small scene resets and energy checks between advances; profiled timings are diagnostic, not benchmarks.
+The summarizer reports exclusive counts and inclusive counts with recursive frames deduplicated.
+It accepts gzipped reports and an optional `--demangler /path/to/rustfilt` for Rust symbol names.
+Generated native code appears as anonymous frames; Rust callback stacks remain visible.
