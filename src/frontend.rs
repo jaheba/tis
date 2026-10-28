@@ -48,6 +48,7 @@ pub fn compile(source: &str) -> Result<Program> {
         }
     }
     builder.finish(block)?;
+    builder.function.index_locals(false);
     let mut functions = BTreeMap::new();
     for block in &builder.function.blocks {
         for instruction in &block.instructions {

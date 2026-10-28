@@ -18,6 +18,7 @@ pub struct Code {
     block_offsets: Vec<usize>,
     pub(crate) constants: Vec<Constant>,
     pub(crate) slots: usize,
+    pub(crate) local_names: Vec<String>,
     pub(crate) operations: Vec<(crate::hir::CoreOp, usize)>,
 }
 
@@ -48,6 +49,8 @@ pub(crate) enum Opcode {
     Runtime,
     EnterBlock,
     Observe,
+    LoadLocal,
+    StoreLocal,
 }
 
 impl Opcode {
@@ -71,6 +74,8 @@ impl Opcode {
             15 => Self::Runtime,
             16 => Self::EnterBlock,
             17 => Self::Observe,
+            18 => Self::LoadLocal,
+            19 => Self::StoreLocal,
             _ => return Err(Error::InvalidIr("invalid opcode")),
         })
     }
@@ -79,6 +84,8 @@ impl Opcode {
         matches!(
             self,
             Self::EnterBlock
+                | Self::LoadLocal
+                | Self::StoreLocal
                 | Self::Observe
                 | Self::Runtime
                 | Self::Constant
@@ -117,6 +124,7 @@ impl Code {
                 block_offsets: Vec::new(),
                 constants: Vec::new(),
                 slots: function.value_count,
+                local_names: function.local_slots.clone(),
                 operations: Vec::new(),
             },
             patches: Vec::new(),
@@ -195,6 +203,13 @@ impl Code {
             if opcode.has_operand() {
                 let operand = read_operand(&self.body, &mut ip)?;
                 write!(output, " {operand}").unwrap();
+                if matches!(opcode, Opcode::LoadLocal | Opcode::StoreLocal) {
+                    let name = self
+                        .local_names
+                        .get(operand)
+                        .ok_or(Error::InvalidIr("local slot"))?;
+                    write!(output, " ({name})").unwrap();
+                }
                 if matches!(opcode, Opcode::Runtime) {
                     let (operation, _) = self
                         .operations
@@ -253,6 +268,12 @@ impl Builder {
             Op::GetItem(..) => self.emit(Opcode::GetItem),
             Op::SetItem { .. } => self.emit(Opcode::SetItem),
             Op::Len(..) => self.emit(Opcode::Len),
+            Op::Runtime(crate::hir::CoreOp::LoadLocal(slot), _) => {
+                self.operand(Opcode::LoadLocal, *slot)?;
+            }
+            Op::Runtime(crate::hir::CoreOp::StoreLocal(slot), _) => {
+                self.operand(Opcode::StoreLocal, *slot)?;
+            }
             Op::Runtime(operation, values) => {
                 let id = self.code.operations.len();
                 self.code.operations.push((operation.clone(), values.len()));

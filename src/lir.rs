@@ -36,6 +36,8 @@ pub struct FrameState {
     pub values: Vec<(ValueId, Register)>,
     /// The current lexical environment is a separate implicit boxed input and GC root.
     pub environment_root: bool,
+    /// Mutable frame locals stay rooted independently of temporary register liveness.
+    pub local_count: usize,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
@@ -173,6 +175,7 @@ pub struct Function {
     pub osr_entries: Vec<OsrEntry>,
     /// Boxed registers correspond directly to interpreter frame slots.
     pub hir_values: Vec<Register>,
+    pub local_count: usize,
 }
 
 impl Function {
@@ -188,6 +191,7 @@ impl Function {
             exits: vec![],
             osr_entries: vec![],
             hir_values: (0..hir.value_count).map(Register).collect(),
+            local_count: hir.local_slots.len(),
         };
         for (block_id, body) in hir.blocks.iter().enumerate() {
             let mut instructions = vec![];
@@ -514,6 +518,7 @@ impl Function {
                 .map(|value| (*value, Register(value.0)))
                 .collect(),
             environment_root: true,
+            local_count: self.local_count,
         });
         id
     }
@@ -709,7 +714,9 @@ impl Function {
                         effects,
                         ..
                     } => {
-                        if !helper.accepts(arguments.len()) {
+                        if !helper.accepts(arguments.len())
+                            || matches!(helper, Helper::Python(CoreOp::LoadLocal(slot) | CoreOp::StoreLocal(slot)) if *slot >= self.local_count)
+                        {
                             return Err(fail());
                         }
                         for &arg in arguments {
@@ -772,7 +779,10 @@ impl Function {
             }
         }
         for snapshot in &self.states {
-            if snapshot.resume.block.0 >= self.blocks.len() || !snapshot.environment_root {
+            if snapshot.resume.block.0 >= self.blocks.len()
+                || !snapshot.environment_root
+                || snapshot.local_count != self.local_count
+            {
                 return Err(fail());
             }
             let mut slots = BTreeSet::new();
@@ -831,8 +841,8 @@ impl Function {
         for (id, state) in self.states.iter().enumerate() {
             writeln!(
                 text,
-                "s{id}: resume b{}:{} env=current slots={:?}",
-                state.resume.block.0, state.resume.instruction, state.values
+                "s{id}: resume b{}:{} env=current locals={} slots={:?}",
+                state.resume.block.0, state.resume.instruction, state.local_count, state.values
             )
             .unwrap();
         }
@@ -851,12 +861,14 @@ pub struct DeoptFrame {
     pub resume: ResumePoint,
     pub environment: crate::Value,
     pub slots: Vec<Option<crate::Value>>,
+    pub locals: Vec<Option<crate::Value>>,
 }
 impl Function {
     pub fn reconstruct(
         &self,
         state: StateId,
         environment: crate::Value,
+        locals: &[Option<crate::Value>],
         mut read: impl FnMut(Register) -> Result<crate::Value>,
     ) -> Result<DeoptFrame> {
         let snapshot = self
@@ -864,6 +876,9 @@ impl Function {
             .get(state.0)
             .ok_or(Error::InvalidIr("invalid frame state"))?;
         let mut slots = vec![None; self.hir_values.len()];
+        if locals.len() != snapshot.local_count {
+            return Err(Error::InvalidIr("deoptimization local layout"));
+        }
         for (value, register) in &snapshot.values {
             *slots
                 .get_mut(value.0)
@@ -875,6 +890,7 @@ impl Function {
             resume: snapshot.resume,
             environment,
             slots,
+            locals: locals.to_vec(),
         })
     }
     pub fn resume_offset(&self, state: StateId, code: &crate::bytecode::Code) -> Result<usize> {
@@ -1025,8 +1041,12 @@ impl Helper {
             Self::List | Self::Tuple => true,
             Self::Dict => count.is_multiple_of(2),
             Self::Python(op) => match op {
-                CoreOp::Missing | CoreOp::LoadName(_) | CoreOp::Namespace => count == 0,
+                CoreOp::Missing
+                | CoreOp::LoadName(_)
+                | CoreOp::LoadLocal(_)
+                | CoreOp::Namespace => count == 0,
                 CoreOp::StoreName(_)
+                | CoreOp::StoreLocal(_)
                 | CoreOp::Unary(_)
                 | CoreOp::GetAttr(_)
                 | CoreOp::Iter

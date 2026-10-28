@@ -113,6 +113,8 @@ pub enum CoreOp {
     UnpackStar(usize, usize),
     LoadName(String),
     StoreName(String),
+    LoadLocal(usize),
+    StoreLocal(usize),
     Binary(String),
     Inplace(String),
     Compare(String),
@@ -149,6 +151,7 @@ pub struct Function {
     pub(crate) vararg: Option<String>,
     pub(crate) kwarg: Option<String>,
     pub(crate) local_names: Vec<String>,
+    pub(crate) local_slots: Vec<String>,
     pub(crate) global_names: Vec<String>,
     pub(crate) nonlocal_names: Vec<String>,
     pub(crate) module: bool,
@@ -171,6 +174,7 @@ impl Function {
             vararg: None,
             kwarg: None,
             local_names: Vec::new(),
+            local_slots: Vec::new(),
             global_names: Vec::new(),
             nonlocal_names: Vec::new(),
             module: false,
@@ -184,6 +188,63 @@ impl Function {
 
     pub fn entry(&self) -> BlockId {
         BlockId(0)
+    }
+
+    pub fn local_slots(&self) -> &[String] {
+        &self.local_slots
+    }
+
+    pub(crate) fn index_locals(&mut self, class_scope: bool) {
+        fn references(function: &Function, names: &mut std::collections::BTreeSet<String>) {
+            for instruction in function.blocks.iter().flat_map(|b| &b.instructions) {
+                match &instruction.op {
+                    Op::Runtime(CoreOp::LoadName(name) | CoreOp::StoreName(name), _) => {
+                        names.insert(name.clone());
+                    }
+                    Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) => {
+                        references(body, names);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut captured = std::collections::BTreeSet::new();
+        for instruction in self.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) = &instruction.op
+            {
+                references(body, &mut captured);
+            }
+        }
+        // Overlapping names in nested scopes conservatively retain a shared environment binding.
+        if !self.module && !class_scope {
+            self.local_slots = self
+                .local_names
+                .iter()
+                .filter(|name| !captured.contains(*name))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        for instruction in self.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+            if let Op::Runtime(operation, _) = &mut instruction.op {
+                match operation {
+                    CoreOp::Function(body) => body.index_locals(false),
+                    CoreOp::Class(_, body) => body.index_locals(true),
+                    CoreOp::LoadName(name) | CoreOp::StoreName(name) => {
+                        if let Ok(slot) = self.local_slots.binary_search(name) {
+                            *operation = if matches!(operation, CoreOp::LoadName(_)) {
+                                CoreOp::LoadLocal(slot)
+                            } else {
+                                CoreOp::StoreLocal(slot)
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.invalidate();
     }
 
     pub fn block(&mut self, parameters: usize) -> BlockId {

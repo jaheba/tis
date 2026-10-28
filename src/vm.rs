@@ -6,6 +6,12 @@ use crate::{
 };
 use std::{cell::RefCell, rc::Rc};
 
+#[derive(Debug)]
+pub(crate) struct LocalFrame {
+    values: Vec<Option<Value>>,
+    code: Rc<Code>,
+}
+
 #[derive(Debug, Default)]
 pub struct Vm {
     pub heap: Heap,
@@ -24,6 +30,7 @@ pub struct Vm {
     pub(crate) artifacts:
         std::collections::BTreeMap<(crate::profile::FunctionId, u64), Rc<crate::lir::Function>>,
     pub(crate) environments: Vec<Value>,
+    pub(crate) local_frames: Vec<LocalFrame>,
     pub(crate) globals: Option<Value>,
     pub output: String,
     pub(crate) depth: usize,
@@ -95,7 +102,17 @@ impl Vm {
         for (&parameter, &value) in parameters.iter().zip(arguments) {
             slots[parameter.0] = Some(value);
         }
-        self.execute_window(function, code, environment, slots, 0, None)
+        let locals = {
+            let mut object = self.heap.get_mut(environment)?;
+            let Object::Environment(env) = &mut *object else {
+                return Err(Error::InvalidIr("frame environment"));
+            };
+            code.local_names
+                .iter()
+                .map(|name| env.values.remove(name))
+                .collect()
+        };
+        self.execute_window(function, code, environment, slots, locals, 0, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -105,6 +122,7 @@ impl Vm {
         code: Rc<Code>,
         environment: Value,
         slots: Vec<Option<Value>>,
+        locals: Vec<Option<Value>>,
         ip: usize,
         block: Option<usize>,
     ) -> Result<Value> {
@@ -118,6 +136,10 @@ impl Vm {
         self.stack.extend(slots);
         self.depth += 1;
         self.environments.push(environment);
+        self.local_frames.push(LocalFrame {
+            values: locals,
+            code: code.clone(),
+        });
         // Runtime calls currently recurse through Rust; grow before entering another frame
         // so the language recursion limit is reached before exhausting the native stack.
         let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
@@ -152,6 +174,7 @@ impl Vm {
             }
         }
         self.environments.pop();
+        self.local_frames.pop();
         self.depth -= 1;
         self.stack.truncate(base);
         result
@@ -170,6 +193,10 @@ impl Vm {
             crate::tier::Outcome::Deopt(frame) => {
                 let ip = code.resume_offset(frame.resume)?;
                 self.stack[base..frame_end].copy_from_slice(&frame.slots);
+                self.local_frames
+                    .last_mut()
+                    .ok_or(Error::InvalidIr("local frame"))?
+                    .values = frame.locals;
                 self.execute(
                     function,
                     code,
@@ -191,13 +218,14 @@ impl Vm {
         if frame.function != function.id()
             || frame.revision != function.revision()
             || frame.slots.len() != function.value_count
+            || frame.locals.len() != function.local_slots.len()
         {
             return Err(Error::InvalidIr("stale deoptimization frame"));
         }
         if !matches!(self.heap.get(frame.environment)?, Object::Environment(_)) {
             return Err(Error::InvalidIr("deoptimization environment"));
         }
-        for value in frame.slots.iter().flatten() {
+        for value in frame.slots.iter().chain(&frame.locals).flatten() {
             if matches!(value, Value::Ref(_)) {
                 self.heap.get(*value)?;
             }
@@ -224,6 +252,7 @@ impl Vm {
             code,
             frame.environment,
             frame.slots,
+            frame.locals,
             ip,
             Some(frame.resume.block.0),
         );
@@ -237,6 +266,11 @@ impl Vm {
             .iter()
             .filter_map(|value| *value)
             .chain(self.environments.iter().copied())
+            .chain(
+                self.local_frames
+                    .iter()
+                    .flat_map(|frame| frame.values.iter().filter_map(|v| *v)),
+            )
             .chain(self.transient_roots.iter().copied())
             .chain(self.pinned.values().copied())
             .chain(self.globals)
@@ -514,10 +548,57 @@ impl Vm {
                     self.push(result);
                 }
                 Opcode::Return => return self.pop(frame_end),
+                Opcode::LoadLocal => {
+                    let slot = read_operand(&code.body, &mut ip)?;
+                    self.push(self.load_local(slot)?);
+                }
+                Opcode::StoreLocal => {
+                    let slot = read_operand(&code.body, &mut ip)?;
+                    let value = self.pop(frame_end)?;
+                    self.store_local(slot, value)?;
+                    self.push(Value::None);
+                }
             }
             // Collect only between instructions, when all live temporaries are rooted.
             self.maybe_collect()?;
         }
+    }
+
+    pub(crate) fn local_values(&self) -> Result<&[Option<Value>]> {
+        Ok(&self
+            .local_frames
+            .last()
+            .ok_or(Error::InvalidIr("local frame"))?
+            .values)
+    }
+
+    pub(crate) fn load_local(&self, slot: usize) -> Result<Value> {
+        let frame = self
+            .local_frames
+            .last()
+            .ok_or(Error::InvalidIr("local frame"))?;
+        frame
+            .values
+            .get(slot)
+            .ok_or(Error::InvalidIr("local slot"))?
+            .ok_or_else(|| {
+                Error::Runtime(format!(
+                    "UnboundLocalError: {}",
+                    frame.code.local_names[slot]
+                ))
+            })
+    }
+
+    pub(crate) fn store_local(&mut self, slot: usize, value: Value) -> Result<()> {
+        let frame = self
+            .local_frames
+            .last_mut()
+            .ok_or(Error::InvalidIr("local frame"))?;
+        *frame
+            .values
+            .get_mut(slot)
+            .ok_or(Error::InvalidIr("local slot"))? = Some(value);
+        Ok(())
     }
 
     fn push(&mut self, value: Value) {

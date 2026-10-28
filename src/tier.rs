@@ -88,6 +88,7 @@ impl Vm {
         if lir.source != function.id()
             || lir.revision != function.revision()
             || lir.hir_values.len() != function.value_count
+            || lir.local_count != function.local_slots.len()
             || lir.hir_values.iter().enumerate().any(|(i, r)| r.0 != i)
         {
             return Err(Error::InvalidIr("stale LIR artifact"));
@@ -410,7 +411,7 @@ impl Vm {
             .environments
             .last()
             .ok_or(Error::InvalidIr("missing LIR environment"))?;
-        let frame = lir.reconstruct(exit.state, environment, |r| {
+        let frame = lir.reconstruct(exit.state, environment, self.local_values()?, |r| {
             registers[r.0]
                 .ok_or(Error::InvalidIr("missing deoptimization value"))?
                 .boxed()

@@ -20,6 +20,20 @@ fn edges(term: &Terminator) -> Vec<&super::Edge> {
 }
 
 pub(super) fn analyze(function: &Function) -> Result<Analysis> {
+    for instruction in function.blocks.iter().flat_map(|b| &b.instructions) {
+        if let super::Op::Runtime(operation, inputs) = &instruction.op {
+            let local = match operation {
+                super::CoreOp::LoadLocal(slot) => Some((*slot, 0)),
+                super::CoreOp::StoreLocal(slot) => Some((*slot, 1)),
+                _ => None,
+            };
+            if let Some((slot, arity)) = local
+                && (slot >= function.local_slots.len() || inputs.len() != arity)
+            {
+                return Err(Error::InvalidIr("invalid local operation"));
+            }
+        }
+    }
     let count = function.blocks.len();
     if count == 0 {
         return Err(Error::InvalidIr("missing entry block"));

@@ -36,6 +36,10 @@ The executing function retains its HIR and runtime profile.
 Eight successful integer observations select a guarded integer addition strategy.
 Type or overflow guard failure falls back to generic arithmetic without rewriting bytecode.
 Name loads, stores, calls and object operations remain explicit HIR operations.
+Uncaptured function locals use `LoadLocal`/`StoreLocal` operations with stable indexed frame slots.
+Bytecode lowers these directly to local-access instructions; LIR currently accesses them through shared helpers.
+Names referenced anywhere in a nested scope conservatively stay in shared environments, even when shadowed there.
+Module/class namespaces and global/nonlocal bindings retain their named lookup rules.
 
 ## Rust API
 
@@ -115,8 +119,8 @@ Float comparisons specialize only when both operands are floats, preserving exac
 Observed types are hints: type changes, integer overflow, division by zero and invalid power domains have explicit side exits.
 HIR and LIR verification check definitions, dominance and edge arguments; LIR also checks types, guards and root maps.
 
-A side exit stores the live HIR slots and current lexical environment needed to resume before the original operation.
-`lir.reconstruct(...)` materializes a `DeoptFrame` from boxed register locations.
+A side exit stores live HIR temporaries, mutable local slots and the current lexical environment.
+`lir.reconstruct(state, environment, locals, read_register)` materializes a `DeoptFrame` at a pre-effect boundary.
 `Vm::resume_hir(...)` checks its code revision and continues bytecode execution at that boundary.
 Tests exercise type changes and integer overflow after an earlier mutation, verifying that the mutation is not repeated.
 A hot loop can enter LIR or native execution at its header during the first invocation (OSR).
@@ -192,13 +196,14 @@ The tis object layer uses generation-checked handles and tracing collection, inc
 Monty's reference counting and HeapReader API are not part of this port.
 
 Collection runs between bytecode instructions and at LIR/native runtime boundaries.
-Stack slots, active environments, in-flight calls and module globals are rooted; LIR/native safepoints use their live root maps.
+Temporary slots, local slots, active environments, in-flight calls and module globals are rooted.
+LIR/native safepoints use live temporary root maps and retain the separate local frame.
 Host-held handles can be retained with `Vm::pin` and released with `Vm::unpin`.
 `Vm::collect_garbage(&roots)` also accepts temporary external roots.
 Direct `Heap` use has explicit collection only.
 
 Calls currently use Rust recursion with stack growth and a 256-frame language limit.
-Both return and error release the VM frame window and active environment roots.
+Both return and error release the VM frame window, local slots and active environment roots.
 Iterator and representation recursion have bounded depth and stack growth; class hierarchy lookup is iterative.
 
 ## Current limits

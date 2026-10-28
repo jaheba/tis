@@ -402,6 +402,11 @@ impl Vm {
                 self.heap.allocate(Object::Tuple(result))
             }
             CoreOp::LoadName(name) => self.lookup(env, name)?,
+            CoreOp::LoadLocal(slot) => self.load_local(*slot)?,
+            CoreOp::StoreLocal(slot) => {
+                self.store_local(*slot, values[0])?;
+                Value::None
+            }
             CoreOp::StoreName(name) => {
                 self.store(env, name, values[0])?;
                 Value::None

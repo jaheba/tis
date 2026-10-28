@@ -131,7 +131,9 @@ pub(crate) fn execute(
         .environments
         .last()
         .ok_or(Error::InvalidIr("native environment"))?;
-    let frame = lir.reconstruct(exit.state, environment, |r| registers[r.0].value())?;
+    let frame = lir.reconstruct(exit.state, environment, vm.local_values()?, |r| {
+        registers[r.0].value()
+    })?;
     vm.mark_deoptimization(function, &frame);
     Ok(Outcome::Deopt(frame))
 }
@@ -186,6 +188,7 @@ pub(crate) extern "C" fn callback(
             let vm = unsafe { &mut *context.vm };
             vm.stack.truncate(checkpoint.0);
             vm.environments.truncate(checkpoint.1);
+            vm.local_frames.truncate(checkpoint.1);
             vm.transient_roots.truncate(checkpoint.2);
             vm.depth = checkpoint.3;
             context.error = Some(Error::Runtime("panic in native runtime helper".into()));

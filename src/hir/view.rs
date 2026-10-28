@@ -5,11 +5,18 @@ use super::{AddStrategy, Block, Edge, Function, Op, Terminator, ValueId};
 impl Function {
     /// Textual IR with the runtime counters attached to each addition site.
     pub fn dump(&self) -> String {
-        self.blocks
-            .iter()
-            .enumerate()
-            .map(|(id, block)| block_lines(id, block).join("\n") + "\n")
-            .collect()
+        let mut text = if self.local_slots.is_empty() {
+            String::new()
+        } else {
+            format!("locals: {:?}\n", self.local_slots)
+        };
+        text.extend(
+            self.blocks
+                .iter()
+                .enumerate()
+                .map(|(id, block)| block_lines(id, block).join("\n") + "\n"),
+        );
+        text
     }
 
     /// Graphviz control-flow graph. Edge labels show block-parameter transfers.

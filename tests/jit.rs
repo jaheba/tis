@@ -246,7 +246,7 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
     let left = vm.heap.allocate(Object::String("hello ".into()));
     let right = vm.heap.allocate(Object::String("tis".into()));
     let frame = lir
-        .reconstruct(state, env, |reg| {
+        .reconstruct(state, env, &[], |reg| {
             Ok(if reg.0 == args[1].0 {
                 left
             } else if reg.0 == args[2].0 {
@@ -266,7 +266,7 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
         Value::Int(10)
     );
     let frame = lir
-        .reconstruct(state, env, |reg| {
+        .reconstruct(state, env, &[], |reg| {
             Ok(if reg.0 == args[1].0 {
                 Value::Int(i64::MAX)
             } else {
@@ -433,7 +433,7 @@ fn stale_lir_cannot_resume_changed_hir() {
         unreachable!()
     };
     let frame = lir
-        .reconstruct(state, Value::None, |_| Ok(Value::Int(1)))
+        .reconstruct(state, Value::None, &[], |_| Ok(Value::Int(1)))
         .unwrap();
     f.terminate(f.entry(), Terminator::Return(f.parameters(f.entry())[0]));
     let mut vm = Vm::new();
