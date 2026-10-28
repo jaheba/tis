@@ -16,6 +16,7 @@ pub mod profile;
 pub use hir as ir;
 mod copy_patch;
 mod native;
+pub use native::NativeDiagnostics;
 mod native_abi;
 mod native_runtime;
 mod register_vm;

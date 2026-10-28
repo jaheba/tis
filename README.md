@@ -258,6 +258,17 @@ Cranelift runs with its speed optimization pipeline enabled.
 separate region work from runtime crossings. LIR dumps expose region imports and hoisted-guard counts. Copy-and-patch
 and reference LIR keep executing the original operations; region metadata currently accelerates Cranelift only.
 
+Staged native artifacts with regions keep boxed registers as four SSA words as well as primitive float recipes.
+Phi edges perform parallel SSA transfers, preserving references, `None` and unbound locals. Only live values needed
+by a runtime operation or side exit are materialized into the register image. Block bookkeeping does not publish
+lazy parameters, and region entry publishes imports; an entry failure materializes its complete snapshot.
+Allocating helpers receive fresh tagged roots, and callback-produced results reload the SSA cache after success.
+
+Set `Vm.capture_native_code` before compilation to retain `NativeDiagnostics` for a callable. The benchmark worker
+accepts `--dump-native PREFIX`, writing input Cranelift IR, allocated machine disassembly and the finalized live
+machine image as `.clif`, `.asm` and `.bin`. Capture is off by default; timed runs do not retain diagnostic strings.
+
+
 `TierStats.native_float_views` and `native_float_view_failures` count view acquisitions and storage guard failures.
 There is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.

@@ -714,7 +714,11 @@ impl Vm {
                 native.clone()
             } else {
                 let start = std::time::Instant::now();
-                let result = crate::native::NativeCode::compile(lir.clone(), feedback);
+                let result = crate::native::NativeCode::compile(
+                    lir.clone(),
+                    feedback,
+                    self.capture_native_code,
+                );
                 self.tier_stats.native_compile_ns = self
                     .tier_stats
                     .native_compile_ns
@@ -749,5 +753,15 @@ impl Vm {
             }
             self.execute_lir(function, code, &lir, base, frame_end, start, None, osr)
         }
+    }
+}
+
+impl Vm {
+    pub fn native_diagnostics(&self, callable: Value) -> Result<&crate::NativeDiagnostics> {
+        let f = self.function_hir(callable)?;
+        self.native_artifacts
+            .get(&(f.id(), f.revision()))
+            .and_then(|code| code.diagnostics.as_ref())
+            .ok_or(Error::InvalidIr("native diagnostics were not captured"))
     }
 }

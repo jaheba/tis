@@ -19,6 +19,12 @@ use std::{cell::RefCell, fmt, rc::Rc};
 
 use crate::native_abi::*;
 use crate::native_runtime::{Entry, callback, power};
+#[derive(Debug, Clone)]
+pub struct NativeDiagnostics {
+    pub clif: String,
+    pub disassembly: String,
+    pub machine_code: Vec<u8>,
+}
 pub(crate) struct NativeCode {
     module: Option<JITModule>,
     entry: Option<Entry>,
@@ -27,6 +33,7 @@ pub(crate) struct NativeCode {
     root_states: Vec<lir::FrameState>,
     pub bytes: usize,
     pub feedback: bool,
+    pub diagnostics: Option<NativeDiagnostics>,
 }
 impl fmt::Debug for NativeCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,7 +59,7 @@ fn error(message: impl fmt::Display) -> Error {
 }
 
 impl NativeCode {
-    pub fn compile(lir: Rc<lir::Function>, feedback: bool) -> Result<Self> {
+    pub fn compile(lir: Rc<lir::Function>, feedback: bool, capture: bool) -> Result<Self> {
         lir.verify()?;
         if std::mem::size_of::<usize>() != 8 || std::mem::size_of::<Slot>() != 32 {
             return Err(error("native backend requires 64-bit pointers"));
@@ -90,6 +97,7 @@ impl NativeCode {
             root_states,
             bytes: 0,
             feedback,
+            diagnostics: None,
         };
         let module = owner.module.as_mut().unwrap();
         let ptr = module.target_config().pointer_type();
@@ -117,6 +125,7 @@ impl NativeCode {
             .declare_function("tis_power", Linkage::Import, &power_sig)
             .map_err(error)?;
         let mut context = module.make_context();
+        context.set_disasm(capture);
         context.func.signature.params = vec![
             AbiParam::new(ptr),
             AbiParam::new(ptr),
@@ -174,7 +183,11 @@ impl NativeCode {
             b.ins().jump(failed, &[]);
             macro_rules! runtime_call {
                 ($builder:expr, $function:expr, $host:expr, $registers:expr, $event:expr, $location:expr, $failed:expr $(,)?) => {{
-                    let needed = callback_values(&owner.lir, &owner.locations, $event, $location);
+                    let needed = if $event == ENTER && scalars.2.iter().any(Option::is_some) {
+                        vec![]
+                    } else {
+                        callback_values(&owner.lir, &owner.locations, $event, $location)
+                    };
                     scalars.materialize($builder, $registers, needed)?;
                     let event = $builder.ins().iconst(types::I32, $event as i64);
                     let location = $builder.ins().iconst(types::I32, $location as i64);
@@ -191,6 +204,14 @@ impl NativeCode {
                     scalars.materialize($builder, $registers, needed)?;
                     $builder.ins().jump($failed, &[]);
                     $builder.switch_to_block(next);
+                    scalars.reload_callback(
+                        $builder,
+                        $registers,
+                        &owner.lir,
+                        &owner.locations,
+                        $event,
+                        $location,
+                    )?;
                 }};
             }
             macro_rules! side_exit {
@@ -284,7 +305,12 @@ impl NativeCode {
                             &mut b, view_ref, host, registers, FLOAT_VIEW, location, failed,
                         ),
                         Operation::FloatListUnpack { value, .. } => {
-                            copy_slots(&mut b, registers, &[(*value, destination.unwrap())])?;
+                            copy_slots(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                &[(*value, destination.unwrap())],
+                            )?;
                         }
                         Operation::FloatListLoad {
                             view,
@@ -323,8 +349,9 @@ impl NativeCode {
                                     types::F64,
                                 )?;
                                 b.ins().store(MemFlagsData::new(), value, pointer, 0);
-                                store_constant(
+                                store_constant_cached(
                                     &mut b,
+                                    &scalars,
                                     registers,
                                     destination.unwrap(),
                                     Slot::boxed(Value::None),
@@ -375,8 +402,9 @@ impl NativeCode {
                                 crate::hir::Constant::Float(v) => Value::Float(*v),
                                 _ => return Err(error("allocating constant")),
                             };
-                            store_constant(
+                            store_constant_cached(
                                 &mut b,
+                                &scalars,
                                 registers,
                                 destination.unwrap(),
                                 Slot::boxed(value),
@@ -639,9 +667,9 @@ impl NativeCode {
                 }
                 match &body.terminator {
                     Terminator::Return(value) => {
-                        scalars.materialize(&mut b, registers, [*value])?;
                         copy_slots(
                             &mut b,
+                            &scalars,
                             registers,
                             &[(*value, Register(owner.lir.registers.len()))],
                         )?;
@@ -694,6 +722,7 @@ impl NativeCode {
             b.seal_all_blocks();
             b.finalize(module.target_config());
         }
+        let clif = capture.then(|| context.func.display().to_string());
         module.define_function(id, &mut context).map_err(error)?;
         owner.bytes = context
             .compiled_code()
@@ -702,6 +731,18 @@ impl NativeCode {
         let pointer = module.get_finalized_function(id);
         // SAFETY: the finalized function has exactly Entry's target C ABI and remains executable
         // until this NativeCode's final Rc is dropped. No pointer is exposed to callers.
+        if let Some(clif) = clif {
+            // SAFETY: the finalized module owns this complete function image until owner is dropped.
+            let machine_code = unsafe { std::slice::from_raw_parts(pointer, owner.bytes) }.to_vec();
+            owner.diagnostics = Some(NativeDiagnostics {
+                clif,
+                disassembly: context
+                    .compiled_code()
+                    .and_then(|c| c.vcode.clone())
+                    .unwrap_or_default(),
+                machine_code,
+            });
+        }
         owner.entry = Some(unsafe { std::mem::transmute::<*const u8, Entry>(pointer) });
         Ok(owner)
     }
@@ -726,6 +767,7 @@ impl NativeCode {
             &self.lir,
             &self.locations,
             Some(&self.root_states),
+            !self.feedback && !self.lir.regions.is_empty(),
             2,
             |context, registers, start| {
                 // SAFETY: the shared bridge keeps its Context and register allocation alive for this call.
@@ -762,23 +804,6 @@ fn load(
         offset(register, field)?,
     ))
 }
-fn store_constant(
-    b: &mut FunctionBuilder<'_>,
-    registers: ir::Value,
-    register: Register,
-    slot: Slot,
-) -> Result<()> {
-    for (field, value) in [(0, slot.tag), (8, slot.a), (16, slot.b), (24, slot.c)] {
-        let value = b.ins().iconst(types::I64, value as i64);
-        b.ins().store(
-            MemFlagsData::new(),
-            value,
-            registers,
-            offset(register, field)?,
-        );
-    }
-    Ok(())
-}
 fn store_scalar(
     b: &mut FunctionBuilder<'_>,
     registers: ir::Value,
@@ -808,18 +833,22 @@ fn store_float(
 }
 fn copy_slots(
     b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
     registers: ir::Value,
     pairs: &[(Register, Register)],
 ) -> Result<()> {
     let mut copies = vec![];
     for &(from, to) in pairs {
         for field in [0, 8, 16, 24] {
-            copies.push((to, field, load(b, registers, from, field, types::I64)?));
+            copies.push((
+                to,
+                field,
+                load_cached(b, scalars, registers, from, field, types::I64)?,
+            ));
         }
     }
     for (to, field, value) in copies {
-        b.ins()
-            .store(MemFlagsData::new(), value, registers, offset(to, field)?);
+        store_word_cached(b, scalars, registers, to, field, value)?;
     }
     Ok(())
 }
@@ -866,15 +895,21 @@ fn edge_jump(
             boxed.push((from, to));
         }
     }
-    scalars.materialize(b, registers, boxed.iter().map(|(from, _)| *from))?;
-    copy_slots(b, registers, &boxed)?;
+    // Parallel SSA assignments preserve old values for swaps without publishing a slot image.
+    copy_slots(b, scalars, registers, &boxed)?;
     for (to, value) in values {
         b.def_var(scalars.0[to.0].unwrap().0, value);
     }
     b.ins().jump(blocks[edge.block.0], &[]);
     Ok(())
 }
-struct ScalarVars(Vec<Option<(Variable, ir::Type)>>, Vec<Option<Variable>>);
+// Tagged SSA preserves all Python variants, including unbound locals, without an eager slot image.
+// Floats with an explicit unboxing recipe keep their smaller primitive representation.
+struct ScalarVars(
+    Vec<Option<(Variable, ir::Type)>>,
+    Vec<Option<Variable>>,
+    Vec<Option<[Variable; 4]>>,
+);
 impl ScalarVars {
     fn new(b: &mut FunctionBuilder<'_>, lir: &lir::Function, defer: bool) -> Self {
         let recipes = lir.native_boxing_recipes();
@@ -895,6 +930,13 @@ impl ScalarVars {
                         .then(|| b.declare_var(types::F64))
                 })
                 .collect(),
+            lir.registers
+                .iter()
+                .map(|ty| {
+                    (defer && !lir.regions.is_empty() && *ty == lir::Type::Boxed)
+                        .then(|| std::array::from_fn(|_| b.declare_var(types::I64)))
+                })
+                .collect(),
         )
     }
     fn materialize(
@@ -911,6 +953,49 @@ impl ScalarVars {
                 let value = b.use_var(var);
                 let bits = b.ins().bitcast(types::I64, MemFlagsData::new(), value);
                 store_scalar(b, registers, register, FLOAT, bits)?;
+            } else if let Some(vars) = self.2[register.0] {
+                for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                    let value = b.use_var(var);
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        value,
+                        registers,
+                        offset(register, field)?,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    fn reload_callback(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        registers: ir::Value,
+        lir: &lir::Function,
+        locations: &[(usize, usize)],
+        event: i32,
+        location: i32,
+    ) -> Result<()> {
+        if !matches!(event, HELPER | SEQUENCE | UNPACK_BATCH) {
+            return Ok(());
+        }
+        let (block, index) = locations[location as usize];
+        let count = if event == UNPACK_BATCH {
+            match lir.blocks[block].instructions[index].operation {
+                Operation::SequenceUnpack { count, .. } => count,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        for instruction in &lir.blocks[block].instructions[index..=index + count] {
+            if let Some(r) = instruction.result
+                && let Some(vars) = self.2[r.0]
+            {
+                for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                    let value = load(b, registers, r, field, types::I64)?;
+                    b.def_var(var, value);
+                }
             }
         }
         Ok(())
@@ -935,6 +1020,14 @@ impl ScalarVars {
             };
             b.def_var(var, zero);
         }
+        for (index, vars) in self.2.iter().enumerate() {
+            if let Some(vars) = vars {
+                for (field, var) in [0, 8, 16, 24].into_iter().zip(vars) {
+                    let value = load(b, registers, Register(index), field, types::I64)?;
+                    b.def_var(*var, value);
+                }
+            }
+        }
         for (index, var) in self.1.iter().enumerate() {
             if let Some(var) = var {
                 let value = load(b, registers, Register(index), 8, types::F64)?;
@@ -952,7 +1045,7 @@ fn load_cached(
     field: i32,
     ty: ir::Type,
 ) -> Result<ir::Value> {
-    if let Some(var) = scalars.1[register.0] {
+    if let Some(var) = scalars.1.get(register.0).copied().flatten() {
         if field == 0 {
             return Ok(b.ins().iconst(types::I64, FLOAT as i64));
         }
@@ -965,6 +1058,17 @@ fn load_cached(
             });
         }
     }
+    if scalars.1.get(register.0).copied().flatten().is_some() && matches!(field, 16 | 24) {
+        return Ok(b.ins().iconst(ty, 0));
+    }
+    if let Some(vars) = scalars.2.get(register.0).copied().flatten() {
+        let value = b.use_var(vars[field as usize / 8]);
+        return Ok(if ty == types::I64 {
+            value
+        } else {
+            b.ins().bitcast(ty, MemFlagsData::new(), value)
+        });
+    }
     if field == 8
         && let Some((var, source)) = scalars.0.get(register.0).copied().flatten()
     {
@@ -976,6 +1080,35 @@ fn load_cached(
         });
     }
     load(b, registers, register, field, ty)
+}
+fn store_word_cached(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    registers: ir::Value,
+    r: Register,
+    field: i32,
+    value: ir::Value,
+) -> Result<()> {
+    if let Some(vars) = scalars.2.get(r.0).copied().flatten() {
+        b.def_var(vars[field as usize / 8], value);
+    } else {
+        b.ins()
+            .store(MemFlagsData::new(), value, registers, offset(r, field)?);
+    }
+    Ok(())
+}
+fn store_constant_cached(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    registers: ir::Value,
+    r: Register,
+    value: Slot,
+) -> Result<()> {
+    for (field, word) in [(0, value.tag), (8, value.a), (16, value.b), (24, value.c)] {
+        let word = b.ins().iconst(types::I64, word as i64);
+        store_word_cached(b, scalars, registers, r, field, word)?;
+    }
+    Ok(())
 }
 fn store_scalar_cached(
     b: &mut FunctionBuilder<'_>,
@@ -999,6 +1132,15 @@ fn store_scalar_cached(
             value
         };
         b.def_var(var, value);
+        return Ok(());
+    }
+    if scalars.2.get(register.0).copied().flatten().is_some() {
+        let tag = b.ins().iconst(types::I64, tag as i64);
+        store_word_cached(b, scalars, registers, register, 0, tag)?;
+        store_word_cached(b, scalars, registers, register, 8, value)?;
+        let zero = b.ins().iconst(types::I64, 0);
+        store_word_cached(b, scalars, registers, register, 16, zero)?;
+        store_word_cached(b, scalars, registers, register, 24, zero)?;
         return Ok(());
     }
     store_scalar(b, registers, register, tag, value)
@@ -1033,9 +1175,7 @@ fn callback_values(
     location: i32,
 ) -> Vec<Register> {
     if event == REGION_ENTER {
-        return state_values(
-            &lir.states[lir.exits[lir.regions[location as usize].entry.0].state.0],
-        );
+        return lir.regions[location as usize].imports.clone();
     }
     if event == ENTER {
         return lir.blocks[location as usize].parameters.clone();
@@ -1049,7 +1189,22 @@ fn callback_values(
         inputs.extend(instruction.result);
         return inputs;
     }
-    instruction.operation.inputs()
+    let mut values = instruction.operation.inputs();
+    values.extend(&lir.observation_inputs[instruction.origin.0]);
+    if let Operation::Call { state, effects, .. } | Operation::Truth { state, effects, .. } =
+        instruction.operation
+        && effects.needs_safepoint()
+    {
+        let floats = lir.native_boxing_recipes();
+        values.extend(
+            lir.states[state.0]
+                .values
+                .iter()
+                .map(|(_, r)| *r)
+                .filter(|r| !floats.contains_key(r)),
+        );
+    }
+    values
 }
 
 fn callback_failure_values(
@@ -1058,7 +1213,12 @@ fn callback_failure_values(
     event: i32,
     location: i32,
 ) -> Vec<Register> {
-    if event == ENTER || event == FINISH || event == REGION_ENTER {
+    if event == REGION_ENTER {
+        return state_values(
+            &lir.states[lir.exits[lir.regions[location as usize].entry.0].state.0],
+        );
+    }
+    if event == ENTER || event == FINISH {
         return vec![];
     }
     let (block, index) = locations[location as usize];
@@ -1100,7 +1260,7 @@ mod region_entry_tests {
         let body = lir.regions.first().unwrap().body.0;
         let code = hir.code.clone().unwrap();
         let function = Rc::new(RefCell::new(hir));
-        let native = NativeCode::compile(lir, false).unwrap();
+        let native = NativeCode::compile(lir, false, false).unwrap();
         assert!(matches!(
             native.execute(&mut vm, &function, &code, 0, 0, body, true),
             Err(Error::InvalidIr(_))

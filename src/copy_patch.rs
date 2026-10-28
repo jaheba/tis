@@ -506,6 +506,7 @@ impl CopyCode {
             &self.lir,
             &self.locations,
             None,
+            false,
             self.scratch,
             |context, registers, _| {
                 // SAFETY: these bytes came from a verified same-target C-ABI stencil. This borrowed

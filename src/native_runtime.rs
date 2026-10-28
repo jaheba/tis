@@ -75,6 +75,7 @@ pub(crate) fn execute(
     lir: &lir::Function,
     locations: &[(usize, usize)],
     root_states: Option<&[lir::FrameState]>,
+    lazy_slots: bool,
     extra_slots: usize,
     invoke: impl FnOnce(*mut c_void, *mut Slot, u32) -> u64,
     vm: &mut Vm,
@@ -131,6 +132,7 @@ pub(crate) fn execute(
         lir,
         locations,
         root_states,
+        lazy_slots,
         base,
         rooted,
         previous: None,
@@ -192,6 +194,7 @@ struct Context<'a> {
     locations: &'a [(usize, usize)],
     // Deferred scalar recipes cannot contain references; GC reads only the remaining tagged values.
     root_states: Option<&'a [lir::FrameState]>,
+    lazy_slots: bool,
     base: usize,
     rooted: Vec<usize>,
     previous: Option<usize>,
@@ -517,15 +520,18 @@ impl Context<'_> {
         // SAFETY: callbacks reborrow the exclusively owned VM only until returning to Entry.
         let vm = unsafe { &mut *self.vm };
         if event == ENTER {
-            for parameter in &self.lir.blocks[location as usize].parameters {
-                if self.lir.registers[parameter.0] != lir::Type::Boxed {
-                    continue;
+            // No collection runs in block bookkeeping; lazy artifacts publish roots at actual safepoints.
+            if !self.lazy_slots {
+                for parameter in &self.lir.blocks[location as usize].parameters {
+                    if self.lir.registers[parameter.0] != lir::Type::Boxed {
+                        continue;
+                    }
+                    let value = registers[parameter.0].value()?;
+                    if vm.stack[self.base + parameter.0].is_none() {
+                        self.rooted.push(parameter.0);
+                    }
+                    vm.stack[self.base + parameter.0] = Some(value);
                 }
-                let value = registers[parameter.0].value()?;
-                if vm.stack[self.base + parameter.0].is_none() {
-                    self.rooted.push(parameter.0);
-                }
-                vm.stack[self.base + parameter.0] = Some(value);
             }
             if self.skip_probe {
                 self.skip_probe = false;

@@ -19,6 +19,7 @@ pub struct Vm {
     pub tiering: crate::Tiering,
     pub bytecode: crate::BytecodeMode,
     pub numeric: crate::NumericMode,
+    pub capture_native_code: bool,
     pub(crate) copy_artifacts: std::collections::BTreeMap<
         (crate::profile::FunctionId, u64),
         Rc<crate::copy_patch::CopyCode>,

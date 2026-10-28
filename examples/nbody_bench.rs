@@ -14,8 +14,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut numeric = NumericMode::default();
     let mut warmups = 2usize;
     let mut dump_lir = None;
+    let mut dump_native = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--dump-native" => {
+                dump_native = Some(args.next().ok_or("missing native output prefix")?)
+            }
             "--dump-lir" => dump_lir = Some(args.next().ok_or("missing LIR output path")?),
             "--numeric" => {
                 numeric = match args.next().as_deref() {
@@ -56,6 +60,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let compile_ns = start.elapsed().as_nanos();
     let mut vm = Vm::new();
     vm.tiering = tier;
+    vm.capture_native_code = dump_native.is_some();
     vm.bytecode = bytecode;
     vm.numeric = numeric;
     let start = Instant::now();
@@ -87,6 +92,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut warmup_ns = vec![];
     for _ in 0..warmups {
         warmup_ns.push(sample(&mut vm, advance, energy, &snapshot)?.0);
+    }
+    if let Some(prefix) = dump_native {
+        let d = vm.native_diagnostics(advance)?;
+        std::fs::write(format!("{prefix}.clif"), &d.clif)?;
+        std::fs::write(format!("{prefix}.asm"), &d.disassembly)?;
+        std::fs::write(format!("{prefix}.bin"), &d.machine_code)?;
     }
     if let Some(path) = dump_lir {
         std::fs::write(

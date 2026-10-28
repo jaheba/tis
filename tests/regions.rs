@@ -475,3 +475,87 @@ fn aliased_float_graphs_match_bytecode_bit_for_bit() {
         assert_eq!(run(true), run(false), "seed {seed}");
     }
 }
+
+#[test]
+fn lazy_unbound_loop_locals_stay_unbound_on_an_empty_iteration() {
+    let (mut vm, f) = setup(
+        "def f(rows):\n    for xs in rows:\n        a,b=xs\n        xs[0]=a+1.0\n    return a\n",
+    );
+    let xs = floats(&vm, &[1.0, 2.0]);
+    let warm = rows(&vm, vec![xs; 10]);
+    for _ in 0..24 {
+        vm.call(f, &[warm]).unwrap();
+    }
+    let empty = rows(&vm, vec![]);
+    assert!(
+        vm.call(f, &[empty])
+            .unwrap_err()
+            .to_string()
+            .contains("UnboundLocalError")
+    );
+    assert_eq!(vm.stack_len(), 0);
+    assert!(matches!(vm.call(f, &[warm]).unwrap(), Value::Float(_)));
+}
+#[test]
+fn tagged_reference_phis_keep_parallel_swaps_and_none_tags() {
+    let (mut vm, f) = setup(
+        "def f(rows,token):\n    a=None\n    b=token\n    for xs in rows:\n        x,y=xs\n        xs[0]=x+1.0\n        a,b=b,a\n    return a,b\n",
+    );
+    let xs = floats(&vm, &[1.0, 2.0]);
+    let token = vm.heap.allocate(Object::List(vec![Value::Int(123)].into()));
+    let warm = rows(&vm, vec![xs; 10]);
+    for _ in 0..24 {
+        vm.call(f, &[warm, token]).unwrap();
+    }
+    for len in [0, 1, 2, 3, 4] {
+        let input = rows(&vm, vec![xs; len]);
+        let result = vm.call(f, &[input, token]).unwrap();
+        assert_eq!(
+            vm.heap.get_item(result, Value::Int(0)).unwrap(),
+            if len % 2 == 0 { Value::None } else { token }
+        );
+        assert_eq!(
+            vm.heap.get_item(result, Value::Int(1)).unwrap(),
+            if len % 2 == 0 { token } else { Value::None }
+        );
+    }
+}
+#[test]
+fn lazy_tagged_roots_survive_allocating_callbacks_and_return_fresh_results() {
+    let source = "def churn(n):\n    for i in range(n):\n        junk=[i]\n    return [99]\ndef f(rows,n):\n    owned=[42]\n    for xs in rows:\n        a,b=xs\n        xs[0]=a+1.0\n    fresh=churn(n)\n    return owned,fresh,xs\n";
+    let (mut vm, f) = setup(source);
+    let xs = floats(&vm, &[1.0, 2.0]);
+    let input = rows(&vm, vec![xs; 10]);
+    for _ in 0..24 {
+        vm.call(f, &[input, Value::Int(1)]).unwrap();
+    }
+    let before = vm.tier_stats.native_region_entries;
+    let result = vm.call(f, &[input, Value::Int(5000)]).unwrap();
+    let owned = vm.heap.get_item(result, Value::Int(0)).unwrap();
+    let fresh = vm.heap.get_item(result, Value::Int(1)).unwrap();
+    assert_eq!(
+        vm.heap.get_item(owned, Value::Int(0)).unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(
+        vm.heap.get_item(fresh, Value::Int(0)).unwrap(),
+        Value::Int(99)
+    );
+    assert_eq!(vm.heap.get_item(result, Value::Int(2)).unwrap(), xs);
+    assert!(vm.tier_stats.native_region_entries > before);
+}
+#[test]
+fn diagnostics_capture_the_live_compiled_image() {
+    let (mut vm, f) =
+        setup("def f(rows):\n    for xs in rows:\n        a,b=xs\n        xs[0]=a+1.0\n");
+    vm.capture_native_code = true;
+    let xs = floats(&vm, &[1.0, 2.0]);
+    let input = rows(&vm, vec![xs; 10]);
+    for _ in 0..24 {
+        vm.call(f, &[input]).unwrap();
+    }
+    let d = vm.native_diagnostics(f).unwrap();
+    assert!(!d.machine_code.is_empty());
+    assert!(d.clif.contains("block"));
+    assert!(d.disassembly.contains("block"));
+}

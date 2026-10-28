@@ -63,8 +63,8 @@ impl Emitter<'_, '_> {
         Ok([
             load_cached(self.b, self.scalars, self.registers, r, 0, types::I64)?,
             load_cached(self.b, self.scalars, self.registers, r, 8, types::I64)?,
-            load(self.b, self.registers, r, 16, types::I64)?,
-            load(self.b, self.registers, r, 24, types::I64)?,
+            load_cached(self.b, self.scalars, self.registers, r, 16, types::I64)?,
+            load_cached(self.b, self.scalars, self.registers, r, 24, types::I64)?,
         ])
     }
     fn resolve(&mut self, r: Register, exit: lir::ExitId) -> Result<ir::Value> {
@@ -72,14 +72,19 @@ impl Emitter<'_, '_> {
         self.resolve_words(words, exit)
     }
     fn boxed_at(&mut self, pointer: ir::Value, dst: Register) -> Result<()> {
-        for field in [0, 8, 16, 24] {
-            let value = self.field(pointer, field as usize);
-            self.b.ins().store(
-                MemFlagsData::new(),
-                value,
-                self.registers,
-                offset(dst, field)?,
-            );
+        let scalar = self.region.schema.is_some()
+            && self.lir.blocks[self.region.body.0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.operation,Operation::GuardFloat {value,..} if value==dst));
+        if scalar {
+            let bits = self.field(pointer, 8);
+            store_scalar_cached(self.b, self.scalars, self.registers, dst, FLOAT, bits)?;
+        } else {
+            for field in [0, 8, 16, 24] {
+                let value = self.field(pointer, field as usize);
+                store_word_cached(self.b, self.scalars, self.registers, dst, field, value)?;
+            }
         }
         Ok(())
     }
@@ -108,7 +113,7 @@ impl Emitter<'_, '_> {
         let wide = self.b.ins().sextend(types::I128, small);
         let valid = self.b.ins().icmp(IntCC::Equal, value, wide);
         self.guard(valid, exit)?;
-        store_scalar(self.b, self.registers, dst, INT, small)?;
+        store_scalar_cached(self.b, self.scalars, self.registers, dst, INT, small)?;
         self.b.ins().jump(finish, &[]);
         self.b.switch_to_block(sequence);
         let is_float = self.b.ins().icmp_imm_s(IntCC::Equal, kind, FLOATS as i64);
@@ -202,7 +207,12 @@ impl Emitter<'_, '_> {
                 if self.region.schema.is_none() {
                     self.guard(valid, *failure)?;
                 }
-                copy_slots(self.b, self.registers, &[(*value, dst.unwrap())])?;
+                copy_slots(
+                    self.b,
+                    self.scalars,
+                    self.registers,
+                    &[(*value, dst.unwrap())],
+                )?;
             }
             Operation::SequenceGet {
                 value,
@@ -284,6 +294,7 @@ impl Emitter<'_, '_> {
                     .store(MemFlagsData::new(), yes, exhaustedptr, 0);
                 copy_slots(
                     self.b,
+                    self.scalars,
                     self.registers,
                     &[(Register(self.lir.registers.len() + 2), dst.unwrap())],
                 )?;
@@ -313,7 +324,14 @@ impl Emitter<'_, '_> {
                 self.b.ins().jump(done, &[yes.into()]);
                 self.b.switch_to_block(done);
                 let value = self.b.block_params(done)[0];
-                store_scalar(self.b, self.registers, dst.unwrap(), BOOL, value)?;
+                store_scalar_cached(
+                    self.b,
+                    self.scalars,
+                    self.registers,
+                    dst.unwrap(),
+                    BOOL,
+                    value,
+                )?;
             }
             _ => return Ok(false),
         }
