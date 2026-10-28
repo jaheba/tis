@@ -111,6 +111,7 @@ pub(crate) fn execute(
         rooted,
         previous: None,
         skip_probe,
+        collecting: vm.collecting(function),
         error: None,
         registers: registers.as_mut_ptr(),
         helper_arguments: Vec::new(),
@@ -162,6 +163,7 @@ struct Context<'a> {
     rooted: Vec<usize>,
     previous: Option<usize>,
     skip_probe: bool,
+    collecting: bool,
     error: Option<Error>,
     registers: *mut Slot,
     // Each native invocation owns its scratch buffer, including during recursive helper calls.
@@ -232,6 +234,7 @@ impl Context<'_> {
             } else {
                 vm.record_block(self.function, self.code, location as usize, self.previous)?;
             }
+            self.collecting = vm.collecting(self.function);
             self.previous = Some(location as usize);
             return vm.maybe_collect();
         }
@@ -273,10 +276,12 @@ impl Context<'_> {
                 self.side_exit = Some(failure);
                 return Ok(());
             };
-            let observed =
+            let observed = self.collecting && {
+                vm.tier_stats.native_feedback_probes += 1;
                 vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                     registers[v.0].value()
-                })?;
+                })?
+            };
             let result = instruction
                 .result
                 .ok_or(Error::InvalidIr("sequence result"))?;
@@ -317,14 +322,18 @@ impl Context<'_> {
                     for r in arguments {
                         self.helper_arguments.push(registers[r.0].value()?);
                     }
-                    observed =
+                    observed = self.collecting && {
+                        vm.tier_stats.native_feedback_probes += 1;
                         vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                             registers[v.0].value()
-                        })?;
+                        })?
+                    };
                     let roots = vm.transient_roots.len();
                     vm.transient_roots.extend_from_slice(&self.helper_arguments);
                     let result = vm.lir_helper(helper, &self.helper_arguments);
                     vm.transient_roots.truncate(roots);
+                    // A recursive call can reopen this function's observation window.
+                    self.collecting = vm.collecting(self.function);
                     Slot::boxed(result?)
                 }
                 Operation::Truth { value, .. } => Slot {
@@ -342,7 +351,8 @@ impl Context<'_> {
         if let Some(result) = instruction.result
             && self.lir.registers[result.0] == lir::Type::Boxed
         {
-            if event == FINISH {
+            if event == FINISH && self.collecting {
+                vm.tier_stats.native_feedback_probes += 1;
                 observed =
                     vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                         registers[v.0].value()
@@ -353,18 +363,21 @@ impl Context<'_> {
                 self.rooted.push(result.0);
             }
             vm.stack[self.base + result.0] = Some(value);
-            let function = self.function.borrow();
-            let mut profile = function.profile.borrow_mut();
-            let site = &mut profile.sites[instruction.origin.0];
-            if observed {
-                site.result
-                    .observe(crate::profile::ValueKind::of(&vm.heap, value));
-            }
-            if matches!(
+            let scalar = matches!(
                 instruction.operation,
                 Operation::BoxInt(_) | Operation::BoxFloat(_) | Operation::BoxBool(_)
-            ) {
-                site.fast_paths = site.fast_paths.saturating_add(1);
+            );
+            if observed || scalar {
+                let function = self.function.borrow();
+                let mut profile = function.profile.borrow_mut();
+                let site = &mut profile.sites[instruction.origin.0];
+                if observed {
+                    site.result
+                        .observe(crate::profile::ValueKind::of(&vm.heap, value));
+                }
+                if scalar {
+                    site.fast_paths = site.fast_paths.saturating_add(1);
+                }
             }
         }
         vm.maybe_collect()
