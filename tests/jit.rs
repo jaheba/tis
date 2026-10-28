@@ -229,7 +229,7 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
     f.terminate(block, Terminator::Return(add));
     let mut vm = Vm::new();
     vm.profiling = tis::profile::ProfileConfig::eager();
-    let list = vm.heap.allocate(Object::List(vec![Value::Int(0)]));
+    let list = vm.heap.allocate(Object::List(vec![Value::Int(0)].into()));
     let pin = vm.pin(list).unwrap();
     for _ in 0..10 {
         vm.run(&mut f, &[list, Value::Int(1), Value::Int(2)])

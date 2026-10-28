@@ -11,7 +11,7 @@ use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
     types,
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::{cell::RefCell, fmt, rc::Rc};
@@ -103,11 +103,13 @@ impl NativeCode {
         let mut builder_context = FunctionBuilderContext::new();
         {
             let mut b = FunctionBuilder::new(&mut context.func, &mut builder_context);
+            let scalars = ScalarVars::new(&mut b, &owner.lir.registers);
             let entry = b.create_block();
             b.switch_to_block(entry);
             b.append_block_params_for_function_params(entry);
             let params = b.block_params(entry).to_vec();
             let (host, registers, start) = (params[0], params[1], params[2]);
+            scalars.initialize(&mut b, registers, &owner.lir)?;
             let callback_ref = module.declare_func_in_func(callback_id, b.func);
             let power_ref = module.declare_func_in_func(power_id, b.func);
             let blocks = (0..owner.lir.blocks.len())
@@ -142,6 +144,70 @@ impl NativeCode {
                     }
                     let destination = instruction.result;
                     match &instruction.operation {
+                        Operation::FloatListView { .. } => call(
+                            &mut b,
+                            callback_ref,
+                            host,
+                            registers,
+                            FLOAT_VIEW,
+                            location,
+                            failed,
+                        ),
+                        Operation::FloatListLoad {
+                            view,
+                            index,
+                            failure,
+                        }
+                        | Operation::FloatListStore {
+                            view,
+                            index,
+                            failure,
+                            ..
+                        } => {
+                            let pointer =
+                                load_cached(&mut b, &scalars, registers, *view, 8, types::I64)?;
+                            let len =
+                                load_cached(&mut b, &scalars, registers, *view, 16, types::I64)?;
+                            let index = if *index < 0 {
+                                b.ins().iadd_imm_s(len, *index)
+                            } else {
+                                b.ins().iconst(types::I64, *index)
+                            };
+                            let valid = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
+                            guard(&mut b, valid, *failure);
+                            let offset = b.ins().ishl_imm_u(index, 3);
+                            let pointer = b.ins().iadd(pointer, offset);
+                            if let Operation::FloatListStore { value, .. } = &instruction.operation
+                            {
+                                let value = load_cached(
+                                    &mut b,
+                                    &scalars,
+                                    registers,
+                                    *value,
+                                    8,
+                                    types::F64,
+                                )?;
+                                b.ins().store(MemFlagsData::new(), value, pointer, 0);
+                                store_constant(
+                                    &mut b,
+                                    registers,
+                                    destination.unwrap(),
+                                    Slot::boxed(Value::None),
+                                )?;
+                            } else {
+                                let value =
+                                    b.ins().load(types::F64, MemFlagsData::new(), pointer, 0);
+                                let bits = b.ins().bitcast(types::I64, MemFlagsData::new(), value);
+                                store_scalar_cached(
+                                    &mut b,
+                                    &scalars,
+                                    registers,
+                                    destination.unwrap(),
+                                    FLOAT,
+                                    bits,
+                                )?;
+                            }
+                        }
                         Operation::SequenceUnpack { count, .. } if !feedback => {
                             unpack_reads = *count;
                             call(
@@ -181,7 +247,8 @@ impl NativeCode {
                         }
                         Operation::GuardInt { value, exit }
                         | Operation::GuardFloat { value, exit } => {
-                            let tag = load(&mut b, registers, *value, 0, types::I64)?;
+                            let tag =
+                                load_cached(&mut b, &scalars, registers, *value, 0, types::I64)?;
                             let expected =
                                 if matches!(instruction.operation, Operation::GuardInt { .. }) {
                                     INT
@@ -196,7 +263,8 @@ impl NativeCode {
                         | Operation::BoxInt(value)
                         | Operation::BoxFloat(value)
                         | Operation::BoxBool(value) => {
-                            let bits = load(&mut b, registers, *value, 8, types::I64)?;
+                            let bits =
+                                load_cached(&mut b, &scalars, registers, *value, 8, types::I64)?;
                             let tag = match instruction.operation {
                                 Operation::UnboxInt(_) => RAW_INT,
                                 Operation::UnboxFloat(_) => RAW_FLOAT,
@@ -204,27 +272,50 @@ impl NativeCode {
                                 Operation::BoxFloat(_) => FLOAT,
                                 _ => BOOL,
                             };
-                            store_scalar(&mut b, registers, destination.unwrap(), tag, bits)?;
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                tag,
+                                bits,
+                            )?;
                         }
                         Operation::IntToFloat(value) => {
-                            let value = load(&mut b, registers, *value, 8, types::I64)?;
+                            let value =
+                                load_cached(&mut b, &scalars, registers, *value, 8, types::I64)?;
                             let converted = b.ins().fcvt_from_sint(types::F64, value);
-                            store_float(&mut b, registers, destination.unwrap(), converted)?;
+                            store_float_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                converted,
+                            )?;
                         }
                         Operation::CheckedAdd {
                             left,
                             right,
                             overflow,
                         } => {
-                            let left = load(&mut b, registers, *left, 8, types::I64)?;
-                            let right = load(&mut b, registers, *right, 8, types::I64)?;
+                            let left =
+                                load_cached(&mut b, &scalars, registers, *left, 8, types::I64)?;
+                            let right =
+                                load_cached(&mut b, &scalars, registers, *right, 8, types::I64)?;
                             let sum = b.ins().iadd(left, right);
                             let x = b.ins().bxor(left, sum);
                             let y = b.ins().bxor(right, sum);
                             let both = b.ins().band(x, y);
                             let safe = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, both, 0);
                             guard(&mut b, safe, *overflow);
-                            store_scalar(&mut b, registers, destination.unwrap(), RAW_INT, sum)?;
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                RAW_INT,
+                                sum,
+                            )?;
                         }
                         Operation::FloatBinary {
                             operator,
@@ -232,8 +323,10 @@ impl NativeCode {
                             right,
                             failure,
                         } => {
-                            let left = load(&mut b, registers, *left, 8, types::F64)?;
-                            let right = load(&mut b, registers, *right, 8, types::F64)?;
+                            let left =
+                                load_cached(&mut b, &scalars, registers, *left, 8, types::F64)?;
+                            let right =
+                                load_cached(&mut b, &scalars, registers, *right, 8, types::F64)?;
                             let result = match operator {
                                 FloatOperator::Add => b.ins().fadd(left, right),
                                 FloatOperator::Subtract => b.ins().fsub(left, right),
@@ -258,15 +351,23 @@ impl NativeCode {
                                     result
                                 }
                             };
-                            store_float(&mut b, registers, destination.unwrap(), result)?;
+                            store_float_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                result,
+                            )?;
                         }
                         Operation::FloatCompare {
                             operator,
                             left,
                             right,
                         } => {
-                            let left = load(&mut b, registers, *left, 8, types::F64)?;
-                            let right = load(&mut b, registers, *right, 8, types::F64)?;
+                            let left =
+                                load_cached(&mut b, &scalars, registers, *left, 8, types::F64)?;
+                            let right =
+                                load_cached(&mut b, &scalars, registers, *right, 8, types::F64)?;
                             let cc = match operator.as_str() {
                                 "==" => FloatCC::Equal,
                                 "!=" => FloatCC::NotEqual,
@@ -278,10 +379,18 @@ impl NativeCode {
                             };
                             let compared = b.ins().fcmp(cc, left, right);
                             let bits = b.ins().uextend(types::I64, compared);
-                            store_scalar(&mut b, registers, destination.unwrap(), RAW_BOOL, bits)?;
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                RAW_BOOL,
+                                bits,
+                            )?;
                         }
                         Operation::Truth { value, .. } => {
-                            let tag = load(&mut b, registers, *value, 0, types::I64)?;
+                            let tag =
+                                load_cached(&mut b, &scalars, registers, *value, 0, types::I64)?;
                             let scalar = b.ins().icmp_imm_s(
                                 IntCC::UnsignedLessThanOrEqual,
                                 tag,
@@ -292,7 +401,8 @@ impl NativeCode {
                             let done = b.create_block();
                             b.ins().brif(scalar, fast, &[], slow, &[]);
                             b.switch_to_block(fast);
-                            let bits = load(&mut b, registers, *value, 8, types::I64)?;
+                            let bits =
+                                load_cached(&mut b, &scalars, registers, *value, 8, types::I64)?;
                             let float = b.ins().icmp_imm_s(IntCC::Equal, tag, FLOAT as i64);
                             // Ignore the sign bit so both floating-point zeros are false, while NaNs stay true.
                             let magnitude = b.ins().ishl_imm_u(bits, 1);
@@ -301,7 +411,14 @@ impl NativeCode {
                             let not_none = b.ins().icmp_imm_s(IntCC::NotEqual, tag, NONE as i64);
                             let truth = b.ins().band(nonzero, not_none);
                             let truth = b.ins().uextend(types::I64, truth);
-                            store_scalar(&mut b, registers, destination.unwrap(), RAW_BOOL, truth)?;
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                RAW_BOOL,
+                                truth,
+                            )?;
                             b.ins().jump(done, &[]);
                             b.switch_to_block(slow);
                             call(
@@ -313,6 +430,16 @@ impl NativeCode {
                                 location,
                                 failed,
                             );
+                            let value =
+                                load(&mut b, registers, destination.unwrap(), 8, types::I64)?;
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                RAW_BOOL,
+                                value,
+                            )?;
                             b.ins().jump(done, &[]);
                             b.switch_to_block(done);
                         }
@@ -325,6 +452,28 @@ impl NativeCode {
                             location,
                             failed,
                         ),
+                    }
+                    if !feedback
+                        && let Operation::FloatListLoad { view, .. }
+                        | Operation::FloatListStore { view, .. } = &instruction.operation
+                    {
+                        let sample =
+                            load_cached(&mut b, &scalars, registers, *view, 24, types::I64)?;
+                        let record = b.create_block();
+                        let done = b.create_block();
+                        b.ins().brif(sample, record, &[], done, &[]);
+                        b.switch_to_block(record);
+                        call(
+                            &mut b,
+                            callback_ref,
+                            host,
+                            registers,
+                            FINISH,
+                            location,
+                            failed,
+                        );
+                        b.ins().jump(done, &[]);
+                        b.switch_to_block(done);
                     }
                     // Arithmetic/constant results are primitive; eager diagnostics retain their finish callbacks.
                     if feedback
@@ -360,17 +509,18 @@ impl NativeCode {
                         b.ins().return_(&[status]);
                     }
                     Terminator::Jump(edge) => {
-                        edge_jump(&mut b, registers, &owner.lir, edge, &blocks)?;
+                        edge_jump(&mut b, &scalars, registers, &owner.lir, edge, &blocks)?;
                     }
                     Terminator::Branch { condition, yes, no } => {
-                        let condition = load(&mut b, registers, *condition, 8, types::I64)?;
+                        let condition =
+                            load_cached(&mut b, &scalars, registers, *condition, 8, types::I64)?;
                         let yes_block = b.create_block();
                         let no_block = b.create_block();
                         b.ins().brif(condition, yes_block, &[], no_block, &[]);
                         b.switch_to_block(yes_block);
-                        edge_jump(&mut b, registers, &owner.lir, yes, &blocks)?;
+                        edge_jump(&mut b, &scalars, registers, &owner.lir, yes, &blocks)?;
                         b.switch_to_block(no_block);
-                        edge_jump(&mut b, registers, &owner.lir, no, &blocks)?;
+                        edge_jump(&mut b, &scalars, registers, &owner.lir, no, &blocks)?;
                     }
                 }
             }
@@ -505,6 +655,7 @@ fn copy_slots(
 }
 fn edge_jump(
     b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
     registers: ir::Value,
     lir: &lir::Function,
     edge: &lir::Edge,
@@ -516,7 +667,19 @@ fn edge_jump(
         .copied()
         .zip(lir.blocks[edge.block.0].parameters.iter().copied())
         .collect::<Vec<_>>();
-    copy_slots(b, registers, &pairs)?;
+    let mut values = vec![];
+    let mut boxed = vec![];
+    for (from, to) in pairs {
+        if lir.registers[to.0] == lir::Type::F64 {
+            values.push((to, load_cached(b, scalars, registers, from, 8, types::F64)?));
+        } else {
+            boxed.push((from, to));
+        }
+    }
+    copy_slots(b, registers, &boxed)?;
+    for (to, value) in values {
+        b.def_var(scalars.0[to.0].unwrap().0, value);
+    }
     b.ins().jump(blocks[edge.block.0], &[]);
     Ok(())
 }
@@ -545,4 +708,97 @@ fn call(
     let next = b.create_block();
     b.ins().brif(status, failed, &[], next, &[]);
     b.switch_to_block(next);
+}
+
+struct ScalarVars(Vec<Option<(Variable, ir::Type)>>);
+impl ScalarVars {
+    fn new(b: &mut FunctionBuilder<'_>, types: &[lir::Type]) -> Self {
+        Self(
+            types
+                .iter()
+                .map(|ty| match ty {
+                    lir::Type::F64 => Some((b.declare_var(types::F64), types::F64)),
+                    lir::Type::I64 | lir::Type::Bool => {
+                        Some((b.declare_var(types::I64), types::I64))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+    fn initialize(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        registers: ir::Value,
+        lir: &lir::Function,
+    ) -> Result<()> {
+        // Dispatch can enter an OSR header directly. Its actual primitive definitions execute in that header.
+        for (index, entry) in self.0.iter().enumerate() {
+            let Some(&(var, ty)) = entry.as_ref() else {
+                continue;
+            };
+            let zero = if lir.scalar_sources.contains_key(&Register(index)) {
+                load(b, registers, Register(index), 8, types::F64)?
+            } else if ty == types::F64 {
+                b.ins().f64const(0.0)
+            } else {
+                b.ins().iconst(ty, 0)
+            };
+            b.def_var(var, zero);
+        }
+        Ok(())
+    }
+}
+fn load_cached(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    registers: ir::Value,
+    register: Register,
+    field: i32,
+    ty: ir::Type,
+) -> Result<ir::Value> {
+    if field == 8
+        && let Some((var, source)) = scalars.0.get(register.0).copied().flatten()
+    {
+        let value = b.use_var(var);
+        return Ok(if source == ty {
+            value
+        } else {
+            b.ins().bitcast(ty, MemFlagsData::new(), value)
+        });
+    }
+    load(b, registers, register, field, ty)
+}
+fn store_scalar_cached(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    registers: ir::Value,
+    register: Register,
+    tag: u64,
+    value: ir::Value,
+) -> Result<()> {
+    if let Some((var, ty)) = scalars.0.get(register.0).copied().flatten() {
+        let value = if ty == types::F64 {
+            b.ins().bitcast(ty, MemFlagsData::new(), value)
+        } else {
+            value
+        };
+        b.def_var(var, value);
+        return Ok(());
+    }
+    store_scalar(b, registers, register, tag, value)
+}
+fn store_float_cached(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    registers: ir::Value,
+    register: Register,
+    value: ir::Value,
+) -> Result<()> {
+    if let Some((var, ty)) = scalars.0.get(register.0).copied().flatten() {
+        debug_assert_eq!(ty, types::F64);
+        b.def_var(var, value);
+        return Ok(());
+    }
+    store_float(b, registers, register, value)
 }

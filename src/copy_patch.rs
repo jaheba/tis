@@ -123,6 +123,37 @@ impl Plan {
                     ..Patch::default()
                 };
                 let stencil = match &instruction.operation {
+                    Operation::FloatListView { .. } => {
+                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.event = FLOAT_VIEW;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        "callback"
+                    }
+                    Operation::FloatListLoad {
+                        view,
+                        index,
+                        failure,
+                    }
+                    | Operation::FloatListStore {
+                        view,
+                        index,
+                        failure,
+                        ..
+                    } => {
+                        p.left = slot(*view)?;
+                        p.a = *index as u64;
+                        p.status = failure.0 as u64 + 1;
+                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.event = FINISH;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        p.tag = (!feedback) as u64;
+                        if let Operation::FloatListStore { value, .. } = &instruction.operation {
+                            p.right = slot(*value)?;
+                            "float_store"
+                        } else {
+                            "float_load"
+                        }
+                    }
                     Operation::SequenceUnpack { count, .. } if !feedback => {
                         unpack_reads = *count;
                         p.callback = native_runtime::callback as *const u8 as usize;
@@ -490,7 +521,7 @@ mod tests {
     use super::*;
     #[test]
     fn stencil_library_contains_offline_code() {
-        assert_eq!(generated::STENCILS.len(), 22);
+        assert_eq!(generated::STENCILS.len(), 24);
         assert!(
             generated::STENCILS
                 .iter()

@@ -194,7 +194,9 @@ impl Vm {
                             arguments.push(self.read(base, *input)?);
                         }
                         match op {
-                            Opcode::List => self.heap.allocate(Object::List(arguments.clone())),
+                            Opcode::List => {
+                                self.heap.allocate(Object::List(arguments.clone().into()))
+                            }
                             Opcode::Tuple => self.heap.allocate(Object::Tuple(arguments.clone())),
                             Opcode::Dict => {
                                 let dict = self.heap.allocate(Object::Dict(vec![]));

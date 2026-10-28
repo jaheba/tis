@@ -9,11 +9,13 @@ pub(crate) const RAW_FLOAT: u64 = 6;
 pub(crate) const RAW_BOOL: u64 = 7;
 pub(crate) const EMPTY: u64 = 8;
 pub(crate) const UNBOUND: u64 = 9;
+pub(crate) const FLOAT_VIEW_TAG: u64 = 10;
 pub(crate) const ENTER: i32 = 1;
 pub(crate) const HELPER: i32 = 2;
 pub(crate) const FINISH: i32 = 3;
 pub(crate) const SEQUENCE: i32 = 4;
 pub(crate) const UNPACK_BATCH: i32 = 5;
+pub(crate) const FLOAT_VIEW: i32 = 6;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Slot {

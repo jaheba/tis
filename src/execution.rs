@@ -34,7 +34,14 @@ fn error(message: impl Into<String>) -> Error {
 
 pub(crate) fn children(object: &Object) -> Vec<Value> {
     match object {
-        Object::List(values) | Object::Tuple(values) | Object::Set(values) => values.clone(),
+        Object::List(values) => {
+            if values.is_float() {
+                vec![]
+            } else {
+                values.to_vec()
+            }
+        }
+        Object::Tuple(values) | Object::Set(values) => values.clone(),
         Object::Enumerate { iterator, .. } => vec![*iterator],
         Object::Zip { iterators, .. } => iterators.clone(),
         Object::Dict(values) => values.iter().map(|(_, value)| *value).collect(),
@@ -393,9 +400,9 @@ impl Vm {
                 if items.len() < before + after {
                     return Err(error("ValueError: not enough values to unpack"));
                 }
-                let middle = self
-                    .heap
-                    .allocate(Object::List(items[*before..items.len() - after].to_vec()));
+                let middle = self.heap.allocate(Object::List(
+                    items[*before..items.len() - after].to_vec().into(),
+                ));
                 let result = items[..*before]
                     .iter()
                     .copied()
@@ -553,7 +560,7 @@ impl Vm {
                         if items.len() != *count {
                             return Err(error("ValueError: unpacking length mismatch"));
                         }
-                        items.clone()
+                        items.to_vec()
                     }
                     _ => self.collect_iter(values[0])?,
                 };
@@ -906,7 +913,7 @@ impl Vm {
                     self.collect_iter(args[0])?
                 };
                 match name {
-                    "list" => self.heap.allocate(Object::List(items)),
+                    "list" => self.heap.allocate(Object::List(items.into())),
                     "tuple" => self.heap.allocate(Object::Tuple(items)),
                     _ => {
                         let set = self.heap.allocate(Object::Set(vec![]));
@@ -1087,7 +1094,7 @@ impl Vm {
                         }
                     }
                 }
-                let list = self.heap.allocate(Object::List(items));
+                let list = self.heap.allocate(Object::List(items.into()));
                 if name == "reversed" {
                     self.iter(list)?
                 } else {
@@ -1371,7 +1378,8 @@ impl Vm {
                             parts
                                 .into_iter()
                                 .map(|s| text_heap(&self.heap, s))
-                                .collect(),
+                                .collect::<Vec<_>>()
+                                .into(),
                         ))
                     }
                     "upper" | "lower" | "strip" => {
@@ -1516,9 +1524,9 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
         i += step;
     }
     Ok(match heap.get(object)? {
-        Object::List(items) => {
-            heap.allocate(Object::List(indices.iter().map(|&i| items[i]).collect()))
-        }
+        Object::List(items) => heap.allocate(Object::List(
+            indices.iter().map(|&i| items[i]).collect::<Vec<_>>().into(),
+        )),
         Object::Tuple(items) => {
             heap.allocate(Object::Tuple(indices.iter().map(|&i| items[i]).collect()))
         }
@@ -1619,7 +1627,7 @@ fn repeat(heap: &Heap, value: Value, n: i64) -> Result<Value> {
     let n = usize::try_from(n.max(0)).map_err(|_| Error::IntegerOverflow)?;
     Ok(match heap.get(value)? {
         Object::String(s) => text_heap(heap, s.repeat(n)),
-        Object::List(items) => heap.allocate(Object::List(items.repeat(n))),
+        Object::List(items) => heap.allocate(Object::List(items.repeat(n).into())),
         Object::Tuple(items) => heap.allocate(Object::Tuple(items.repeat(n))),
         _ => return Err(Error::Type("unsupported multiplication")),
     })
@@ -1641,7 +1649,9 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
     if let (Value::Ref(_), Value::Ref(_)) = (a, b) {
         match (heap.get(a)?, heap.get(b)?) {
             (Object::String(a), Object::String(b)) => return Ok(a == b),
-            (Object::List(a), Object::List(b)) | (Object::Tuple(a), Object::Tuple(b)) => {
+            (a @ Object::List(_), b @ Object::List(_))
+            | (a @ Object::Tuple(_), b @ Object::Tuple(_)) => {
+                let (a, b) = (a.values().unwrap(), b.values().unwrap());
                 if a.len() != b.len() {
                     return Ok(false);
                 }
@@ -1701,7 +1711,8 @@ fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool> {
                     let key = heap.key(a)?;
                     items.iter().any(|(k, _)| *k == key)
                 }
-                Object::List(items) | Object::Tuple(items) | Object::Set(items) => {
+                object @ (Object::List(_) | Object::Tuple(_) | Object::Set(_)) => {
+                    let items = object.values().unwrap();
                     let mut found = false;
                     for &item in items {
                         if equal(heap, a, item, 0)? {
@@ -1795,7 +1806,8 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
                         s.clone()
                     }
                 }
-                Object::List(items) | Object::Tuple(items) | Object::Set(items) => {
+                object @ (Object::List(_) | Object::Tuple(_) | Object::Set(_)) => {
+                    let items = object.values().unwrap();
                     let parts = items
                         .iter()
                         .map(|&v| render(heap, v, true, active))
@@ -1884,8 +1896,9 @@ fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cm
     }
     match (heap.get(a), heap.get(b)) {
         (Ok(Object::String(a)), Ok(Object::String(b))) => Ok(Some(a.cmp(b))),
-        (Ok(Object::List(a)), Ok(Object::List(b)))
-        | (Ok(Object::Tuple(a)), Ok(Object::Tuple(b))) => {
+        (Ok(a @ Object::List(_)), Ok(b @ Object::List(_)))
+        | (Ok(a @ Object::Tuple(_)), Ok(b @ Object::Tuple(_))) => {
+            let (a, b) = (a.values().unwrap(), b.values().unwrap());
             for (&a, &b) in a.iter().zip(b) {
                 if !equal(heap, a, b, depth + 1)? {
                     return order(heap, a, b, depth + 1);

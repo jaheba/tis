@@ -234,6 +234,66 @@ pub unsafe extern "C" fn tis_stencil_truth(
         next(ctx, slots, p)
     }
 }
+#[inline(always)]
+unsafe fn float_element(slots: *mut Slot, p: &Patch) -> Option<*mut f64> {
+    let view = unsafe { read(slots, p.left) };
+    let index = if (p.a as i64) < 0 {
+        view.b.wrapping_add(p.a)
+    } else {
+        p.a
+    };
+    if index >= view.b {
+        return None;
+    }
+    // View creation validates contiguous float storage; verification bounds its lifetime to a call-free block region.
+    Some(unsafe { (view.a as *mut f64).add(index as usize) })
+}
+#[inline(always)]
+unsafe fn float_feedback(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> bool {
+    if p.tag != 0 && unsafe { read(slots, p.left) }.c != 0 {
+        let callback: extern "C" fn(*mut c_void, *mut Slot, i32, i32) -> i32 =
+            unsafe { std::mem::transmute(p.callback) };
+        return callback(ctx, slots, p.event, p.location) == 0;
+    }
+    true
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_float_load(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        let Some(element) = float_element(slots, p) else {
+            return p.status;
+        };
+        write(slots, p.dst, scalar(FLOAT, element.read().to_bits()));
+        if !float_feedback(ctx, slots, p) {
+            return u64::MAX;
+        }
+        next(ctx, slots, p)
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_float_store(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        let Some(element) = float_element(slots, p) else {
+            return p.status;
+        };
+        element.write(f64::from_bits(read(slots, p.right).a));
+        write(slots, p.dst, scalar(NONE, 0));
+        if !float_feedback(ctx, slots, p) {
+            return u64::MAX;
+        }
+        next(ctx, slots, p)
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tis_stencil_branch(
     ctx: *mut c_void,

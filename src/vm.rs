@@ -545,7 +545,7 @@ impl Vm {
                         .map(|value| value.ok_or(Error::InvalidIr("empty operand")))
                         .collect::<Result<Vec<_>>>()?;
                     let result = match opcode {
-                        Opcode::List => self.heap.allocate(Object::List(values)),
+                        Opcode::List => self.heap.allocate(Object::List(values.into())),
                         Opcode::Tuple => self.heap.allocate(Object::Tuple(values)),
                         _ => {
                             let result = self.heap.allocate(Object::Dict(Vec::new()));

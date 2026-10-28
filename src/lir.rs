@@ -21,6 +21,7 @@ pub struct Register(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Boxed,
+    FloatView,
     I64,
     F64,
     Bool,
@@ -111,6 +112,21 @@ pub enum SequenceIndex {
 }
 #[derive(Debug, Clone)]
 pub enum Operation {
+    FloatListView {
+        value: Register,
+        failure: ExitId,
+    },
+    FloatListLoad {
+        view: Register,
+        index: i64,
+        failure: ExitId,
+    },
+    FloatListStore {
+        view: Register,
+        index: i64,
+        value: Register,
+        failure: ExitId,
+    },
     SequenceUnpack {
         value: Register,
         kind: SequenceKind,
@@ -214,6 +230,9 @@ pub struct Function {
     /// Boxed registers correspond directly to interpreter frame slots.
     pub hir_values: Vec<Register>,
     pub local_count: usize,
+    /// Primitive loop parameters and entry-invariant scalars retain boxed sources for OSR reconstruction.
+    pub scalar_sources: BTreeMap<Register, Register>,
+    pub scalar_entries: BTreeMap<BlockId, ExitId>,
 }
 
 impl Function {
@@ -230,12 +249,69 @@ impl Function {
             osr_entries: vec![],
             hir_values: (0..hir.value_count).map(Register).collect(),
             local_count: hir.local_slots.len(),
+            scalar_sources: BTreeMap::new(),
+            scalar_entries: BTreeMap::new(),
         };
+        let mut float_values = BTreeSet::new();
+        let mut float_params = BTreeSet::new();
+        if mode == LoweringMode::Profiled {
+            for (block_id, body) in hir.blocks.iter().enumerate() {
+                if block_id != 0 {
+                    float_params.extend(body.parameters.iter().copied());
+                }
+                for instruction in &body.instructions {
+                    if matches!(instruction.op, hir::Op::Constant(Constant::Float(_)))
+                        || profile.site(instruction.result).is_some_and(|s| {
+                            s.executions > 0 && s.result.monomorphic() == Some(ValueKind::Float)
+                        })
+                    {
+                        float_values.insert(instruction.result);
+                    }
+                }
+            }
+            loop {
+                let before = float_params.clone();
+                for body in &hir.blocks {
+                    let edges: Vec<_> = match body.terminator.as_ref().unwrap() {
+                        hir::Terminator::Jump(e) => vec![e],
+                        hir::Terminator::Branch { yes, no, .. } => vec![yes, no],
+                        _ => vec![],
+                    };
+                    for edge in edges {
+                        for (&source, &target) in edge
+                            .arguments
+                            .iter()
+                            .zip(&hir.blocks[edge.block.0].parameters)
+                        {
+                            if !float_values.contains(&source) && !float_params.contains(&source) {
+                                float_params.remove(&target);
+                            }
+                        }
+                    }
+                }
+                if before == float_params {
+                    break;
+                }
+            }
+        }
+        let mut typed_params = BTreeMap::new();
+        for value in &float_params {
+            let scalar = output.register(Type::F64);
+            typed_params.insert(*value, scalar);
+            output.scalar_sources.insert(scalar, Register(value.0));
+        }
+        let mut globals = BTreeMap::new();
         for (block_id, body) in hir.blocks.iter().enumerate() {
             let mut instructions = vec![];
             let mut sequences = BTreeMap::<hir::ValueId, SequenceKind>::new();
+            let mut views = BTreeMap::<hir::ValueId, Register>::new();
             // Scalar SSA values survive helper calls; their boxed shadows still support frame reconstruction.
-            let mut scalars = BTreeMap::<hir::ValueId, (ValueKind, Register)>::new();
+            let mut scalars = globals.clone();
+            scalars.extend(
+                typed_params
+                    .iter()
+                    .map(|(v, r)| (*v, (ValueKind::Float, *r))),
+            );
             for (index, instruction) in body.instructions.iter().enumerate() {
                 let origin = instruction.result;
                 let result = Register(origin.0);
@@ -258,6 +334,100 @@ impl Function {
                         },
                     })
                 };
+                let typed = match &instruction.op {
+                    hir::Op::GetItem(source, key) => Some((*source, *key, None)),
+                    hir::Op::SetItem { object, key, value } => Some((*object, *key, Some(*value))),
+                    _ => None,
+                }
+                .and_then(|(source, key, value)| {
+                    let site = profile.site(origin)?;
+                    if mode != LoweringMode::Profiled
+                        || site.executions < hir::AddFeedback::WARMUP as u64
+                        || site.operands.first()?.monomorphic() != Some(ValueKind::List)
+                    {
+                        return None;
+                    }
+                    let hir::Op::Constant(Constant::Int(index)) = hir.instruction(key)?.op else {
+                        return None;
+                    };
+                    let float = if value.is_some() {
+                        site.operands.get(2)?.monomorphic()
+                    } else {
+                        site.result.monomorphic()
+                    };
+                    (float == Some(ValueKind::Float)).then_some((source, index, value))
+                });
+                if let Some((source, index, value)) = typed {
+                    let failure = output.exit(state, ExitReason::SequenceGuard);
+                    let view = if let Some(view) = views.get(&source) {
+                        *view
+                    } else {
+                        views.clear();
+                        let view = output.register(Type::FloatView);
+                        emit(
+                            &mut instructions,
+                            Some(view),
+                            Operation::FloatListView {
+                                value: Register(source.0),
+                                failure,
+                            },
+                        );
+                        views.insert(source, view);
+                        view
+                    };
+                    if let Some(value) = value {
+                        let scalar = if let Some(&(ValueKind::Float, reg)) = scalars.get(&value) {
+                            reg
+                        } else {
+                            let guard = output.exit(state, ExitReason::TypeGuard);
+                            emit(
+                                &mut instructions,
+                                None,
+                                Operation::GuardFloat {
+                                    value: Register(value.0),
+                                    exit: guard,
+                                },
+                            );
+                            let scalar = output.register(Type::F64);
+                            emit(
+                                &mut instructions,
+                                Some(scalar),
+                                Operation::UnboxFloat(Register(value.0)),
+                            );
+                            scalars.insert(value, (ValueKind::Float, scalar));
+                            scalar
+                        };
+                        emit(
+                            &mut instructions,
+                            Some(result),
+                            Operation::FloatListStore {
+                                view,
+                                index,
+                                value: scalar,
+                                failure,
+                            },
+                        );
+                    } else {
+                        emit(
+                            &mut instructions,
+                            Some(result),
+                            Operation::FloatListLoad {
+                                view,
+                                index,
+                                failure,
+                            },
+                        );
+
+                        let scalar = output.register(Type::F64);
+                        emit(
+                            &mut instructions,
+                            Some(scalar),
+                            Operation::UnboxFloat(result),
+                        );
+                        scalars.insert(origin, (ValueKind::Float, scalar));
+                    }
+                    continue;
+                }
                 let integer_add = mode == LoweringMode::Profiled
                     && matches!(instruction.op, hir::Op::Add(..))
                     && profile.site(origin).is_some_and(|site| {
@@ -357,6 +527,7 @@ impl Function {
                     _ => None,
                 };
                 if let Some(operation) = specialized {
+                    views.clear();
                     if let Operation::SequenceUnpack { kind, .. } = operation {
                         sequences.insert(origin, kind);
                     }
@@ -484,6 +655,7 @@ impl Function {
                     emit(&mut instructions, Some(result), Operation::BoxInt(sum));
                     scalars.insert(origin, (ValueKind::Int, sum));
                 } else if let hir::Op::Constant(Constant::String(text)) = &instruction.op {
+                    views.clear();
                     let roots = output.states[state.0]
                         .values
                         .iter()
@@ -507,6 +679,7 @@ impl Function {
                         Operation::Constant(constant.clone()),
                     );
                 } else {
+                    views.clear();
                     let helper = match &instruction.op {
                         hir::Op::Add(..) => Helper::Add,
                         hir::Op::Subtract(..) => Helper::Subtract,
@@ -548,6 +721,47 @@ impl Function {
                         },
                     );
                 }
+                if block_id == 0
+                    && float_values.contains(&origin)
+                    && !scalars.contains_key(&origin)
+                    && matches!(
+                        instruction.op,
+                        hir::Op::Constant(_) | hir::Op::Runtime(CoreOp::LoadLocal(_), _)
+                    )
+                {
+                    let live = if index + 1 < body.instructions.len() {
+                        &analysis.live_before[block_id][index + 1]
+                    } else {
+                        &analysis.live_terminator[block_id]
+                    };
+                    if live.contains(&origin) {
+                        let point = ResumePoint {
+                            block: BlockId(block_id),
+                            instruction: index + 1,
+                        };
+                        let state = output.state(hir, point, live);
+                        let guard = output.exit(state, ExitReason::TypeGuard);
+                        let scalar = output.register(Type::F64);
+                        instructions.push(Instruction {
+                            result: None,
+                            operation: Operation::GuardFloat {
+                                value: result,
+                                exit: guard,
+                            },
+                            origin,
+                            point,
+                        });
+                        instructions.push(Instruction {
+                            result: Some(scalar),
+                            operation: Operation::UnboxFloat(result),
+                            origin,
+                            point,
+                        });
+                        scalars.insert(origin, (ValueKind::Float, scalar));
+                        globals.insert(origin, (ValueKind::Float, scalar));
+                        output.scalar_sources.insert(scalar, result);
+                    }
+                }
                 if matches!(
                     instruction.op,
                     hir::Op::Runtime(CoreOp::Unpack(_) | CoreOp::UnpackStar(..), _)
@@ -555,9 +769,66 @@ impl Function {
                     sequences.entry(origin).or_insert(SequenceKind::Tuple);
                 }
             }
-            let edge = |edge: &hir::Edge| Edge {
-                block: edge.block,
-                arguments: edge.arguments.iter().map(|id| Register(id.0)).collect(),
+            let point = ResumePoint {
+                block: BlockId(block_id),
+                instruction: body.instructions.len(),
+            };
+            let mut edge_scalars = BTreeMap::new();
+            let outgoing: Vec<_> = match body.terminator.as_ref().unwrap() {
+                hir::Terminator::Jump(e) => vec![e],
+                hir::Terminator::Branch { yes, no, .. } => vec![yes, no],
+                _ => vec![],
+            };
+            for edge in outgoing {
+                for (&source, target) in edge
+                    .arguments
+                    .iter()
+                    .zip(&hir.blocks[edge.block.0].parameters)
+                {
+                    if !typed_params.contains_key(target) {
+                        continue;
+                    }
+                    let scalar = if let Some(&(ValueKind::Float, r)) = scalars.get(&source) {
+                        r
+                    } else {
+                        let state = output.state(hir, point, &analysis.live_terminator[block_id]);
+                        let failure = output.exit(state, ExitReason::TypeGuard);
+                        let scalar = output.register(Type::F64);
+                        instructions.push(Instruction {
+                            result: None,
+                            operation: Operation::GuardFloat {
+                                value: Register(source.0),
+                                exit: failure,
+                            },
+                            origin: source,
+                            point,
+                        });
+                        instructions.push(Instruction {
+                            result: Some(scalar),
+                            operation: Operation::UnboxFloat(Register(source.0)),
+                            origin: source,
+                            point,
+                        });
+                        scalars.insert(source, (ValueKind::Float, scalar));
+                        scalar
+                    };
+                    edge_scalars.insert(source, scalar);
+                }
+            }
+            let edge = |edge: &hir::Edge| {
+                let mut arguments: Vec<_> =
+                    edge.arguments.iter().map(|id| Register(id.0)).collect();
+                arguments.extend(
+                    edge.arguments
+                        .iter()
+                        .zip(&hir.blocks[edge.block.0].parameters)
+                        .filter(|(_, target)| typed_params.contains_key(target))
+                        .map(|(source, _)| edge_scalars[source]),
+                );
+                Edge {
+                    block: edge.block,
+                    arguments,
+                }
             };
             let terminator = match body.terminator.as_ref().unwrap() {
                 hir::Terminator::Return(id) => Terminator::Return(Register(id.0)),
@@ -589,10 +860,38 @@ impl Function {
                 }
             };
             output.blocks.push(Block {
-                parameters: body.parameters.iter().map(|id| Register(id.0)).collect(),
+                parameters: body
+                    .parameters
+                    .iter()
+                    .map(|id| Register(id.0))
+                    .chain(
+                        body.parameters
+                            .iter()
+                            .filter_map(|id| typed_params.get(id).copied()),
+                    )
+                    .collect(),
                 instructions,
                 terminator,
             });
+        }
+        for block in 0..hir.blocks.len() {
+            let live = &analysis.live_in[block];
+            if output
+                .scalar_sources
+                .values()
+                .any(|r| live.contains(&ValueId(r.0)))
+            {
+                let state = output.state(
+                    hir,
+                    ResumePoint {
+                        block: BlockId(block),
+                        instruction: 0,
+                    },
+                    live,
+                );
+                let exit = output.exit(state, ExitReason::TypeGuard);
+                output.scalar_entries.insert(BlockId(block), exit);
+            }
         }
         let headers = analysis
             .backedges
@@ -663,18 +962,92 @@ impl Function {
             state(exit.state)?;
             Ok(exit)
         };
+        for (raw, source) in &self.scalar_sources {
+            kind(*raw, Type::F64)?;
+            kind(*source, Type::Boxed)?;
+            if self.hir_values.get(source.0) != Some(source) {
+                return Err(fail());
+            }
+            let parameter = self.blocks.iter().any(|b| b.parameters.contains(raw));
+            if !parameter
+                && !self.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+                    i.result == Some(*raw)
+                        && matches!(i.operation,Operation::UnboxFloat(value) if value==*source)
+                })
+            {
+                return Err(fail());
+            }
+        }
+        for entry in &self.osr_entries {
+            let state = state(entry.state)?;
+            if self
+                .scalar_sources
+                .values()
+                .any(|source| state.values.iter().any(|(_, r)| r == source))
+                && !self.scalar_entries.contains_key(&entry.header)
+            {
+                return Err(fail());
+            }
+        }
+        for (block, id) in &self.scalar_entries {
+            let entry = exit(*id)?;
+            if block.0 >= self.blocks.len()
+                || entry.reason != ExitReason::TypeGuard
+                || state(entry.state)?.resume
+                    != (ResumePoint {
+                        block: *block,
+                        instruction: 0,
+                    })
+            {
+                return Err(fail());
+            }
+        }
         let mut definitions = BTreeSet::new();
         for body in &self.blocks {
             for &parameter in &body.parameters {
-                kind(parameter, Type::Boxed)?;
+                if self.registers.get(parameter.0) == Some(&Type::F64) {
+                    let source = self.scalar_sources.get(&parameter).ok_or_else(fail)?;
+                    if !body.parameters.contains(source) {
+                        return Err(fail());
+                    }
+                } else {
+                    kind(parameter, Type::Boxed)?;
+                }
                 if !definitions.insert(parameter) {
                     return Err(fail());
                 }
             }
             let mut guarded = BTreeMap::new();
-            let mut unboxed_sources = BTreeMap::new();
+            let mut unboxed_sources = self.scalar_sources.clone();
             for instruction in &body.instructions {
                 let expected = match &instruction.operation {
+                    Operation::FloatListView { value, failure } => {
+                        kind(*value, Type::Boxed)?;
+                        let snapshot = state(exit(*failure)?.state)?;
+                        if exit(*failure)?.reason != ExitReason::SequenceGuard
+                            || snapshot.resume != instruction.point
+                            || !snapshot.values.iter().any(|(_, r)| r == value)
+                        {
+                            return Err(fail());
+                        }
+                        Some(Type::FloatView)
+                    }
+                    Operation::FloatListLoad { view, failure, .. }
+                    | Operation::FloatListStore { view, failure, .. } => {
+                        kind(*view, Type::FloatView)?;
+                        if let Operation::FloatListStore { value, .. } = &instruction.operation {
+                            kind(*value, Type::F64)?;
+                        }
+                        if exit(*failure)?.reason != ExitReason::SequenceGuard
+                            || state(exit(*failure)?.state)?.resume != instruction.point
+                        {
+                            return Err(fail());
+                        }
+                        if matches!(instruction.operation, Operation::FloatListLoad { .. }) {
+                            guarded.insert(instruction.result.ok_or_else(fail)?, Type::F64);
+                        }
+                        Some(Type::Boxed)
+                    }
                     Operation::SequenceUnpack { failure, .. }
                     | Operation::SequenceGet { failure, .. } => {
                         let snapshot = state(exit(*failure)?.state)?;
@@ -910,8 +1283,19 @@ impl Function {
                 if edge.arguments.len() != target.parameters.len() {
                     return Err(fail());
                 }
-                for &arg in &edge.arguments {
-                    kind(arg, Type::Boxed)?;
+                for (&arg, param) in edge.arguments.iter().zip(&target.parameters) {
+                    kind(arg, *self.registers.get(param.0).ok_or_else(fail)?)?;
+                    if self.registers[param.0] == Type::F64 {
+                        let source = self.scalar_sources.get(param).ok_or_else(fail)?;
+                        let index = target
+                            .parameters
+                            .iter()
+                            .position(|r| r == source)
+                            .ok_or_else(fail)?;
+                        if unboxed_sources.get(&arg) != Some(&edge.arguments[index]) {
+                            return Err(fail());
+                        }
+                    }
                 }
                 Ok(())
             };
@@ -944,6 +1328,26 @@ impl Function {
                 kind(*register, Type::Boxed)?;
                 if self.hir_values.get(value.0) != Some(register) || !slots.insert(*value) {
                     return Err(fail());
+                }
+            }
+        }
+        // Raw float views are block-local and end before any callback that could access generic list storage.
+        for body in &self.blocks {
+            let mut active = None;
+            for instruction in &body.instructions {
+                match &instruction.operation {
+                    Operation::FloatListView { .. } => active = instruction.result,
+                    Operation::FloatListLoad { view, .. }
+                    | Operation::FloatListStore { view, .. } => {
+                        if active != Some(*view) {
+                            return Err(fail());
+                        }
+                    }
+                    Operation::Call { .. }
+                    | Operation::SequenceGet { .. }
+                    | Operation::SequenceUnpack { .. }
+                    | Operation::Truth { .. } => active = None,
+                    _ => {}
                 }
             }
         }
@@ -1123,6 +1527,9 @@ impl Function {
 impl Operation {
     fn inputs(&self) -> Vec<Register> {
         match self {
+            Self::FloatListView { value, .. } => vec![*value],
+            Self::FloatListLoad { view, .. } => vec![*view],
+            Self::FloatListStore { view, value, .. } => vec![*view, *value],
             Self::SequenceUnpack { value, .. } => vec![*value],
             Self::SequenceGet { value, index, .. } => match index {
                 SequenceIndex::Constant(_) => vec![*value],
@@ -1220,7 +1627,10 @@ impl Function {
                     | Operation::CheckedAdd { overflow: exit, .. } => {
                         Some(self.exits[exit.0].state)
                     }
-                    Operation::SequenceGet { failure, .. }
+                    Operation::FloatListView { failure, .. }
+                    | Operation::FloatListLoad { failure, .. }
+                    | Operation::FloatListStore { failure, .. }
+                    | Operation::SequenceGet { failure, .. }
                     | Operation::SequenceUnpack { failure, .. } => {
                         Some(self.exits[failure.0].state)
                     }

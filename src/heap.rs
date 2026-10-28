@@ -6,7 +6,7 @@ use std::{
 
 use crate::{Error, ObjectId, Result, Value};
 
-// These two modules are copied from Monty; the exception does not cover tis heap code.
+// These modules retain the copied storage invariants and stable arena addresses.
 #[allow(unsafe_code, dead_code)]
 #[rustfmt::skip]
 mod free_list;
@@ -44,7 +44,7 @@ pub enum Key {
 #[derive(Debug, Clone)]
 pub enum Object {
     String(String),
-    List(Vec<Value>),
+    List(crate::List),
     Tuple(Vec<Value>),
     Dict(Vec<(Key, Value)>),
     Set(Vec<Value>),
@@ -92,6 +92,16 @@ pub enum Object {
         source: Value,
         kind: String,
     },
+}
+
+impl Object {
+    pub(crate) fn values(&self) -> Option<&[Value]> {
+        match self {
+            Self::List(v) => Some(v),
+            Self::Tuple(v) | Self::Set(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -189,7 +199,8 @@ impl Heap {
     pub fn len(&self, value: Value) -> Result<usize> {
         Ok(match self.get(value)? {
             Object::String(value) => value.chars().count(),
-            Object::List(value) | Object::Tuple(value) => value.len(),
+            Object::List(value) => value.len(),
+            Object::Tuple(value) => value.len(),
             Object::Dict(value) => value.len(),
             Object::Set(value) => value.len(),
             Object::View { source, .. } => return self.len(*source),
@@ -205,7 +216,8 @@ impl Heap {
             return crate::execution::slice(self, object, key);
         }
         match self.get(object)? {
-            Object::List(items) | Object::Tuple(items) => Ok(items[index(key, items.len())?]),
+            Object::List(items) => items.value(index(key, items.len())?).ok_or(Error::Index),
+            Object::Tuple(items) => Ok(items[index(key, items.len())?]),
             Object::String(text) => {
                 let position = index(key, text.chars().count())?;
                 let character = text.chars().nth(position).ok_or(Error::Index)?;
@@ -235,7 +247,7 @@ impl Heap {
         match &mut *self.get_mut(object)? {
             Object::List(items) => {
                 let index = index(key, items.len())?;
-                items[index] = value;
+                items.set(index, value);
                 Ok(())
             }
             Object::Dict(items) => {
@@ -353,7 +365,8 @@ impl PartialEq for Object {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::String(a), Self::String(b)) => a == b,
-            (Self::List(a), Self::List(b)) | (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (Self::List(a), Self::List(b)) => a == b,
+            (Self::Tuple(a), Self::Tuple(b)) => a == b,
             (Self::Dict(a), Self::Dict(b)) => a == b,
             _ => false,
         }

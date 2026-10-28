@@ -57,8 +57,8 @@ fn frontend_rejects_unsupported_code() {
 fn collection_preserves_roots_and_reuses_slots_without_reviving_handles() {
     let mut heap = Heap::new();
     let child = heap.allocate(Object::String("child".into()));
-    let root = heap.allocate(Object::List(vec![child]));
-    let cycle = heap.allocate(Object::List(vec![Value::None]));
+    let root = heap.allocate(Object::List(vec![child].into()));
+    let cycle = heap.allocate(Object::List(vec![Value::None].into()));
     heap.set_item(cycle, Value::Int(0), cycle).unwrap();
     assert_eq!(heap.collect(&[root]).unwrap(), 1);
     assert!(heap.get(cycle).is_err());
@@ -67,7 +67,7 @@ fn collection_preserves_roots_and_reuses_slots_without_reviving_handles() {
     assert!(heap.get(cycle).is_err());
     assert!(heap.get(replacement).is_ok());
     assert!(heap.get(child).is_ok());
-    let foreign = Heap::new().allocate(Object::List(vec![]));
+    let foreign = Heap::new().allocate(Object::List(vec![].into()));
     assert!(heap.collect(&[foreign]).is_err());
     assert_eq!(heap.allocation_count(), 3);
     assert_eq!(heap.collect(&[]).unwrap(), 3);

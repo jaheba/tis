@@ -131,7 +131,9 @@ fn detached_side_exit_restores_local_values_and_rejects_wrong_layouts() {
         .iter()
         .find(|exit| exit.reason == ExitReason::TypeGuard)
         .unwrap();
-    let saved = vm.heap.allocate(tis::Object::List(vec![Value::Int(42)]));
+    let saved = vm
+        .heap
+        .allocate(tis::Object::List(vec![Value::Int(42)].into()));
     let locals = function
         .local_slots()
         .iter()

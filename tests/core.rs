@@ -177,11 +177,11 @@ fn item_assignment_preserves_aliases() {
     let result = function.append(entry, Op::GetItem(object, key));
     function.terminate(entry, Terminator::Return(result));
     let mut vm = Vm::new();
-    let list = vm.heap.allocate(Object::List(vec![Value::None]));
+    let list = vm.heap.allocate(Object::List(vec![Value::None].into()));
     assert_eq!(vm.run(&mut function, &[list]), Ok(Value::Int(42)));
     assert_eq!(
         vm.heap.get(list).unwrap(),
-        &Object::List(vec![Value::Int(42)])
+        &Object::List(vec![Value::Int(42)].into())
     );
 }
 
@@ -222,7 +222,7 @@ fn unicode_indexing_and_immutable_tuples() {
 #[test]
 fn heap_supports_cycles_without_reference_counting() {
     let mut heap = Heap::new();
-    let list = heap.allocate(Object::List(vec![Value::None]));
+    let list = heap.allocate(Object::List(vec![Value::None].into()));
     heap.set_item(list, Value::Int(0), list).unwrap();
     assert_eq!(heap.get_item(list, Value::Int(0)), Ok(list));
     assert_eq!(heap.allocation_count(), 1);

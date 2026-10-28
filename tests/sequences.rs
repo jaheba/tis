@@ -91,10 +91,12 @@ fn nested_unpack_errors_preserve_prefix_assignments_and_do_not_repeat_effects() 
             "calls=[0]\nassigned=[0]\ndef f(xs):\n    calls[0]+=1\n    assigned[0],(a,b)=xs\n    return a+b\nfor i in range(40):\n    assert f([1,[2,3]])==5\n",
             tier,
         );
-        let inner = vm.heap.allocate(tis::Object::List(vec![Value::Int(2)]));
+        let inner = vm
+            .heap
+            .allocate(tis::Object::List(vec![Value::Int(2)].into()));
         let outer = vm
             .heap
-            .allocate(tis::Object::List(vec![Value::Int(99), inner]));
+            .allocate(tis::Object::List(vec![Value::Int(99), inner].into()));
         let error = vm.call(vm.get_global("f").unwrap(), &[outer]).unwrap_err();
         assert!(error.to_string().contains("unpacking length mismatch"));
         assert_eq!(
@@ -129,7 +131,7 @@ fn indexed_reads_guard_current_kind_length_and_integer_index() {
             let source = vm.heap.allocate(if case == 0 {
                 tis::Object::Tuple(vec![Value::Int(10), Value::Int(20)])
             } else {
-                tis::Object::List(vec![Value::Int(10), Value::Int(20)])
+                tis::Object::List(vec![Value::Int(10), Value::Int(20)].into())
             });
             let result = vm.call(vm.get_global("f").unwrap(), &[source, index]);
             if case < 2 {

@@ -49,7 +49,9 @@ fn type_misses_record_feedback_and_preserve_container_inplace_behavior() {
         NumericMode::Adaptive,
     );
     warm(&mut vm, f, Value::Float(2.0), Value::Float(3.0));
-    let list = vm.heap.allocate(tis::Object::List(vec![Value::Int(7)]));
+    let list = vm
+        .heap
+        .allocate(tis::Object::List(vec![Value::Int(7)].into()));
     assert_eq!(vm.call(f, &[list, Value::Int(2)]).unwrap(), list);
     assert!(matches!(vm.heap.get(list).unwrap(), tis::Object::List(items) if items.len() == 2));
     assert_eq!(vm.tier_stats.numeric_type_misses, 1);

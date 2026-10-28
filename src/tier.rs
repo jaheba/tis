@@ -46,10 +46,13 @@ pub struct TierStats {
     pub native_root_syncs: u64,
     pub native_unpack_batches: u64,
     pub native_truth_fallbacks: u64,
+    pub native_float_views: u64,
+    pub native_float_view_failures: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {
     Boxed(Value),
+    FloatView(Value),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -103,11 +106,9 @@ impl Vm {
         }
         lir.verify()?;
         for block in &lir.blocks {
-            if block
-                .parameters
-                .iter()
-                .any(|register| register.0 >= function.value_count)
-            {
+            if block.parameters.iter().any(|register| {
+                lir.registers[register.0] == lir::Type::Boxed && register.0 >= function.value_count
+            }) {
                 return Err(Error::InvalidIr("invalid boxed LIR parameter"));
             }
             for instruction in &block.instructions {
@@ -159,6 +160,18 @@ impl Vm {
         for (index, value) in self.stack[base..frame_end].iter().enumerate() {
             registers[index] = value.map(Datum::Boxed);
         }
+        if let Some(exit) = lir.scalar_entries.get(&start) {
+            let state = &lir.states[lir.exits[exit.0].state.0];
+            for (raw, source) in &lir.scalar_sources {
+                if !state.values.iter().any(|(_, r)| r == source) {
+                    continue;
+                }
+                let Some(Datum::Boxed(Value::Float(value))) = registers[source.0] else {
+                    return self.lir_exit(function, lir, *exit, &registers);
+                };
+                registers[raw.0] = Some(Datum::Float(value));
+            }
+        }
         let read = |registers: &[Option<Datum>], r: Register| -> Result<Datum> {
             registers
                 .get(r.0)
@@ -187,6 +200,59 @@ impl Vm {
                 let mut observed = false;
                 let mut checkpoint = false;
                 let result = match &instruction.operation {
+                    Operation::FloatListView { value, failure } => {
+                        let source = read(&registers, *value)?.boxed()?;
+                        let valid = if matches!(source, Value::Ref(_)) {
+                            match &mut *self.heap.get_mut(source)? {
+                                Object::List(v) => v.float_view().is_some(),
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if !valid {
+                            return self.lir_exit(function, lir, *failure, &registers);
+                        }
+                        Some(Datum::FloatView(source))
+                    }
+                    Operation::FloatListLoad {
+                        view,
+                        index,
+                        failure,
+                    }
+                    | Operation::FloatListStore {
+                        view,
+                        index,
+                        failure,
+                        ..
+                    } => {
+                        let Datum::FloatView(source) = read(&registers, *view)? else {
+                            return Err(Error::InvalidIr("float view"));
+                        };
+                        let Object::List(list) = self.heap.get(source)? else {
+                            return Err(Error::InvalidIr("float list"));
+                        };
+                        let index = if *index < 0 {
+                            list.len() as i128 + i128::from(*index)
+                        } else {
+                            i128::from(*index)
+                        };
+                        let index = usize::try_from(index).ok().filter(|i| *i < list.len());
+                        let Some(index) = index else {
+                            return self.lir_exit(function, lir, *failure, &registers);
+                        };
+                        if let Operation::FloatListStore { value, .. } = &instruction.operation {
+                            let value = read(&registers, *value)?.float()?;
+                            self.heap.set_item(
+                                source,
+                                Value::Int(index as i64),
+                                Value::Float(value),
+                            )?;
+                            Some(Datum::Boxed(Value::None))
+                        } else {
+                            Some(Datum::Boxed(list.value(index).ok_or(Error::Index)?))
+                        }
+                    }
                     Operation::SequenceUnpack {
                         value,
                         kind,
@@ -415,10 +481,12 @@ impl Vm {
             let parameters = &lir.blocks[edge.block.0].parameters;
             for (&parameter, value) in parameters.iter().zip(args) {
                 registers[parameter.0] = Some(value);
-                if self.stack[base + parameter.0].is_none() {
-                    rooted.push(parameter.0);
+                if lir.registers[parameter.0] == lir::Type::Boxed {
+                    if self.stack[base + parameter.0].is_none() {
+                        rooted.push(parameter.0);
+                    }
+                    self.stack[base + parameter.0] = Some(value.boxed()?);
                 }
-                self.stack[base + parameter.0] = Some(value.boxed()?);
             }
             block = edge.block;
         }
@@ -540,7 +608,7 @@ impl Vm {
             Helper::Add => runtime::add(&mut self.heap, args[0], args[1])?,
             Helper::Subtract => runtime::subtract(args[0], args[1])?,
             Helper::Less => runtime::less(args[0], args[1])?,
-            Helper::List => self.heap.allocate(Object::List(args.to_vec())),
+            Helper::List => self.heap.allocate(Object::List(args.to_vec().into())),
             Helper::Tuple => self.heap.allocate(Object::Tuple(args.to_vec())),
             Helper::Dict => {
                 let dict = self.heap.allocate(Object::Dict(vec![]));

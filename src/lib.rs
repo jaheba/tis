@@ -5,6 +5,8 @@ mod error;
 mod execution;
 pub mod frontend;
 mod heap;
+mod list;
+pub use list::List;
 pub mod hir;
 pub mod lir;
 pub mod profile;

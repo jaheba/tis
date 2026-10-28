@@ -214,6 +214,13 @@ Their complete deoptimization states are retained, while their GC maps are empty
 Allocating or calling helpers retain full GC maps and publish roots before execution and collection afterwards.
 Generic iteration, calls, attributes and formatting retain conservative effects.
 The verifier rejects effects that understate a helper's requirements and checks each GC map against its effects.
+Homogeneous float lists use contiguous `f64` storage. Typed LIR guards their storage and bounds, then loads
+and stores elements directly. Views remain within one block and cannot survive calls, collection or shape mutation;
+the verifier enforces these boundaries. Generic mutations can widen a list back to mixed values.
+Float loop parameters have unboxed companions with boxed shadows for GC and deoptimization. Incoming edges and OSR
+entries check the observed types. Cranelift keeps primitive values in SSA across backedges; copy-and-patch still
+uses its register image. Typed indexed operations currently require constant integer indices.
+`TierStats.native_float_views` and `native_float_view_failures` count view acquisitions and storage guard failures.
 There is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
@@ -227,7 +234,7 @@ cargo run --release --example backend_compare
 ```
 
 `build.rs` invokes rustc once per target build to compile `src/copy_patch/stencils.rs` at optimization level 3.
-It extracts 22 self-contained function bodies from the object file into the executable's stencil library.
+It extracts 24 self-contained function bodies from the object file into the executable's stencil library.
 The build rejects external relocations and indirect non-tail continuations.
 The shared scalar module supplies float arithmetic and comparison semantics; Python helpers, GC and side exits
 use the same runtime bridge as Cranelift.

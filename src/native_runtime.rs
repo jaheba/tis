@@ -98,6 +98,26 @@ pub(crate) fn execute(
             registers[index] = Slot::boxed(*value);
         }
     }
+    let mut entry_failure = None;
+    if let Some(exit) = lir.scalar_entries.get(&crate::hir::BlockId(start)) {
+        let state = &lir.states[lir.exits[exit.0].state.0];
+        for (raw, source) in &lir.scalar_sources {
+            if !state.values.iter().any(|(_, r)| r == source) {
+                continue;
+            }
+            if let Value::Float(value) = registers[source.0].value()? {
+                registers[raw.0] = Slot {
+                    tag: RAW_FLOAT,
+                    a: value.to_bits(),
+                    b: 0,
+                    c: 0,
+                };
+            } else {
+                entry_failure = Some(*exit);
+                break;
+            }
+        }
+    }
     let rooted = vm.stack[base..frame_end]
         .iter()
         .enumerate()
@@ -117,11 +137,13 @@ pub(crate) fn execute(
         error: None,
         registers: registers.as_mut_ptr(),
         helper_arguments: Vec::new(),
-        side_exit: None,
+        side_exit: entry_failure,
     };
     // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
     // synchronous invocation. Generated memory offsets are bounds checked during emission.
-    let status = {
+    let status = if context.side_exit.is_some() {
+        u64::MAX
+    } else {
         invoke(
             (&mut context as *mut Context<'_>).cast(),
             registers.as_mut_ptr(),
@@ -250,6 +272,9 @@ impl Context<'_> {
         let vm = unsafe { &mut *self.vm };
         if event == ENTER {
             for parameter in &self.lir.blocks[location as usize].parameters {
+                if self.lir.registers[parameter.0] != lir::Type::Boxed {
+                    continue;
+                }
                 let value = registers[parameter.0].value()?;
                 if vm.stack[self.base + parameter.0].is_none() {
                     self.rooted.push(parameter.0);
@@ -270,6 +295,41 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
+        if event == FLOAT_VIEW {
+            vm.tier_stats.native_float_views += 1;
+            let Operation::FloatListView { value, failure } = instruction.operation else {
+                return Err(Error::InvalidIr("float view callback"));
+            };
+            let source = registers[value.0].value()?;
+            let view = if matches!(source, Value::Ref(_)) {
+                let mut object = vm.heap.get_mut(source)?;
+                if let crate::Object::List(list) = &mut *object {
+                    list.float_view()
+                        .map(|values| (values.as_mut_ptr() as usize, values.len()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some((pointer, length)) = view else {
+                vm.tier_stats.native_float_view_failures += 1;
+                self.side_exit = Some(failure);
+                return Ok(());
+            };
+            let dst = instruction
+                .result
+                .ok_or(Error::InvalidIr("float view result"))?;
+            // The verifier forbids view access after callbacks or across block edges. The owner stays live
+            // in the register image; no collection or resizing operation occurs while generated code uses it.
+            registers[dst.0] = Slot {
+                tag: FLOAT_VIEW_TAG,
+                a: pointer as u64,
+                b: length as u64,
+                c: self.collecting as u64,
+            };
+            return Ok(());
+        }
         if event == UNPACK_BATCH {
             let Operation::SequenceUnpack {
                 value,
@@ -293,12 +353,13 @@ impl Context<'_> {
                 .result
                 .ok_or(Error::InvalidIr("native unpack result"))?;
             registers[result.0] = Slot::boxed(source);
-            for (offset, value) in items.iter().enumerate() {
+            for offset in 0..items.len() {
+                let value = items.get(offset).unwrap();
                 let element = &self.lir.blocks[block].instructions[index + offset + 1];
                 let result = element
                     .result
                     .ok_or(Error::InvalidIr("native unpack element"))?;
-                registers[result.0] = Slot::boxed(*value);
+                registers[result.0] = Slot::boxed(value);
             }
             return Ok(());
         }

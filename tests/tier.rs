@@ -124,7 +124,7 @@ fn host_pins_survive_lir_collections() {
     let mut vm = Vm::new();
     vm.tiering = Tiering::Lir;
     vm.thresholds.loop_backedges = 8;
-    let value = vm.heap.allocate(Object::List(vec![Value::Int(42)]));
+    let value = vm.heap.allocate(Object::List(vec![Value::Int(42)].into()));
     let pin = vm.pin(value).unwrap();
     let mut program = compile("for i in range(5000):\n    x = [i]\n").unwrap();
     vm.run_program(&mut program).unwrap();

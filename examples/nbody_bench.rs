@@ -76,7 +76,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let Object::List(items) = vm.heap.get(list)? else {
                 return Err("body coordinates are not lists".into());
             };
-            snapshot.push((list, items.clone()));
+            snapshot.push((list, items.to_vec()));
         }
     }
     let setup_ns = start.elapsed().as_nanos();
@@ -117,11 +117,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let elapsed = sample(&mut vm, advance, energy, &snapshot)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{elapsed},\"feedback_probes\":{},\"root_syncs\":{},\"unpack_batches\":{},\"truth_fallbacks\":{},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
+            "{{\"run_ns\":{elapsed},\"feedback_probes\":{},\"root_syncs\":{},\"unpack_batches\":{},\"truth_fallbacks\":{},\"float_views\":{},\"float_view_failures\":{},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
             stats.native_feedback_probes - before.native_feedback_probes,
             stats.native_root_syncs - before.native_root_syncs,
             stats.native_unpack_batches - before.native_unpack_batches,
             stats.native_truth_fallbacks - before.native_truth_fallbacks,
+            stats.native_float_views - before.native_float_views,
+            stats.native_float_view_failures - before.native_float_view_failures,
             stats.numeric_fast_paths - before.numeric_fast_paths,
             stats.numeric_type_misses - before.numeric_type_misses,
             stats.numeric_arithmetic_fallbacks - before.numeric_arithmetic_fallbacks,

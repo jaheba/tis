@@ -44,7 +44,7 @@ fn scalar_truth_has_no_callback_and_heap_truth_keeps_its_fallback() {
         }
         assert_eq!(vm.tier_stats.native_truth_fallbacks, before);
         for (object, truth) in [
-            (Object::List(vec![]), false),
+            (Object::List(vec![].into()), false),
             (Object::String("x".into()), true),
             (Object::Dict(vec![]), false),
         ] {
@@ -60,7 +60,7 @@ fn scalar_truth_has_no_callback_and_heap_truth_keeps_its_fallback() {
 
 fn source(vm: &mut Vm) -> Value {
     let values = (0..3)
-        .map(|i| vm.heap.allocate(Object::List(vec![Value::Int(i)])))
+        .map(|i| vm.heap.allocate(Object::List(vec![Value::Int(i)].into())))
         .collect();
     vm.heap.allocate(Object::List(values))
 }
@@ -151,11 +151,9 @@ fn batch_guard_failure_does_not_repeat_prior_effects_or_partial_assignment() {
             "calls=0\ndef f(items):\n    global calls\n    calls+=1\n    a,b,c=items\n    return a+b+c\n",
             tier,
         );
-        let items = vm.heap.allocate(Object::List(vec![
-            Value::Int(1),
-            Value::Int(2),
-            Value::Int(3),
-        ]));
+        let items = vm.heap.allocate(Object::List(
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)].into(),
+        ));
         for _ in 0..24 {
             vm.call(f, &[items]).unwrap();
         }

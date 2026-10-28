@@ -76,7 +76,7 @@ fn class_bases_and_ephemeral_callables_are_roots_during_nested_execution() {
 #[test]
 fn host_handles_can_be_pinned_across_collections() {
     let mut vm = Vm::new();
-    let value = vm.heap.allocate(Object::List(vec![Value::Int(42)]));
+    let value = vm.heap.allocate(Object::List(vec![Value::Int(42)].into()));
     let root = vm.pin(value).unwrap();
     let mut program = compile("for i in range(10000):\n    temporary = [i]\n").unwrap();
     vm.run_program(&mut program).unwrap();
