@@ -1440,6 +1440,9 @@ impl Function {
             }
             writeln!(text, "  {:?}", block.terminator).unwrap();
         }
+        for (boxed, raw) in self.boxing_recipes() {
+            writeln!(text, "materialize {boxed:?} = Float({raw:?})").unwrap();
+        }
         for (id, exit) in self.exits.iter().enumerate() {
             writeln!(text, "exit{id}: {:?} -> s{}", exit.reason, exit.state.0).unwrap();
         }
@@ -1525,7 +1528,7 @@ impl Function {
 }
 
 impl Operation {
-    fn inputs(&self) -> Vec<Register> {
+    pub(crate) fn inputs(&self) -> Vec<Register> {
         match self {
             Self::FloatListView { value, .. } => vec![*value],
             Self::FloatListLoad { view, .. } => vec![*view],
@@ -1791,4 +1794,40 @@ fn unpack_bundle(hir: &hir::Function, block: usize, index: usize, count: usize) 
             .flatten()
             .flatten()
             .any(|v| *v == Some(result))
+}
+
+impl Function {
+    /// Boxed float values can be reconstructed from these primitive producers at native boundaries.
+    pub fn boxing_recipes(&self) -> BTreeMap<Register, Register> {
+        self.blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
+                if let Operation::BoxFloat(source) = instruction.operation {
+                    Some((instruction.result?, source))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+impl Function {
+    pub(crate) fn native_boxing_recipes(&self) -> BTreeMap<Register, Register> {
+        let mut recipes = self.boxing_recipes();
+        // OSR imports retain runtime tags until guarded; only locally produced floats are deferred.
+        for entry in &self.osr_entries {
+            let state = &self.states[entry.state.0];
+            for register in state
+                .values
+                .iter()
+                .map(|(_, r)| r)
+                .chain(state.local_values.iter().flatten())
+            {
+                recipes.remove(register);
+            }
+        }
+        recipes
+    }
 }

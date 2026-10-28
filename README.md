@@ -220,6 +220,12 @@ the verifier enforces these boundaries. Generic mutations can widen a list back 
 Float loop parameters have unboxed companions with boxed shadows for GC and deoptimization. Incoming edges and OSR
 entries check the observed types. Cranelift keeps primitive values in SSA across backedges; copy-and-patch still
 uses its register image. Typed indexed operations currently require constant integer indices.
+LIR dumps include float boxing recipes. In staged Cranelift code, eligible `BoxFloat` results stay in native
+SSA values. Helpers materialize their operands; edge transfers and returns materialize their outgoing values.
+Guard failures reconstruct the live frame image on the failure branch. Native GC maps omit these proven floats;
+the original frame states remain available for deoptimization. Imported OSR values retain tagged storage until checked,
+and eager feedback artifacts retain immediate boxing. Reopened feedback windows materialize values for observation.
+Float-list views remain block-local; deferred boxing does not extend their lifetime across callbacks or backedges.
 `TierStats.native_float_views` and `native_float_view_failures` count view acquisitions and storage guard failures.
 There is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.

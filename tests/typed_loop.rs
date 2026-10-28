@@ -248,3 +248,73 @@ fn boxed_read_snapshots_refresh_after_native_float_writes() {
         );
     }
 }
+
+#[test]
+fn deferred_float_boxes_reconstruct_after_a_store_and_guard_failure() {
+    for tier in TIERS {
+        let (mut vm, f) = setup(
+            "def f(xs,x):\n    a=x+0.5\n    xs[1]=a\n    b=xs[0]\n    return a+b\n",
+            tier,
+        );
+        let xs = vm.heap.allocate(Object::List(
+            vec![Value::Float(2.0), Value::Float(0.0)].into(),
+        ));
+        for _ in 0..24 {
+            assert_eq!(
+                vm.call(f, &[xs, Value::Float(3.0)]).unwrap(),
+                Value::Float(5.5)
+            );
+        }
+        let lir = vm
+            .function_hir(f)
+            .unwrap()
+            .lower_lir(LoweringMode::Profiled)
+            .unwrap();
+        assert!(!lir.boxing_recipes().is_empty());
+        vm.heap.set_item(xs, Value::Int(0), Value::Int(7)).unwrap();
+        assert_eq!(
+            vm.call(f, &[xs, Value::Float(8.0)]).unwrap(),
+            Value::Float(15.5)
+        );
+        assert_eq!(
+            vm.heap.get_item(xs, Value::Int(1)).unwrap(),
+            Value::Float(8.5)
+        );
+        assert!(vm.tier_stats.deoptimizations > 0);
+    }
+}
+
+#[test]
+fn deferred_float_boxes_materialize_for_allocating_helpers_and_return() {
+    for tier in TIERS {
+        let (mut vm, f) = setup(
+            "def f(x):\n    a=x+0.5\n    xs=[a,a+1.0]\n    return xs[0]+xs[1]+a\n",
+            tier,
+        );
+        for _ in 0..24 {
+            assert_eq!(vm.call(f, &[Value::Float(2.0)]).unwrap(), Value::Float(8.5));
+        }
+        assert_eq!(
+            vm.call(f, &[Value::Float(-3.0)]).unwrap(),
+            Value::Float(-6.5)
+        );
+    }
+}
+
+#[test]
+fn deferred_floats_and_heap_roots_survive_collection_inside_native_loops() {
+    let (mut vm, f) = setup(
+        "def f(n):\n    token=[42]\n    a=0.0\n    for i in range(n):\n        a=a+0.5\n        junk=[a]\n    return a+token[0]\n",
+        Tiering::Native,
+    );
+    for _ in 0..24 {
+        vm.call(f, &[Value::Int(4)]).unwrap();
+    }
+    let before = vm.tier_stats.native_entries;
+    assert_eq!(
+        vm.call(f, &[Value::Int(10000)]).unwrap(),
+        Value::Float(5042.0)
+    );
+    assert!(vm.tier_stats.native_entries > before);
+    assert!(vm.heap.allocation_count() < 4096);
+}

@@ -496,6 +496,7 @@ impl CopyCode {
         native_runtime::execute(
             &self.lir,
             &self.locations,
+            None,
             self.scratch,
             |context, registers, _| {
                 // SAFETY: these bytes came from a verified same-target C-ABI stencil. This borrowed

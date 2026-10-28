@@ -1,4 +1,4 @@
-//! Cranelift gateway. Generated code only accesses fixed-size register slots; heap access stays in Rust helpers.
+//! Cranelift gateway with guarded heap views and explicit runtime materialization boundaries.
 use crate::{
     Error, Result, Value, Vm,
     bytecode::Code,
@@ -23,6 +23,7 @@ pub(crate) struct NativeCode {
     entry: Option<Entry>,
     pub lir: Rc<lir::Function>,
     locations: Vec<(usize, usize)>,
+    root_states: Vec<lir::FrameState>,
     pub bytes: usize,
     pub feedback: bool,
 }
@@ -58,11 +59,24 @@ impl NativeCode {
         let mut jit = JITBuilder::new(default_libcall_names()).map_err(error)?;
         jit.symbol("tis_callback", callback as *const u8);
         jit.symbol("tis_power", power as *const u8);
+        let recipes = lir.native_boxing_recipes();
+        let root_states = lir
+            .states
+            .iter()
+            .map(|state| {
+                let mut roots = state.clone();
+                roots
+                    .values
+                    .retain(|(_, register)| !recipes.contains_key(register));
+                roots
+            })
+            .collect();
         let mut owner = Self {
             module: Some(JITModule::new(jit)),
             entry: None,
             lir,
             locations: vec![],
+            root_states,
             bytes: 0,
             feedback,
         };
@@ -103,7 +117,7 @@ impl NativeCode {
         let mut builder_context = FunctionBuilderContext::new();
         {
             let mut b = FunctionBuilder::new(&mut context.func, &mut builder_context);
-            let scalars = ScalarVars::new(&mut b, &owner.lir.registers);
+            let scalars = ScalarVars::new(&mut b, &owner.lir, !feedback);
             let entry = b.create_block();
             b.switch_to_block(entry);
             b.append_block_params_for_function_params(entry);
@@ -123,9 +137,44 @@ impl NativeCode {
                 b.switch_to_block(next);
             }
             b.ins().jump(failed, &[]);
+            macro_rules! runtime_call {
+                ($builder:expr, $function:expr, $host:expr, $registers:expr, $event:expr, $location:expr, $failed:expr $(,)?) => {{
+                    let needed = callback_values(&owner.lir, &owner.locations, $event, $location);
+                    scalars.materialize($builder, $registers, needed)?;
+                    let event = $builder.ins().iconst(types::I32, $event as i64);
+                    let location = $builder.ins().iconst(types::I32, $location as i64);
+                    let call = $builder
+                        .ins()
+                        .call($function, &[$host, $registers, event, location]);
+                    let status = $builder.inst_results(call)[0];
+                    let failed = $builder.create_block();
+                    let next = $builder.create_block();
+                    $builder.ins().brif(status, failed, &[], next, &[]);
+                    $builder.switch_to_block(failed);
+                    let needed =
+                        callback_failure_values(&owner.lir, &owner.locations, $event, $location);
+                    scalars.materialize($builder, $registers, needed)?;
+                    $builder.ins().jump($failed, &[]);
+                    $builder.switch_to_block(next);
+                }};
+            }
+            macro_rules! side_exit {
+                ($builder:expr, $passed:expr, $exit:expr) => {{
+                    let exit = $exit;
+                    let success = $builder.create_block();
+                    let failed = $builder.create_block();
+                    $builder.ins().brif($passed, success, &[], failed, &[]);
+                    $builder.switch_to_block(failed);
+                    let state = &owner.lir.states[owner.lir.exits[exit.0].state.0];
+                    scalars.materialize($builder, registers, state_values(state))?;
+                    let status = $builder.ins().iconst(types::I64, exit.0 as i64 + 1);
+                    $builder.ins().return_(&[status]);
+                    $builder.switch_to_block(success);
+                }};
+            }
             for (block_index, body) in owner.lir.blocks.iter().enumerate() {
                 b.switch_to_block(blocks[block_index]);
-                call(
+                runtime_call!(
                     &mut b,
                     callback_ref,
                     host,
@@ -144,7 +193,7 @@ impl NativeCode {
                     }
                     let destination = instruction.result;
                     match &instruction.operation {
-                        Operation::FloatListView { .. } => call(
+                        Operation::FloatListView { .. } => runtime_call!(
                             &mut b,
                             callback_ref,
                             host,
@@ -174,7 +223,7 @@ impl NativeCode {
                                 b.ins().iconst(types::I64, *index)
                             };
                             let valid = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-                            guard(&mut b, valid, *failure);
+                            side_exit!(&mut b, valid, *failure);
                             let offset = b.ins().ishl_imm_u(index, 3);
                             let pointer = b.ins().iadd(pointer, offset);
                             if let Operation::FloatListStore { value, .. } = &instruction.operation
@@ -210,7 +259,7 @@ impl NativeCode {
                         }
                         Operation::SequenceUnpack { count, .. } if !feedback => {
                             unpack_reads = *count;
-                            call(
+                            runtime_call!(
                                 &mut b,
                                 callback_ref,
                                 host,
@@ -220,15 +269,17 @@ impl NativeCode {
                                 failed,
                             );
                         }
-                        Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => call(
-                            &mut b,
-                            callback_ref,
-                            host,
-                            registers,
-                            SEQUENCE,
-                            location,
-                            failed,
-                        ),
+                        Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => {
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                SEQUENCE,
+                                location,
+                                failed,
+                            )
+                        }
                         Operation::Constant(value) => {
                             let value = match value {
                                 crate::hir::Constant::Unbound => Value::Unbound,
@@ -256,7 +307,7 @@ impl NativeCode {
                                     FLOAT
                                 };
                             let passed = b.ins().icmp_imm_s(IntCC::Equal, tag, expected as i64);
-                            guard(&mut b, passed, *exit);
+                            side_exit!(&mut b, passed, *exit);
                         }
                         Operation::UnboxInt(value)
                         | Operation::UnboxFloat(value)
@@ -307,7 +358,7 @@ impl NativeCode {
                             let y = b.ins().bxor(right, sum);
                             let both = b.ins().band(x, y);
                             let safe = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, both, 0);
-                            guard(&mut b, safe, *overflow);
+                            side_exit!(&mut b, safe, *overflow);
                             store_scalar_cached(
                                 &mut b,
                                 &scalars,
@@ -334,7 +385,7 @@ impl NativeCode {
                                 FloatOperator::Divide => {
                                     let zero = b.ins().f64const(0.0);
                                     let safe = b.ins().fcmp(FloatCC::NotEqual, right, zero);
-                                    guard(&mut b, safe, *failure);
+                                    side_exit!(&mut b, safe, *failure);
                                     b.ins().fdiv(left, right)
                                 }
                                 FloatOperator::Power => {
@@ -343,11 +394,11 @@ impl NativeCode {
                                     let negative = b.ins().fcmp(FloatCC::LessThan, right, zero);
                                     let invalid = b.ins().band(is_zero, negative);
                                     let safe = b.ins().icmp_imm_s(IntCC::Equal, invalid, 0);
-                                    guard(&mut b, safe, *failure);
+                                    side_exit!(&mut b, safe, *failure);
                                     let call = b.ins().call(power_ref, &[left, right]);
                                     let result = b.inst_results(call)[0];
                                     let ordered = b.ins().fcmp(FloatCC::Ordered, result, result);
-                                    guard(&mut b, ordered, *failure);
+                                    side_exit!(&mut b, ordered, *failure);
                                     result
                                 }
                             };
@@ -421,7 +472,7 @@ impl NativeCode {
                             )?;
                             b.ins().jump(done, &[]);
                             b.switch_to_block(slow);
-                            call(
+                            runtime_call!(
                                 &mut b,
                                 callback_ref,
                                 host,
@@ -443,7 +494,7 @@ impl NativeCode {
                             b.ins().jump(done, &[]);
                             b.switch_to_block(done);
                         }
-                        Operation::Call { .. } => call(
+                        Operation::Call { .. } => runtime_call!(
                             &mut b,
                             callback_ref,
                             host,
@@ -463,7 +514,7 @@ impl NativeCode {
                         let done = b.create_block();
                         b.ins().brif(sample, record, &[], done, &[]);
                         b.switch_to_block(record);
-                        call(
+                        runtime_call!(
                             &mut b,
                             callback_ref,
                             host,
@@ -487,7 +538,7 @@ impl NativeCode {
                                 | Operation::SequenceGet { .. }
                         )
                     {
-                        call(
+                        runtime_call!(
                             &mut b,
                             callback_ref,
                             host,
@@ -500,6 +551,7 @@ impl NativeCode {
                 }
                 match &body.terminator {
                     Terminator::Return(value) => {
+                        scalars.materialize(&mut b, registers, [*value])?;
                         copy_slots(
                             &mut b,
                             registers,
@@ -556,6 +608,7 @@ impl NativeCode {
         crate::native_runtime::execute(
             &self.lir,
             &self.locations,
+            Some(&self.root_states),
             0,
             |context, registers, start| {
                 // SAFETY: the shared bridge keeps its Context and register allocation alive for this call.
@@ -676,6 +729,7 @@ fn edge_jump(
             boxed.push((from, to));
         }
     }
+    scalars.materialize(b, registers, boxed.iter().map(|(from, _)| *from))?;
     copy_slots(b, registers, &boxed)?;
     for (to, value) in values {
         b.def_var(scalars.0[to.0].unwrap().0, value);
@@ -683,38 +737,12 @@ fn edge_jump(
     b.ins().jump(blocks[edge.block.0], &[]);
     Ok(())
 }
-fn guard(b: &mut FunctionBuilder<'_>, passed: ir::Value, exit: lir::ExitId) {
-    let success = b.create_block();
-    let failed = b.create_block();
-    b.ins().brif(passed, success, &[], failed, &[]);
-    b.switch_to_block(failed);
-    let status = b.ins().iconst(types::I64, exit.0 as i64 + 1);
-    b.ins().return_(&[status]);
-    b.switch_to_block(success);
-}
-fn call(
-    b: &mut FunctionBuilder<'_>,
-    function: ir::FuncRef,
-    host: ir::Value,
-    registers: ir::Value,
-    event: i32,
-    location: i32,
-    failed: ir::Block,
-) {
-    let event = b.ins().iconst(types::I32, event as i64);
-    let location = b.ins().iconst(types::I32, location as i64);
-    let call = b.ins().call(function, &[host, registers, event, location]);
-    let status = b.inst_results(call)[0];
-    let next = b.create_block();
-    b.ins().brif(status, failed, &[], next, &[]);
-    b.switch_to_block(next);
-}
-
-struct ScalarVars(Vec<Option<(Variable, ir::Type)>>);
+struct ScalarVars(Vec<Option<(Variable, ir::Type)>>, Vec<Option<Variable>>);
 impl ScalarVars {
-    fn new(b: &mut FunctionBuilder<'_>, types: &[lir::Type]) -> Self {
+    fn new(b: &mut FunctionBuilder<'_>, lir: &lir::Function, defer: bool) -> Self {
+        let recipes = lir.native_boxing_recipes();
         Self(
-            types
+            lir.registers
                 .iter()
                 .map(|ty| match ty {
                     lir::Type::F64 => Some((b.declare_var(types::F64), types::F64)),
@@ -724,7 +752,31 @@ impl ScalarVars {
                     _ => None,
                 })
                 .collect(),
+            (0..lir.registers.len())
+                .map(|index| {
+                    (defer && recipes.contains_key(&Register(index)))
+                        .then(|| b.declare_var(types::F64))
+                })
+                .collect(),
         )
+    }
+    fn materialize(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        registers: ir::Value,
+        values: impl IntoIterator<Item = Register>,
+    ) -> Result<()> {
+        for register in values
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if let Some(var) = self.1[register.0] {
+                let value = b.use_var(var);
+                let bits = b.ins().bitcast(types::I64, MemFlagsData::new(), value);
+                store_scalar(b, registers, register, FLOAT, bits)?;
+            }
+        }
+        Ok(())
     }
     fn initialize(
         &self,
@@ -732,7 +784,7 @@ impl ScalarVars {
         registers: ir::Value,
         lir: &lir::Function,
     ) -> Result<()> {
-        // Dispatch can enter an OSR header directly. Its actual primitive definitions execute in that header.
+        // OSR can bypass producers, so seed live primitive values and boxed recipes from the entry image.
         for (index, entry) in self.0.iter().enumerate() {
             let Some(&(var, ty)) = entry.as_ref() else {
                 continue;
@@ -746,6 +798,12 @@ impl ScalarVars {
             };
             b.def_var(var, zero);
         }
+        for (index, var) in self.1.iter().enumerate() {
+            if let Some(var) = var {
+                let value = load(b, registers, Register(index), 8, types::F64)?;
+                b.def_var(*var, value);
+            }
+        }
         Ok(())
     }
 }
@@ -757,6 +815,19 @@ fn load_cached(
     field: i32,
     ty: ir::Type,
 ) -> Result<ir::Value> {
+    if let Some(var) = scalars.1[register.0] {
+        if field == 0 {
+            return Ok(b.ins().iconst(types::I64, FLOAT as i64));
+        }
+        if field == 8 {
+            let value = b.use_var(var);
+            return Ok(if ty == types::F64 {
+                value
+            } else {
+                b.ins().bitcast(ty, MemFlagsData::new(), value)
+            });
+        }
+    }
     if field == 8
         && let Some((var, source)) = scalars.0.get(register.0).copied().flatten()
     {
@@ -777,6 +848,13 @@ fn store_scalar_cached(
     tag: u64,
     value: ir::Value,
 ) -> Result<()> {
+    if tag == FLOAT
+        && let Some(var) = scalars.1[register.0]
+    {
+        let value = b.ins().bitcast(types::F64, MemFlagsData::new(), value);
+        b.def_var(var, value);
+        return Ok(());
+    }
     if let Some((var, ty)) = scalars.0.get(register.0).copied().flatten() {
         let value = if ty == types::F64 {
             b.ins().bitcast(ty, MemFlagsData::new(), value)
@@ -801,4 +879,50 @@ fn store_float_cached(
         return Ok(());
     }
     store_float(b, registers, register, value)
+}
+
+fn state_values(state: &lir::FrameState) -> Vec<Register> {
+    state
+        .values
+        .iter()
+        .map(|(_, register)| *register)
+        .chain(state.local_values.iter().flatten().copied())
+        .collect()
+}
+fn callback_values(
+    lir: &lir::Function,
+    locations: &[(usize, usize)],
+    event: i32,
+    location: i32,
+) -> Vec<Register> {
+    if event == ENTER {
+        return lir.blocks[location as usize].parameters.clone();
+    }
+    if event == FINISH {
+        // A reopened observation window may inspect the original HIR operands as well as the result.
+        return lir.boxing_recipes().keys().copied().collect();
+    }
+    let (block, index) = locations[location as usize];
+    let instruction = &lir.blocks[block].instructions[index];
+    instruction.operation.inputs()
+}
+
+fn callback_failure_values(
+    lir: &lir::Function,
+    locations: &[(usize, usize)],
+    event: i32,
+    location: i32,
+) -> Vec<Register> {
+    if event == ENTER || event == FINISH {
+        return vec![];
+    }
+    let (block, index) = locations[location as usize];
+    let instruction = &lir.blocks[block].instructions[index];
+    let state = match instruction.operation {
+        Operation::FloatListView { failure, .. }
+        | Operation::SequenceGet { failure, .. }
+        | Operation::SequenceUnpack { failure, .. } => Some(lir.exits[failure.0].state),
+        _ => None,
+    };
+    state.map_or_else(Vec::new, |state| state_values(&lir.states[state.0]))
 }

@@ -74,6 +74,7 @@ pub(crate) type Entry = unsafe extern "C" fn(*mut c_void, *mut Slot, u32) -> u64
 pub(crate) fn execute(
     lir: &lir::Function,
     locations: &[(usize, usize)],
+    root_states: Option<&[lir::FrameState]>,
     extra_slots: usize,
     invoke: impl FnOnce(*mut c_void, *mut Slot, u32) -> u64,
     vm: &mut Vm,
@@ -129,6 +130,7 @@ pub(crate) fn execute(
         code,
         lir,
         locations,
+        root_states,
         base,
         rooted,
         previous: None,
@@ -183,6 +185,8 @@ struct Context<'a> {
     code: &'a Code,
     lir: &'a lir::Function,
     locations: &'a [(usize, usize)],
+    // Deferred scalar recipes cannot contain references; GC reads only the remaining tagged values.
+    root_states: Option<&'a [lir::FrameState]>,
     base: usize,
     rooted: Vec<usize>,
     previous: Option<usize>,
@@ -441,7 +445,7 @@ impl Context<'_> {
             if checkpoint {
                 vm.tier_stats.native_root_syncs += 1;
                 vm.sync_lir_roots(
-                    &self.lir.states[state.0],
+                    &self.root_states.unwrap_or(&self.lir.states)[state.0],
                     roots,
                     self.base,
                     &mut self.rooted,

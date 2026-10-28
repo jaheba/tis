@@ -17,6 +17,8 @@ def main():
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--samples', type=int, default=10)
+    parser.add_argument('--fresh-processes', action='store_true',
+                        help='warm a new worker for every sample to expose process layout variation')
     parser.add_argument('--seed', type=int, default=20261028)
     parser.add_argument('--tiers', nargs='+', choices=['bytecode', 'lir', 'native', 'copy-patch'],
                         default=['bytecode', 'lir', 'native', 'copy-patch'])
@@ -36,41 +38,59 @@ def main():
                              for name, path in binaries.items()},
                    bytecode_modes={'baseline': args.baseline_bytecode, 'candidate': args.candidate_bytecode},
                    numeric_modes={'baseline': args.baseline_numeric, 'candidate': args.candidate_numeric},
-                   readiness={}, samples_raw=[])
+                   fresh_processes=args.fresh_processes, readiness={}, samples_raw=[])
     workers = {}
 
     def save():
         (args.output / 'comparison.json').write_text(json.dumps(results, indent=2) + '\n')
 
+    def start(label):
+        name, mode = label.split('/')
+        command = [str(binaries[name]), '--tier', mode, '--warmups', '2']
+        encoding = results['bytecode_modes'][name]
+        if encoding:
+            command += ['--bytecode', encoding]
+        numeric = results['numeric_modes'][name]
+        if numeric:
+            command += ['--numeric', numeric]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, bufsize=1)
+        workers[label] = process
+        line = process.stdout.readline()
+        if not line:
+            raise RuntimeError((label, process.stderr.read()))
+        readiness = json.loads(line)
+        assert readiness['ready']
+        if args.fresh_processes:
+            results['readiness'].setdefault(label, []).append(readiness)
+        else:
+            results['readiness'][label] = readiness
+        save()
+        return process
+
+    def stop(process):
+        if process.poll() is None:
+            process.stdin.write('quit\n')
+            process.stdin.flush()
+        process.wait(timeout=30)
+        error = process.stderr.read()
+        if process.returncode or error:
+            raise RuntimeError((process.returncode, error))
+
     try:
-        for name, binary in binaries.items():
+        for name in binaries:
             for mode in args.tiers:
                 label = f'{name}/{mode}'
-                command = [str(binary), '--tier', mode, '--warmups', '2']
-                encoding = results['bytecode_modes'][name]
-                if encoding:
-                    command += ['--bytecode', encoding]
-                numeric = results['numeric_modes'][name]
-                if numeric:
-                    command += ['--numeric', numeric]
-                process = subprocess.Popen(command,
-                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE, text=True, bufsize=1)
-                workers[label] = process
-                line = process.stdout.readline()
-                if not line:
-                    raise RuntimeError((label, process.stderr.read()))
-                readiness = json.loads(line)
-                assert readiness['ready']
-                results['readiness'][label] = readiness
-                save()
-                print(f'ready {label}', flush=True)
+                workers[label] = None
+                if not args.fresh_processes:
+                    start(label)
+                    print(f'ready {label}', flush=True)
         rng = random.Random(args.seed)
         for round_index in range(args.samples):
             order = list(workers)
             rng.shuffle(order)
             for label in order:
-                process = workers[label]
+                process = start(label) if args.fresh_processes else workers[label]
                 process.stdin.write('run\n')
                 process.stdin.flush()
                 line = process.stdout.readline()
@@ -85,18 +105,15 @@ def main():
                 if entry:
                     assert sample[entry] == 1
                 results['samples_raw'].append(dict(label=label, round=round_index, **sample))
+                if args.fresh_processes:
+                    stop(process)
+                    workers[label] = None
                 save()
                 print(f'{round_index + 1:2} {label:22} {sample["run_ns"] / 1e9:.6f}s', flush=True)
     finally:
         for process in workers.values():
-            if process.poll() is None:
-                process.stdin.write('quit\n')
-                process.stdin.flush()
-        for process in workers.values():
-            process.wait(timeout=30)
-            error = process.stderr.read()
-            if process.returncode or error:
-                raise RuntimeError((process.returncode, error))
+            if process is not None:
+                stop(process)
     results['summary'] = {
         label: summarize([row['run_ns'] for row in results['samples_raw'] if row['label'] == label])
         for label in workers}
