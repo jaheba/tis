@@ -16,6 +16,7 @@ pub(crate) const FINISH: i32 = 3;
 pub(crate) const SEQUENCE: i32 = 4;
 pub(crate) const UNPACK_BATCH: i32 = 5;
 pub(crate) const FLOAT_VIEW: i32 = 6;
+pub(crate) const REGION_ENTER: i32 = 7;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Slot {

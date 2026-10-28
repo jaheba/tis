@@ -140,6 +140,10 @@ pub(crate) fn execute(
         registers: registers.as_mut_ptr(),
         helper_arguments: Vec::new(),
         side_exit: entry_failure,
+        views: crate::region::HeapViews::default(),
+        active_region: None,
+        region_done: None,
+        schema_key: vec![],
     };
     // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
     // synchronous invocation. Generated memory offsets are bounds checked during emission.
@@ -152,6 +156,7 @@ pub(crate) fn execute(
             u32::try_from(start).map_err(error)?,
         )
     };
+    context.flush_region()?;
     if let Some(error) = context.error {
         return Err(error);
     }
@@ -197,6 +202,10 @@ struct Context<'a> {
     // Each native invocation owns its scratch buffer, including during recursive helper calls.
     helper_arguments: Vec<Value>,
     side_exit: Option<lir::ExitId>,
+    views: crate::region::HeapViews,
+    active_region: Option<usize>,
+    region_done: Option<(usize, Value)>,
+    schema_key: Vec<u64>,
 }
 pub(crate) extern "C" fn callback(
     raw: *mut c_void,
@@ -207,6 +216,11 @@ pub(crate) extern "C" fn callback(
     // SAFETY: only generated Entry calls this private callback, using its original Context
     // pointer. Calls are synchronous; nested JIT frames allocate distinct contexts and slots.
     let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    // SAFETY: each synchronous gateway holds the suspended invocation's exclusive VM borrow.
+    unsafe {
+        (&mut *context.vm).tier_stats.native_runtime_calls += 1;
+    }
+
     // SAFETY: the VM's exclusive borrow is suspended for Entry; callbacks temporarily reborrow it.
     let vm = unsafe { &mut *context.vm };
     if event == UNPACK_BATCH {
@@ -219,6 +233,7 @@ pub(crate) extern "C" fn callback(
         vm.depth,
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.flush_region()?;
         context.step(registers, event, location)
     }));
     match result {
@@ -250,10 +265,18 @@ pub(crate) extern "C" fn float_view_callback(
 ) -> i32 {
     // SAFETY: generated callers pass their invocation's live Context; callbacks cannot retain it.
     let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    // SAFETY: each synchronous gateway holds the suspended invocation's exclusive VM borrow.
+    unsafe {
+        (&mut *context.vm).tier_stats.native_runtime_calls += 1;
+    }
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if event != FLOAT_VIEW {
             return Err(Error::InvalidIr("float view event"));
         }
+        context.flush_region()?;
+        // Promotion can change a cached descriptor's storage kind as well as its data pointer.
+        context.views.clear();
         context.float_view(registers, location)
     }));
     match result {
@@ -268,7 +291,138 @@ pub(crate) extern "C" fn float_view_callback(
         }
     }
 }
+/// Preparation can allocate owned view buffers but cannot execute Python or change VM frames.
+pub(crate) extern "C" fn region_callback(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    event: i32,
+    location: i32,
+) -> i32 {
+    // SAFETY: the private entry passes its live invocation context and exclusively owned register image.
+    let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    // SAFETY: each synchronous gateway holds the suspended invocation's exclusive VM borrow.
+    unsafe {
+        (&mut *context.vm).tier_stats.native_runtime_calls += 1;
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.flush_region()?;
+        if event != REGION_ENTER || registers != context.registers {
+            return Err(Error::InvalidIr("region entry ABI"));
+        }
+        context.prepare_region(location as usize)
+    }));
+    match result {
+        Ok(Ok(())) => i32::from(context.side_exit.is_some()),
+        Ok(Err(error)) => {
+            context.error = Some(error);
+            1
+        }
+        Err(_) => {
+            context.error = Some(Error::Runtime("panic preparing native region".into()));
+            1
+        }
+    }
+}
 impl Context<'_> {
+    fn flush_region(&mut self) -> Result<()> {
+        let Some(index) = self.active_region.take() else {
+            return Ok(());
+        };
+        let region = &self.lir.regions[index];
+        // SAFETY: only Cranelift regions allocate and write these two additional slots.
+        let metadata = unsafe { *self.registers.add(self.lir.registers.len() + 1) };
+        // SAFETY: native code is suspended or returned; the VM is exclusively reborrowed here.
+        let vm = unsafe { &mut *self.vm };
+        vm.tier_stats.native_region_iterations = vm
+            .tier_stats
+            .native_region_iterations
+            .saturating_add(metadata.c);
+        let function = self.function.borrow();
+        let mut profile = function.profile.borrow_mut();
+        let count = profile
+            .backedges
+            .entry((region.body.0, region.header.0))
+            .or_default();
+        *count = count.saturating_add(metadata.c);
+        self.previous = Some(metadata.tag as usize);
+        Ok(())
+    }
+    fn prepare_region(&mut self, index: usize) -> Result<()> {
+        let region = self
+            .lir
+            .regions
+            .get(index)
+            .ok_or(Error::InvalidIr("region index"))?;
+        // SAFETY: preparation is a synchronous callback into the exclusively borrowed VM.
+        let vm = unsafe { &mut *self.vm };
+        // SAFETY: the native region backend allocated two extra slots beyond its ordinary return slot.
+        let slots =
+            unsafe { std::slice::from_raw_parts_mut(self.registers, self.lir.registers.len() + 3) };
+        let epoch = vm.heap.collection_epoch();
+        let done = match self.region_done {
+            Some((saved, value)) if saved == epoch => value,
+            _ => {
+                let value = vm.heap.allocate(crate::Object::Done);
+                self.region_done = Some((epoch, value));
+                value
+            }
+        };
+        let iterator = slots[region.iterator.0].value()?;
+        let roots = region
+            .imports
+            .iter()
+            .map(|r| slots[r.0].value())
+            .chain(std::iter::once(Ok(done)));
+        if vm.collecting(self.function) || !self.views.prepare(&mut vm.heap, roots, iterator)? {
+            vm.tier_stats.native_region_failures += 1;
+            self.side_exit = Some(region.entry);
+            return Ok(());
+        }
+        if let Some(schema) = &region.schema {
+            let crate::Object::Iterator { source, .. } = vm.heap.get(iterator)? else {
+                return Err(Error::InvalidIr("prepared iterator"));
+            };
+            let source = Slot::boxed(*source);
+            self.schema_key.clear();
+            self.schema_key
+                .extend([index as u64, source.tag, source.a, source.b, source.c]);
+            for register in &region.imports {
+                if *register == region.iterator {
+                    continue;
+                }
+                let s = slots[register.0];
+                self.schema_key.extend([register.0 as u64, s.tag]);
+                if s.tag == REF {
+                    self.schema_key.extend([s.a, s.b, s.c]);
+                }
+            }
+            if !self.views.schemas.contains(self.schema_key.as_slice()) {
+                let imported = region
+                    .imports
+                    .iter()
+                    .map(|r| Ok((*r, slots[r.0].value()?)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+                if !schema.validate(&vm.heap, iterator, &imported)? {
+                    vm.tier_stats.native_region_failures += 1;
+                    self.side_exit = Some(region.entry);
+                    return Ok(());
+                }
+                self.views.schemas.insert(self.schema_key.clone());
+            }
+        }
+        slots[self.lir.registers.len() + 1] = Slot {
+            tag: region.header.0 as u64,
+            a: self.views.descriptors.as_ptr() as u64,
+            b: self.views.descriptors.len() as u64,
+            c: 0,
+        };
+        slots[self.lir.registers.len() + 2] = Slot::boxed(done);
+        self.active_region = Some(index);
+        vm.tier_stats.native_region_entries += 1;
+        Ok(())
+    }
+
     fn float_view(&mut self, registers: *mut Slot, location: i32) -> Result<()> {
         if registers != self.registers {
             return Err(Error::InvalidIr("native register buffer changed"));
@@ -328,6 +482,9 @@ impl Context<'_> {
     fn step(&mut self, registers: *mut Slot, event: i32, location: i32) -> Result<()> {
         if registers != self.registers {
             return Err(Error::InvalidIr("native register buffer changed"));
+        }
+        if event == SEQUENCE || event == UNPACK_BATCH {
+            self.views.floats_dirty = true;
         }
         if event == UNPACK_BATCH && self.collecting {
             // A recursive call may reopen feedback while an artifact with fused reads is active.
@@ -489,6 +646,36 @@ impl Context<'_> {
                 } => (*state, roots, *effects),
                 _ => return Err(Error::InvalidIr("native helper instruction")),
             };
+            // Current builtin iter/next implementations mutate only iterator state. Their descriptors
+            // are refreshed at region entry; sequence buffers survive unless collection changes the epoch.
+            if (effects.may_write || effects.needs_safepoint())
+                && !matches!(
+                    instruction.operation,
+                    Operation::Call {
+                        helper: lir::Helper::Python(
+                            crate::hir::CoreOp::Iter
+                                | crate::hir::CoreOp::Next
+                                | crate::hir::CoreOp::IsDone
+                        ),
+                        ..
+                    }
+                )
+            {
+                self.views.clear();
+            }
+            if !matches!(
+                instruction.operation,
+                Operation::Call {
+                    helper: lir::Helper::Python(
+                        crate::hir::CoreOp::Iter
+                            | crate::hir::CoreOp::Next
+                            | crate::hir::CoreOp::IsDone
+                    ),
+                    ..
+                }
+            ) {
+                self.views.floats_dirty = true;
+            }
             checkpoint = effects.needs_safepoint();
             if checkpoint {
                 vm.tier_stats.native_root_syncs += 1;

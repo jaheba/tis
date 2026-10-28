@@ -48,6 +48,10 @@ pub struct TierStats {
     pub native_truth_fallbacks: u64,
     pub native_float_views: u64,
     pub native_float_view_failures: u64,
+    pub native_region_entries: u64,
+    pub native_region_iterations: u64,
+    pub native_region_failures: u64,
+    pub native_runtime_calls: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {

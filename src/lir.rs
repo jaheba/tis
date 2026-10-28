@@ -241,6 +241,7 @@ pub struct Function {
     /// Primitive loop parameters and entry-invariant scalars retain boxed sources for OSR reconstruction.
     pub scalar_sources: BTreeMap<Register, Register>,
     pub scalar_entries: BTreeMap<BlockId, ExitId>,
+    pub regions: Vec<crate::region::LoopRegion>,
 }
 
 impl Function {
@@ -260,6 +261,7 @@ impl Function {
             local_count: hir.local_slots.len(),
             scalar_sources: BTreeMap::new(),
             scalar_entries: BTreeMap::new(),
+            regions: vec![],
         };
         let mut float_values = BTreeSet::new();
         let mut float_params = BTreeSet::new();
@@ -350,6 +352,23 @@ impl Function {
                         },
                     })
                 };
+                if let hir::Op::Runtime(CoreOp::Unary(op), inputs) = &instruction.op
+                    && op == "-"
+                    && inputs.len() == 1
+                    && let Some(value) = hir
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.instructions)
+                        .find(|i| i.result == inputs[0])
+                    && let hir::Op::Constant(Constant::Float(value)) = value.op
+                {
+                    emit(
+                        &mut instructions,
+                        Some(result),
+                        Operation::Constant(Constant::Float(-value)),
+                    );
+                    continue;
+                }
                 if let hir::Op::Runtime(CoreOp::Unpack(count), inputs) = &instruction.op
                     && mode == LoweringMode::Profiled
                     && *count > 0
@@ -996,6 +1015,21 @@ impl Function {
                 state,
             });
         }
+        if mode == LoweringMode::Profiled {
+            for (header, body, iterator, state) in crate::region::LoopRegion::candidates(&output) {
+                let entry = output.exit(state, ExitReason::TypeGuard);
+                let imports = crate::region::LoopRegion::imports(&output, header, body);
+                let schema = crate::region::schema::Schema::build(&output, header, body);
+                output.regions.push(crate::region::LoopRegion {
+                    schema,
+                    imports,
+                    header,
+                    body,
+                    iterator,
+                    entry,
+                });
+            }
+        }
         output.verify()?;
         Ok(output)
     }
@@ -1092,6 +1126,32 @@ impl Function {
         for inputs in &self.observation_inputs {
             for &input in inputs {
                 kind(input, Type::Boxed)?;
+            }
+        }
+        let candidates = crate::region::LoopRegion::candidates(self);
+        let mut covered = BTreeSet::new();
+        for region in &self.regions {
+            let (_, _, _, entry_state) = candidates
+                .iter()
+                .find(|(h, b, i, _)| {
+                    *h == region.header && *b == region.body && *i == region.iterator
+                })
+                .ok_or_else(fail)?;
+            let expected_state = state(*entry_state)?;
+            if region.schema
+                != crate::region::schema::Schema::build(self, region.header, region.body)
+                || region.imports
+                    != crate::region::LoopRegion::imports(self, region.header, region.body)
+                || region
+                    .imports
+                    .iter()
+                    .any(|r| !expected_state.values.iter().any(|(_, v)| v == r))
+                || exit(region.entry)?.state != *entry_state
+                || exit(region.entry)?.reason != ExitReason::TypeGuard
+                || !covered.insert(region.header)
+                || !covered.insert(region.body)
+            {
+                return Err(fail());
             }
         }
         let mut definitions = BTreeSet::new();
@@ -1546,6 +1606,19 @@ impl Function {
                 }
             }
             writeln!(text, "  {:?}", block.terminator).unwrap();
+        }
+        for region in &self.regions {
+            writeln!(
+                text,
+                "region b{} + b{} iterator={:?} entry=exit{} imports={:?} hoisted={}",
+                region.header.0,
+                region.body.0,
+                region.iterator,
+                region.entry.0,
+                region.imports,
+                region.schema.as_ref().map_or(0, |s| s.constraints.len())
+            )
+            .unwrap();
         }
         for (boxed, raw) in self.boxing_recipes() {
             writeln!(text, "materialize {boxed:?} = Float({raw:?})").unwrap();

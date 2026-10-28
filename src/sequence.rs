@@ -1,7 +1,7 @@
 //! Non-allocating exact-sequence operations shared by execution tiers.
 use crate::{Heap, Object, Result, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SequenceKind {
     List,
     Tuple,

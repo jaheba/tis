@@ -4,7 +4,9 @@ use std::{
     io::{self, BufRead, Write},
     time::Instant,
 };
-use tis::{BytecodeMode, Error, NumericMode, Object, Result, Tiering, Value, Vm, compile};
+use tis::{
+    BytecodeMode, Error, NumericMode, Object, Result, TierStats, Tiering, Value, Vm, compile,
+};
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let mut tier = Tiering::Bytecode;
@@ -84,7 +86,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let energy = vm.get_global("report_energy")?;
     let mut warmup_ns = vec![];
     for _ in 0..warmups {
-        warmup_ns.push(sample(&mut vm, advance, energy, &snapshot)?);
+        warmup_ns.push(sample(&mut vm, advance, energy, &snapshot)?.0);
     }
     if let Some(path) = dump_lir {
         std::fs::write(
@@ -113,11 +115,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         if line != "run" {
             return Err("unknown worker command".into());
         }
-        let before = vm.tier_stats.clone();
-        let elapsed = sample(&mut vm, advance, energy, &snapshot)?;
-        let stats = &vm.tier_stats;
+        let (elapsed, before, stats) = sample(&mut vm, advance, energy, &snapshot)?;
         println!(
-            "{{\"run_ns\":{elapsed},\"feedback_probes\":{},\"root_syncs\":{},\"unpack_batches\":{},\"truth_fallbacks\":{},\"float_views\":{},\"float_view_failures\":{},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
+            "{{\"run_ns\":{elapsed},\"region_entries\":{},\"region_iterations\":{},\"region_failures\":{},\"runtime_calls\":{},\"feedback_probes\":{},\"root_syncs\":{},\"unpack_batches\":{},\"truth_fallbacks\":{},\"float_views\":{},\"float_view_failures\":{},\"numeric_fast_paths\":{},\"numeric_type_misses\":{},\"numeric_arithmetic_fallbacks\":{},\"energy\":\"-0.169089263\",\"backend_compile_ns\":{},\"deoptimizations\":{},\"native_entries\":{},\"copy_patch_entries\":{},\"lir_entries\":{}}}",
+            stats.native_region_entries - before.native_region_entries,
+            stats.native_region_iterations - before.native_region_iterations,
+            stats.native_region_failures - before.native_region_failures,
+            stats.native_runtime_calls - before.native_runtime_calls,
             stats.native_feedback_probes - before.native_feedback_probes,
             stats.native_root_syncs - before.native_root_syncs,
             stats.native_unpack_batches - before.native_unpack_batches,
@@ -144,7 +148,7 @@ fn sample(
     advance: Value,
     energy: Value,
     snapshot: &[(Value, Vec<Value>)],
-) -> Result<u128> {
+) -> Result<(u128, TierStats, TierStats)> {
     for (value, items) in snapshot {
         let mut object = vm.heap.get_mut(*value)?;
         let Object::List(values) = &mut *object else {
@@ -152,17 +156,20 @@ fn sample(
         };
         values.copy_from_slice(items);
     }
+    let before = vm.tier_stats.clone();
     let start = Instant::now();
     assert_eq!(
         vm.call(advance, &[Value::Float(0.01), Value::Int(20_000)])?,
         Value::None
     );
     let elapsed = start.elapsed().as_nanos();
+    // Energy validation can itself become hot during long profiles; exclude its tiering from advance's counters.
+    let after = vm.tier_stats.clone();
     let Value::Float(value) = vm.call(energy, &[])? else {
         return Err(Error::Type("energy is not a float"));
     };
     if format!("{value:.9}") != "-0.169089263" {
         return Err(Error::Runtime("benchmark energy mismatch".into()));
     }
-    Ok(elapsed)
+    Ok((elapsed, before, after))
 }

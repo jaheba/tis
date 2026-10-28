@@ -233,6 +233,31 @@ unpacking retain the existing paths; failed guards resume the original unpack wi
 Float-view acquisition has a narrow runtime entry point with panic containment and no frame checkpoint, since it
 cannot execute Python, collect or change frames. Views still end at invalidating helpers and block edges.
 LIR retains original HIR observation operands so reopened feedback branches keep only their own inputs and result live.
+
+Staged Cranelift artifacts can execute complete two-block sequence loops as native regions. Verified metadata names
+the header, body, imported values and entry snapshot. An explicit instruction allowlist excludes Python calls,
+allocating operations and shape changes. Builtin list, tuple, float-list and range iterators advance directly;
+iterator indices and exhaustion are written to their stable heap payloads. Range arithmetic uses checked wide integers.
+A float power remains a pure math call. Loop backedges are counted in native code and published in bulk at boundaries.
+Eager feedback and unsupported loop shapes retain the observing backend path.
+
+Entry prepares a C-layout descriptor table and tagged snapshots of immutable/read-only sequence storage. Float data
+stays in its original writable buffer. Generic allocating, calling or mutating helpers invalidate the cache; harmless
+builtin iteration preserves it. Float views are renewed after other reads, and each collection advances a heap epoch
+that invalidates all cached descriptors and guard schemas. These caches are not GC roots. Preparation currently falls
+back when the arena has more than 65,536 slots.
+
+When a loop's imported object identities are invariant, an entry schema validates its item shapes, exact unpack lengths,
+index bounds and scalar types before executing any iteration. Successful validation is cached while those guarantees
+hold. Numerical failure checks remain in the loop. Object phis that can change identity keep per-iteration guards.
+Failed entry validation resumes before the original next operation; later numerical exits preserve completed stores
+and consumed iterator items. The verifier reconstructs the schema and rejects modified metadata or reversed done edges.
+Cranelift runs with its speed optimization pipeline enabled.
+
+`TierStats.native_region_entries`, `native_region_iterations`, `native_region_failures` and `native_runtime_calls`
+separate region work from runtime crossings. LIR dumps expose region imports and hoisted-guard counts. Copy-and-patch
+and reference LIR keep executing the original operations; region metadata currently accelerates Cranelift only.
+
 `TierStats.native_float_views` and `native_float_view_failures` count view acquisitions and storage guard failures.
 There is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.

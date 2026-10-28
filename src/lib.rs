@@ -6,6 +6,7 @@ mod execution;
 pub mod frontend;
 mod heap;
 mod list;
+pub mod region;
 pub use list::List;
 pub mod hir;
 pub mod lir;

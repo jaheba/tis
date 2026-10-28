@@ -1,4 +1,5 @@
 //! Cranelift gateway with guarded heap views and explicit runtime materialization boundaries.
+mod region;
 use crate::{
     Error, Result, Value, Vm,
     bytecode::Code,
@@ -56,8 +57,14 @@ impl NativeCode {
         if std::mem::size_of::<usize>() != 8 || std::mem::size_of::<Slot>() != 32 {
             return Err(error("native backend requires 64-bit pointers"));
         }
-        let mut jit = JITBuilder::new(default_libcall_names()).map_err(error)?;
+        // Region code exposes enough SSA to optimize; Cranelift's default skips its optimization pipeline.
+        let mut jit = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names())
+            .map_err(error)?;
         jit.symbol("tis_callback", callback as *const u8);
+        jit.symbol(
+            "tis_region",
+            crate::native_runtime::region_callback as *const u8,
+        );
         jit.symbol(
             "tis_float_view",
             crate::native_runtime::float_view_callback as *const u8,
@@ -100,6 +107,9 @@ impl NativeCode {
         let view_id = module
             .declare_function("tis_float_view", Linkage::Import, &callback_sig)
             .map_err(error)?;
+        let region_id = module
+            .declare_function("tis_region", Linkage::Import, &callback_sig)
+            .map_err(error)?;
         let mut power_sig = module.make_signature();
         power_sig.params = vec![AbiParam::new(types::F64), AbiParam::new(types::F64)];
         power_sig.returns.push(AbiParam::new(types::F64));
@@ -133,12 +143,29 @@ impl NativeCode {
             scalars.initialize(&mut b, registers, &owner.lir)?;
             let callback_ref = module.declare_func_in_func(callback_id, b.func);
             let view_ref = module.declare_func_in_func(view_id, b.func);
+            let region_ref = module.declare_func_in_func(region_id, b.func);
+            let region_active = owner
+                .lir
+                .regions
+                .iter()
+                .map(|_| {
+                    let v = b.declare_var(types::I64);
+                    let zero = b.ins().iconst(types::I64, 0);
+                    b.def_var(v, zero);
+                    v
+                })
+                .collect::<Vec<_>>();
             let power_ref = module.declare_func_in_func(power_id, b.func);
             let blocks = (0..owner.lir.blocks.len())
                 .map(|_| b.create_block())
                 .collect::<Vec<_>>();
             let failed = b.create_block();
             for (index, &target) in blocks.iter().enumerate() {
+                // A region body requires its prepared header. Even the private entry dispatcher must not
+                // admit an unprepared jump past guards whose checks have been hoisted out of the loop.
+                if !feedback && owner.lir.regions.iter().any(|r| r.body.0 == index) {
+                    continue;
+                }
                 let next = b.create_block();
                 let matches = b.ins().icmp_imm_s(IntCC::Equal, start, index as i64);
                 b.ins().brif(matches, target, &[], next, &[]);
@@ -182,15 +209,55 @@ impl NativeCode {
             }
             for (block_index, body) in owner.lir.blocks.iter().enumerate() {
                 b.switch_to_block(blocks[block_index]);
-                runtime_call!(
-                    &mut b,
-                    callback_ref,
-                    host,
-                    registers,
-                    ENTER,
-                    block_index as i32,
-                    failed,
-                );
+                let region_index = (!feedback)
+                    .then(|| {
+                        owner
+                            .lir
+                            .regions
+                            .iter()
+                            .position(|r| r.header.0 == block_index || r.body.0 == block_index)
+                    })
+                    .flatten();
+                if let Some(index) = region_index {
+                    let r = &owner.lir.regions[index];
+                    if r.header.0 == block_index {
+                        let active = b.use_var(region_active[index]);
+                        let prepare = b.create_block();
+                        let ready = b.create_block();
+                        b.ins().brif(active, ready, &[], prepare, &[]);
+                        b.switch_to_block(prepare);
+                        runtime_call!(
+                            &mut b,
+                            region_ref,
+                            host,
+                            registers,
+                            REGION_ENTER,
+                            index as i32,
+                            failed
+                        );
+                        let one = b.ins().iconst(types::I64, 1);
+                        b.def_var(region_active[index], one);
+                        b.ins().jump(ready, &[]);
+                        b.switch_to_block(ready);
+                    }
+                    let block = b.ins().iconst(types::I64, block_index as i64);
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        block,
+                        registers,
+                        offset(Register(owner.lir.registers.len() + 1), 0)?,
+                    );
+                } else {
+                    runtime_call!(
+                        &mut b,
+                        callback_ref,
+                        host,
+                        registers,
+                        ENTER,
+                        block_index as i32,
+                        failed
+                    );
+                }
                 let mut unpack_reads = 0;
                 for (instruction_index, instruction) in body.instructions.iter().enumerate() {
                     let location = i32::try_from(owner.locations.len()).map_err(error)?;
@@ -200,6 +267,18 @@ impl NativeCode {
                         continue;
                     }
                     let destination = instruction.result;
+                    if let Some(index) = region_index {
+                        let mut emitter = region::Emitter {
+                            b: &mut b,
+                            scalars: &scalars,
+                            registers,
+                            lir: &owner.lir,
+                            region: &owner.lir.regions[index],
+                        };
+                        if emitter.emit(&instruction.operation, destination)? {
+                            continue;
+                        }
+                    }
                     match &instruction.operation {
                         Operation::FloatListView { .. } => runtime_call!(
                             &mut b, view_ref, host, registers, FLOAT_VIEW, location, failed,
@@ -228,7 +307,9 @@ impl NativeCode {
                                 b.ins().iconst(types::I64, *index)
                             };
                             let valid = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-                            side_exit!(&mut b, valid, *failure);
+                            if region_index.is_none_or(|i| owner.lir.regions[i].schema.is_none()) {
+                                side_exit!(&mut b, valid, *failure);
+                            }
                             let offset = b.ins().ishl_imm_u(index, 3);
                             let pointer = b.ins().iadd(pointer, offset);
                             if let Operation::FloatListStore { value, .. } = &instruction.operation
@@ -510,6 +591,7 @@ impl NativeCode {
                         ),
                     }
                     if !feedback
+                        && region_index.is_none()
                         && let Operation::FloatListLoad { view, .. }
                         | Operation::FloatListStore { view, .. }
                         | Operation::FloatListUnpack { view, .. } = &instruction.operation
@@ -567,7 +649,15 @@ impl NativeCode {
                         b.ins().return_(&[status]);
                     }
                     Terminator::Jump(edge) => {
-                        edge_jump(&mut b, &scalars, registers, &owner.lir, edge, &blocks)?;
+                        edge_jump(
+                            &mut b,
+                            &scalars,
+                            registers,
+                            &owner.lir,
+                            edge,
+                            &blocks,
+                            (!feedback).then_some((block_index, region_active.as_slice())),
+                        )?;
                     }
                     Terminator::Branch { condition, yes, no } => {
                         let condition =
@@ -576,9 +666,25 @@ impl NativeCode {
                         let no_block = b.create_block();
                         b.ins().brif(condition, yes_block, &[], no_block, &[]);
                         b.switch_to_block(yes_block);
-                        edge_jump(&mut b, &scalars, registers, &owner.lir, yes, &blocks)?;
+                        edge_jump(
+                            &mut b,
+                            &scalars,
+                            registers,
+                            &owner.lir,
+                            yes,
+                            &blocks,
+                            (!feedback).then_some((block_index, region_active.as_slice())),
+                        )?;
                         b.switch_to_block(no_block);
-                        edge_jump(&mut b, &scalars, registers, &owner.lir, no, &blocks)?;
+                        edge_jump(
+                            &mut b,
+                            &scalars,
+                            registers,
+                            &owner.lir,
+                            no,
+                            &blocks,
+                            (!feedback).then_some((block_index, region_active.as_slice())),
+                        )?;
                     }
                 }
             }
@@ -615,7 +721,7 @@ impl NativeCode {
             &self.lir,
             &self.locations,
             Some(&self.root_states),
-            0,
+            2,
             |context, registers, start| {
                 // SAFETY: the shared bridge keeps its Context and register allocation alive for this call.
                 unsafe { self.entry.unwrap()(context, registers, start) }
@@ -719,7 +825,27 @@ fn edge_jump(
     lir: &lir::Function,
     edge: &lir::Edge,
     blocks: &[ir::Block],
+    region_edge: Option<(usize, &[Variable])>,
 ) -> Result<()> {
+    if let Some((from, active)) = region_edge {
+        for (index, r) in lir.regions.iter().enumerate() {
+            if from == r.body.0 && edge.block == r.header {
+                let meta = Register(lir.registers.len() + 1);
+                let count = load(b, registers, meta, 24, types::I64)?;
+                let next = b.ins().iadd_imm_s(count, 1);
+                b.ins()
+                    .store(MemFlagsData::new(), next, registers, offset(meta, 24)?);
+            }
+            if (from == r.header.0 || from == r.body.0)
+                && edge.block != r.header
+                && edge.block != r.body
+            {
+                let zero = b.ins().iconst(types::I64, 0);
+                b.def_var(active[index], zero);
+            }
+        }
+    }
+
     let pairs = edge
         .arguments
         .iter()
@@ -901,6 +1027,11 @@ fn callback_values(
     event: i32,
     location: i32,
 ) -> Vec<Register> {
+    if event == REGION_ENTER {
+        return state_values(
+            &lir.states[lir.exits[lir.regions[location as usize].entry.0].state.0],
+        );
+    }
     if event == ENTER {
         return lir.blocks[location as usize].parameters.clone();
     }
@@ -922,7 +1053,7 @@ fn callback_failure_values(
     event: i32,
     location: i32,
 ) -> Vec<Register> {
-    if event == ENTER || event == FINISH {
+    if event == ENTER || event == FINISH || event == REGION_ENTER {
         return vec![];
     }
     let (block, index) = locations[location as usize];

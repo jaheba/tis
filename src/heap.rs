@@ -117,6 +117,7 @@ pub struct Heap {
     generations: RefCell<Vec<Option<usize>>>,
     next_generation: Cell<usize>,
     live: Cell<usize>,
+    collection_epoch: usize,
 }
 
 impl Heap {
@@ -127,6 +128,7 @@ impl Heap {
             generations: RefCell::new(Vec::new()),
             next_generation: Cell::new(1),
             live: Cell::new(0),
+            collection_epoch: 0,
         }
     }
 
@@ -267,7 +269,14 @@ impl Heap {
 
     /// All external values that must survive collection must be listed as roots.
     /// Marking completes before freeing anything, so invalid roots leave the heap unchanged.
+    pub(crate) fn collection_epoch(&self) -> usize {
+        self.collection_epoch
+    }
     pub fn collect(&mut self, roots: &[Value]) -> Result<usize> {
+        self.collection_epoch = self
+            .collection_epoch
+            .checked_add(1)
+            .expect("collection epoch exhausted");
         let mut marked = vec![false; self.entries.len()];
         let mut pending = roots.to_vec();
         while let Some(value) = pending.pop() {
