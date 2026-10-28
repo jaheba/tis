@@ -106,6 +106,7 @@ pub(crate) fn execute(
         skip_probe,
         error: None,
         registers: registers.as_mut_ptr(),
+        helper_arguments: Vec::new(),
     };
     // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
     // synchronous invocation. Generated memory offsets are bounds checked during emission.
@@ -150,6 +151,8 @@ struct Context<'a> {
     skip_probe: bool,
     error: Option<Error>,
     registers: *mut Slot,
+    // Each native invocation owns its scratch buffer, including during recursive helper calls.
+    helper_arguments: Vec<Value>,
 }
 pub(crate) extern "C" fn callback(
     raw: *mut c_void,
@@ -240,14 +243,14 @@ impl Context<'_> {
                 Operation::Call {
                     helper, arguments, ..
                 } => {
-                    let values = arguments
-                        .iter()
-                        .map(|r| registers[r.0].value())
-                        .collect::<Result<Vec<_>>>()?;
+                    self.helper_arguments.clear();
+                    for r in arguments {
+                        self.helper_arguments.push(registers[r.0].value()?);
+                    }
                     vm.observe_site(self.function, self.code, self.base, instruction.origin)?;
                     let roots = vm.transient_roots.len();
-                    vm.transient_roots.extend_from_slice(&values);
-                    let result = vm.lir_helper(helper, &values);
+                    vm.transient_roots.extend_from_slice(&self.helper_arguments);
+                    let result = vm.lir_helper(helper, &self.helper_arguments);
                     vm.transient_roots.truncate(roots);
                     Slot::boxed(result?)
                 }

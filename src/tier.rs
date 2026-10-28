@@ -382,13 +382,17 @@ impl Vm {
         rooted: &mut Vec<usize>,
         mut read: impl FnMut(Register) -> Result<Value>,
     ) -> Result<()> {
+        // Installation verifies the immutable root map; do not repeat a quadratic membership scan at each helper.
+        debug_assert!(
+            state
+                .values
+                .iter()
+                .all(|(_, register)| roots.contains(register))
+        );
         for index in rooted.drain(..) {
             self.stack[base + index] = None;
         }
         for (value, register) in &state.values {
-            if !roots.contains(register) {
-                return Err(Error::InvalidIr("missing LIR root"));
-            }
             rooted.push(value.0);
             self.stack[base + value.0] = Some(read(*register)?);
         }
