@@ -52,6 +52,7 @@ pub(crate) fn less(lhs: Value, rhs: Value) -> Result<Value> {
 
 pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
     Ok(match value {
+        Value::Unbound => return Err(Error::InvalidIr("unbound value escaped a local read")),
         Value::None => false,
         Value::Bool(value) => value,
         Value::Int(value) => value != 0,

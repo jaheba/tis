@@ -14,6 +14,12 @@ fn error(message: impl std::fmt::Display) -> Error {
 impl Slot {
     pub(crate) fn boxed(value: Value) -> Self {
         match value {
+            Value::Unbound => Self {
+                tag: UNBOUND,
+                a: 0,
+                b: 0,
+                c: 0,
+            },
             Value::None => Self {
                 tag: NONE,
                 a: 0,
@@ -48,6 +54,7 @@ impl Slot {
     }
     pub(crate) fn value(self) -> Result<Value> {
         Ok(match self.tag {
+            UNBOUND => Value::Unbound,
             NONE => Value::None,
             BOOL => Value::Bool(self.a != 0),
             INT => Value::Int(self.a as i64),

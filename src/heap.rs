@@ -164,6 +164,7 @@ impl Heap {
             return Err(Error::Runtime("RecursionError: tuple key depth".into()));
         }
         match value {
+            Value::Unbound => Err(Error::InvalidIr("unbound dictionary key")),
             Value::None => Ok(Key::None),
             Value::Bool(value) => Ok(Key::Bool(value)),
             Value::Int(value) => Ok(Key::Int(value)),

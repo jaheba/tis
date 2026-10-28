@@ -445,6 +445,7 @@ impl Vm {
                         .get(index)
                         .ok_or(Error::InvalidIr("invalid constant"))?
                     {
+                        Constant::Unbound => Value::Unbound,
                         Constant::None => Value::None,
                         Constant::Bool(value) => Value::Bool(*value),
                         Constant::Int(value) => Value::Int(*value),
@@ -609,6 +610,12 @@ impl Vm {
                     self.store_local(slot, value)?;
                     self.push(Value::None);
                 }
+                Opcode::CheckLocal => {
+                    let slot = read_operand(&code.body, &mut ip)?;
+                    let value = self.pop(frame_end)?;
+                    self.check_local(slot, value)?;
+                    self.push(value);
+                }
             }
             // Collect only between instructions, when all live temporaries are rooted.
             self.maybe_collect()?;
@@ -638,6 +645,22 @@ impl Vm {
                     frame.code.local_names[slot]
                 ))
             })
+    }
+
+    pub(crate) fn check_local(&self, slot: usize, value: Value) -> Result<()> {
+        if value == Value::Unbound {
+            let frame = self
+                .local_frames
+                .last()
+                .ok_or(Error::InvalidIr("local frame"))?;
+            let name = frame
+                .code
+                .local_names
+                .get(slot)
+                .ok_or(Error::InvalidIr("local slot"))?;
+            return Err(Error::Runtime(format!("UnboundLocalError: {name}")));
+        }
+        Ok(())
     }
 
     pub(crate) fn store_local(&mut self, slot: usize, value: Value) -> Result<()> {

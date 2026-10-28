@@ -8,6 +8,8 @@ pub struct ObjectId {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
+    #[doc(hidden)]
+    Unbound,
     None,
     Bool(bool),
     Int(i64),

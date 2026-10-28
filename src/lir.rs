@@ -38,6 +38,7 @@ pub struct FrameState {
     pub environment_root: bool,
     /// Mutable frame locals stay rooted independently of temporary register liveness.
     pub local_count: usize,
+    pub local_values: Vec<Option<Register>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExitReason {
@@ -195,10 +196,13 @@ impl Function {
         };
         for (block_id, body) in hir.blocks.iter().enumerate() {
             let mut instructions = vec![];
+            // Scalar SSA values survive helper calls; their boxed shadows still support frame reconstruction.
+            let mut scalars = BTreeMap::<hir::ValueId, (ValueKind, Register)>::new();
             for (index, instruction) in body.instructions.iter().enumerate() {
                 let origin = instruction.result;
                 let result = Register(origin.0);
                 let state = output.state(
+                    hir,
                     ResumePoint {
                         block: BlockId(block_id),
                         instruction: index,
@@ -278,6 +282,19 @@ impl Function {
                     let inputs = instruction.op.inputs();
                     let mut args = vec![];
                     for (input, kind) in inputs.into_iter().zip(signature) {
+                        if let Some(&(known, scalar)) = scalars.get(&input)
+                            && known == kind
+                        {
+                            if kind == ValueKind::Float {
+                                args.push(scalar);
+                            } else {
+                                let reg = output.register(Type::F64);
+                                emit(&mut instructions, Some(reg), Operation::IntToFloat(scalar));
+                                args.push(reg);
+                            }
+                            continue;
+                        }
+                        let source = input;
                         let input = Register(input.0);
                         if kind == ValueKind::Float {
                             emit(
@@ -290,6 +307,7 @@ impl Function {
                             );
                             let reg = output.register(Type::F64);
                             emit(&mut instructions, Some(reg), Operation::UnboxFloat(input));
+                            scalars.insert(source, (ValueKind::Float, reg));
                             args.push(reg);
                         } else {
                             emit(
@@ -302,6 +320,7 @@ impl Function {
                             );
                             let int = output.register(Type::I64);
                             emit(&mut instructions, Some(int), Operation::UnboxInt(input));
+                            scalars.insert(source, (ValueKind::Int, int));
                             let reg = output.register(Type::F64);
                             emit(&mut instructions, Some(reg), Operation::IntToFloat(int));
                             args.push(reg);
@@ -321,6 +340,7 @@ impl Function {
                             },
                         );
                         emit(&mut instructions, Some(result), Operation::BoxFloat(reg));
+                        scalars.insert(origin, (ValueKind::Float, reg));
                     } else {
                         let reg = output.register(Type::Bool);
                         emit(
@@ -340,45 +360,41 @@ impl Function {
                     };
                     let guard = output.exit(state, ExitReason::TypeGuard);
                     let overflow = output.exit(state, ExitReason::IntegerOverflow);
-                    emit(
-                        &mut instructions,
-                        None,
-                        Operation::GuardInt {
-                            value: Register(left.0),
-                            exit: guard,
-                        },
-                    );
-                    emit(
-                        &mut instructions,
-                        None,
-                        Operation::GuardInt {
-                            value: Register(right.0),
-                            exit: guard,
-                        },
-                    );
-                    let a = output.register(Type::I64);
-                    let b = output.register(Type::I64);
+                    let mut args = vec![];
+                    for input in [left, right] {
+                        if let Some(&(ValueKind::Int, scalar)) = scalars.get(&input) {
+                            args.push(scalar);
+                            continue;
+                        }
+                        emit(
+                            &mut instructions,
+                            None,
+                            Operation::GuardInt {
+                                value: Register(input.0),
+                                exit: guard,
+                            },
+                        );
+                        let scalar = output.register(Type::I64);
+                        emit(
+                            &mut instructions,
+                            Some(scalar),
+                            Operation::UnboxInt(Register(input.0)),
+                        );
+                        scalars.insert(input, (ValueKind::Int, scalar));
+                        args.push(scalar);
+                    }
                     let sum = output.register(Type::I64);
-                    emit(
-                        &mut instructions,
-                        Some(a),
-                        Operation::UnboxInt(Register(left.0)),
-                    );
-                    emit(
-                        &mut instructions,
-                        Some(b),
-                        Operation::UnboxInt(Register(right.0)),
-                    );
                     emit(
                         &mut instructions,
                         Some(sum),
                         Operation::CheckedAdd {
-                            left: a,
-                            right: b,
+                            left: args[0],
+                            right: args[1],
                             overflow,
                         },
                     );
                     emit(&mut instructions, Some(result), Operation::BoxInt(sum));
+                    scalars.insert(origin, (ValueKind::Int, sum));
                 } else if let hir::Op::Constant(Constant::String(text)) = &instruction.op {
                     let roots = output.states[state.0]
                         .values
@@ -452,7 +468,7 @@ impl Function {
                         block: BlockId(block_id),
                         instruction: body.instructions.len(),
                     };
-                    let state = output.state(point, &analysis.live_terminator[block_id]);
+                    let state = output.state(hir, point, &analysis.live_terminator[block_id]);
                     let roots = output.states[state.0]
                         .values
                         .iter()
@@ -490,6 +506,7 @@ impl Function {
             .collect::<BTreeSet<_>>();
         for header in headers {
             let state = output.state(
+                hir,
                 ResumePoint {
                     block: BlockId(header),
                     instruction: 0,
@@ -509,7 +526,7 @@ impl Function {
         self.registers.push(kind);
         id
     }
-    fn state(&mut self, resume: ResumePoint, live: &[ValueId]) -> StateId {
+    fn state(&mut self, hir: &hir::Function, resume: ResumePoint, live: &[ValueId]) -> StateId {
         let id = StateId(self.states.len());
         self.states.push(FrameState {
             resume,
@@ -519,6 +536,14 @@ impl Function {
                 .collect(),
             environment_root: true,
             local_count: self.local_count,
+            local_values: if hir.local_state(resume).is_empty() {
+                vec![None; self.local_count]
+            } else {
+                hir.local_state(resume)
+                    .iter()
+                    .map(|v| v.map(|v| Register(v.0)))
+                    .collect()
+            },
         });
         id
     }
@@ -670,6 +695,7 @@ impl Function {
                     }
                     Operation::BoxFloat(value) => {
                         kind(*value, Type::F64)?;
+                        unboxed_sources.insert(*value, instruction.result.ok_or_else(fail)?);
                         Some(Type::Boxed)
                     }
                     Operation::BoxBool(value) => {
@@ -704,6 +730,7 @@ impl Function {
                     }
                     Operation::BoxInt(value) => {
                         kind(*value, Type::I64)?;
+                        unboxed_sources.insert(*value, instruction.result.ok_or_else(fail)?);
                         Some(Type::Boxed)
                     }
                     Operation::Call {
@@ -715,7 +742,7 @@ impl Function {
                         ..
                     } => {
                         if !helper.accepts(arguments.len())
-                            || matches!(helper, Helper::Python(CoreOp::LoadLocal(slot) | CoreOp::StoreLocal(slot)) if *slot >= self.local_count)
+                            || matches!(helper, Helper::Python(CoreOp::LoadLocal(slot) | CoreOp::StoreLocal(slot) | CoreOp::CheckLocal(slot)) if *slot >= self.local_count)
                         {
                             return Err(fail());
                         }
@@ -782,10 +809,17 @@ impl Function {
             if snapshot.resume.block.0 >= self.blocks.len()
                 || !snapshot.environment_root
                 || snapshot.local_count != self.local_count
+                || snapshot.local_values.len() != self.local_count
             {
                 return Err(fail());
             }
             let mut slots = BTreeSet::new();
+            for register in snapshot.local_values.iter().flatten() {
+                kind(*register, Type::Boxed)?;
+                if !snapshot.values.iter().any(|(_, r)| r == register) {
+                    return Err(fail());
+                }
+            }
             for (value, register) in &snapshot.values {
                 kind(*register, Type::Boxed)?;
                 if self.hir_values.get(value.0) != Some(register) || !slots.insert(*value) {
@@ -841,8 +875,12 @@ impl Function {
         for (id, state) in self.states.iter().enumerate() {
             writeln!(
                 text,
-                "s{id}: resume b{}:{} env=current locals={} slots={:?}",
-                state.resume.block.0, state.resume.instruction, state.local_count, state.values
+                "s{id}: resume b{}:{} env=current locals={} bindings={:?} slots={:?}",
+                state.resume.block.0,
+                state.resume.instruction,
+                state.local_count,
+                state.local_values,
+                state.values
             )
             .unwrap();
         }
@@ -884,13 +922,22 @@ impl Function {
                 .get_mut(value.0)
                 .ok_or(Error::InvalidIr("invalid frame slot"))? = Some(read(*register)?);
         }
+        let mut locals = locals.to_vec();
+        for (slot, register) in snapshot.local_values.iter().enumerate() {
+            if let Some(register) = register {
+                locals[slot] = match read(*register)? {
+                    crate::Value::Unbound => None,
+                    value => Some(value),
+                };
+            }
+        }
         Ok(DeoptFrame {
             function: self.source,
             revision: self.revision,
             resume: snapshot.resume,
             environment,
             slots,
-            locals: locals.to_vec(),
+            locals,
         })
     }
     pub fn resume_offset(&self, state: StateId, code: &crate::bytecode::Code) -> Result<usize> {
@@ -1047,6 +1094,7 @@ impl Helper {
                 | CoreOp::Namespace => count == 0,
                 CoreOp::StoreName(_)
                 | CoreOp::StoreLocal(_)
+                | CoreOp::CheckLocal(_)
                 | CoreOp::Unary(_)
                 | CoreOp::GetAttr(_)
                 | CoreOp::Iter

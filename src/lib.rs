@@ -23,7 +23,7 @@ mod vm;
 pub use tier::{TierStats, Tiering};
 
 pub use error::{Error, Result};
-pub use frontend::{Program, compile};
+pub use frontend::{CompileOptions, Program, compile, compile_with_options};
 pub use heap::{Heap, Key, Object};
 pub use value::{ObjectId, Value};
 pub use vm::Vm;

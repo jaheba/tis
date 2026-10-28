@@ -23,7 +23,23 @@ impl Program {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CompileOptions {
+    pub promote_locals: bool,
+}
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            promote_locals: true,
+        }
+    }
+}
+
 pub fn compile(source: &str) -> Result<Program> {
+    compile_with_options(source, CompileOptions::default())
+}
+
+pub fn compile_with_options(source: &str, options: CompileOptions) -> Result<Program> {
     let module = ruff_python_parser::parse_module(source)
         .map_err(|e| Error::Syntax(e.to_string()))?
         .into_syntax();
@@ -49,6 +65,9 @@ pub fn compile(source: &str) -> Result<Program> {
     }
     builder.finish(block)?;
     builder.function.index_locals(false);
+    if options.promote_locals {
+        builder.function.promote_locals()?;
+    }
     let mut functions = BTreeMap::new();
     for block in &builder.function.blocks {
         for instruction in &block.instructions {

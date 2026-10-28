@@ -4,7 +4,7 @@ use std::{env, fs, process};
 
 use tis::{Object, Value, Vm};
 
-const HELP: &str = "Usage: cargo run --example ir -- [OPTIONS]\n\n  --demo add|sum                Function to inspect (default: sum)\n  --phase cold|warm|fallback    Feedback to collect (default: warm)\n  --source PATH                Inspect Python source (always cold)\n  --function NAME              Function in source (default: <module>)\n  --format text|dot|html|bytecode|lir|profile        Output format (default: text)\n  --output PATH                Write to a file instead of stdout\n  --help                       Show this help\n\nExample:\n  cargo run --example ir -- --format html --output /tmp/tis-ir.html";
+const HELP: &str = "Usage: cargo run --example ir -- [OPTIONS]\n\n  --demo add|sum                Function to inspect (default: sum)\n  --phase cold|warm|fallback    Feedback to collect (default: warm)\n  --source PATH                Inspect Python source (always cold)\n  --function NAME              Function in source (default: <module>)\n  --no-promote                 Inspect slot HIR before SSA promotion\n  --format text|dot|html|bytecode|lir|profile        Output format (default: text)\n  --output PATH                Write to a file instead of stdout\n  --help                       Show this help\n\nExample:\n  cargo run --example ir -- --format html --output /tmp/tis-ir.html";
 
 fn main() {
     if let Err(error) = run() {
@@ -20,11 +20,16 @@ fn run() -> Result<(), String> {
     let mut output = None;
     let mut source = None;
     let mut name = "<module>".to_owned();
+    let mut promote_locals = true;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         if argument == "--help" {
             println!("{HELP}");
             return Ok(());
+        }
+        if argument == "--no-promote" {
+            promote_locals = false;
+            continue;
         }
         let target = match argument.as_str() {
             "--source" => {
@@ -51,7 +56,7 @@ fn run() -> Result<(), String> {
     let mut function = if let Some(path) = source {
         phase = "cold".into();
         let source = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        tis::compile(&source)
+        tis::compile_with_options(&source, tis::CompileOptions { promote_locals })
             .map_err(|error| error.to_string())?
             .function(&name)
             .ok_or_else(|| format!("unknown function {name:?}"))?

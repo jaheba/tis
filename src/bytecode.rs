@@ -51,6 +51,7 @@ pub(crate) enum Opcode {
     Observe,
     LoadLocal,
     StoreLocal,
+    CheckLocal,
 }
 
 impl Opcode {
@@ -76,6 +77,7 @@ impl Opcode {
             17 => Self::Observe,
             18 => Self::LoadLocal,
             19 => Self::StoreLocal,
+            20 => Self::CheckLocal,
             _ => return Err(Error::InvalidIr("invalid opcode")),
         })
     }
@@ -86,6 +88,7 @@ impl Opcode {
             Self::EnterBlock
                 | Self::LoadLocal
                 | Self::StoreLocal
+                | Self::CheckLocal
                 | Self::Observe
                 | Self::Runtime
                 | Self::Constant
@@ -203,7 +206,10 @@ impl Code {
             if opcode.has_operand() {
                 let operand = read_operand(&self.body, &mut ip)?;
                 write!(output, " {operand}").unwrap();
-                if matches!(opcode, Opcode::LoadLocal | Opcode::StoreLocal) {
+                if matches!(
+                    opcode,
+                    Opcode::LoadLocal | Opcode::StoreLocal | Opcode::CheckLocal
+                ) {
                     let name = self
                         .local_names
                         .get(operand)
@@ -273,6 +279,9 @@ impl Builder {
             }
             Op::Runtime(crate::hir::CoreOp::StoreLocal(slot), _) => {
                 self.operand(Opcode::StoreLocal, *slot)?;
+            }
+            Op::Runtime(crate::hir::CoreOp::CheckLocal(slot), _) => {
+                self.operand(Opcode::CheckLocal, *slot)?;
             }
             Op::Runtime(operation, values) => {
                 let id = self.code.operations.len();

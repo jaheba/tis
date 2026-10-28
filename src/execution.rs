@@ -226,6 +226,9 @@ impl Vm {
             }
         }
         for &value in arguments.iter().chain(defaults) {
+            if value == Value::Unbound {
+                return Err(Error::InvalidIr("internal argument value"));
+            }
             if matches!(value, Value::Ref(_)) {
                 self.heap.get(value)?;
             }
@@ -403,6 +406,10 @@ impl Vm {
             }
             CoreOp::LoadName(name) => self.lookup(env, name)?,
             CoreOp::LoadLocal(slot) => self.load_local(*slot)?,
+            CoreOp::CheckLocal(slot) => {
+                self.check_local(*slot, values[0])?;
+                values[0]
+            }
             CoreOp::StoreLocal(slot) => {
                 self.store_local(*slot, values[0])?;
                 Value::None
@@ -1739,6 +1746,7 @@ fn render(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Re
 }
 fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Result<String> {
     Ok(match value {
+        Value::Unbound => return Err(Error::InvalidIr("unbound value representation")),
         Value::None => "None".into(),
         Value::Bool(b) => if b { "True" } else { "False" }.into(),
         Value::Int(n) => n.to_string(),

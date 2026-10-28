@@ -177,6 +177,7 @@ impl Vm {
                 let mut observed = false;
                 let result = match &instruction.operation {
                     Operation::Constant(constant) => Some(Datum::Boxed(match constant {
+                        hir::Constant::Unbound => Value::Unbound,
                         hir::Constant::None => Value::None,
                         hir::Constant::Bool(v) => Value::Bool(*v),
                         hir::Constant::Int(v) => Value::Int(*v),

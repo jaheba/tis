@@ -68,6 +68,7 @@ impl ValueKind {
     ];
     pub(crate) fn of(heap: &Heap, value: Value) -> Self {
         match value {
+            Value::Unbound => Self::Internal,
             Value::None => Self::None,
             Value::Bool(_) => Self::Bool,
             Value::Int(_) => Self::Int,

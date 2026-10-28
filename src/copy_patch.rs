@@ -120,6 +120,7 @@ impl Plan {
                 let stencil = match &instruction.operation {
                     Operation::Constant(value) => {
                         let value = Slot::boxed(match value {
+                            crate::hir::Constant::Unbound => Value::Unbound,
                             crate::hir::Constant::None => Value::None,
                             crate::hir::Constant::Bool(v) => Value::Bool(*v),
                             crate::hir::Constant::Int(v) => Value::Int(*v),

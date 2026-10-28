@@ -52,8 +52,11 @@ Argument and return types are sampled when calls enter or return during an activ
 Eight successful integer observations select a guarded integer addition strategy.
 Type or overflow guard failure falls back to generic arithmetic without rewriting bytecode.
 Name loads, stores, calls and object operations remain explicit HIR operations.
-Uncaptured function locals use `LoadLocal`/`StoreLocal` operations with stable indexed frame slots.
-Bytecode lowers these directly to local-access instructions; LIR currently accesses them through shared helpers.
+Uncaptured function locals are promoted to SSA values before bytecode generation.
+Assignments and reads become value references, with block parameters at branches and loop headers.
+Only parameter loads remain in the prologue; possibly unbound reads retain explicit `CheckLocal` operations.
+An internal unbound marker crosses joins without becoming Python `None`.
+`compile_with_options(source, CompileOptions { promote_locals: false })` retains slot HIR for comparisons.
 Names referenced anywhere in a nested scope conservatively stay in shared environments, even when shadowed there.
 Module/class namespaces and global/nonlocal bindings retain their named lookup rules.
 
@@ -135,8 +138,10 @@ Float comparisons specialize only when both operands are floats, preserving exac
 Observed types are hints: type changes, integer overflow, division by zero and invalid power domains have explicit side exits.
 HIR and LIR verification check definitions, dominance and edge arguments; LIR also checks types, guards and root maps.
 
-A side exit stores live HIR temporaries, mutable local slots and the current lexical environment.
+A side exit stores live HIR temporaries, the current SSA bindings of Python locals and the lexical environment.
+Local binding maps distinguish unbound locals from Python `None` and keep their heap references rooted.
 `lir.reconstruct(state, environment, locals, read_register)` materializes a `DeoptFrame` at a pre-effect boundary.
+SSA bindings replace stale slot contents during reconstruction; prologue bindings can still use initial frame slots.
 `Vm::resume_hir(...)` checks its code revision and continues bytecode execution at that boundary.
 Tests exercise type changes and integer overflow after an earlier mutation, verifying that the mutation is not repeated.
 A hot loop can enter LIR or native execution at its header during the first invocation (OSR).
@@ -159,6 +164,8 @@ The Cranelift emitter is in `src/native.rs`; both native backends use `src/nativ
 The Cranelift emitter follows the [Cranelift JIT API](https://docs.rs/cranelift-jit/0.137.0/cranelift_jit/).
 
 Boxed results still invoke runtime callbacks for roots and optional feedback; registers are materialized in memory.
+Within a block, typed arithmetic reuses existing primitive SSA registers across operations and helper calls.
+Boxed shadow values remain for reconstruction; boxing is not yet deferred to helper calls and side exits.
 LIR helper effects remain conservative; there is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
 Native execution is currently tested on macOS ARM64; the bytecode and reference LIR paths remain available.
@@ -214,7 +221,7 @@ Monty's reference counting and HeapReader API are not part of this port.
 
 Collection runs between bytecode instructions and at LIR/native runtime boundaries.
 Temporary slots, local slots, active environments, in-flight calls and module globals are rooted.
-LIR/native safepoints use live temporary root maps and retain the separate local frame.
+LIR/native safepoints include SSA local bindings in their root maps and retain the initial local frame.
 Host-held handles can be retained with `Vm::pin` and released with `Vm::unpin`.
 `Vm::collect_garbage(&roots)` also accepts temporary external roots.
 Direct `Heap` use has explicit collection only.

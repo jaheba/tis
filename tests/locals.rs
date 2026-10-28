@@ -33,11 +33,11 @@ fn hir_distinguishes_slots_from_shared_bindings() {
     assert!(function.local_slots().contains(&"scratch".into()));
     assert!(!function.local_slots().contains(&"a".into()));
     let dump = function.dump();
-    assert!(dump.contains("StoreLocal"));
-    assert!(dump.contains("LoadLocal"));
+    assert!(!dump.contains("StoreLocal"));
+    assert!(!dump.contains("LoadLocal"));
     let bytecode = function.bytecode().unwrap().disassemble().unwrap();
-    assert!(bytecode.contains("LoadLocal"));
-    assert!(bytecode.contains("StoreLocal"));
+    assert!(!bytecode.contains("LoadLocal"));
+    assert!(!bytecode.contains("StoreLocal"));
     let lir = function.lower_lir(LoweringMode::Generic).unwrap();
     assert_eq!(lir.local_count, function.local_slots().len());
     assert!(
@@ -119,7 +119,7 @@ fn invalid_local_operations_are_rejected_before_execution() {
 
 #[test]
 fn detached_side_exit_restores_local_values_and_rejects_wrong_layouts() {
-    use tis::lir::{ExitReason, Operation};
+    use tis::lir::ExitReason;
     let mut vm = execute(
         "calls=[0]\ndef f(a,b):\n    calls[0]+=1\n    saved=[42]\n    value=a+b\n    return saved[0],value\nfor i in range(10):\n    f(1,2)\n",
         Tiering::Bytecode,
@@ -130,18 +130,6 @@ fn detached_side_exit_restores_local_values_and_rejects_wrong_layouts() {
         .exits
         .iter()
         .find(|exit| exit.reason == ExitReason::TypeGuard)
-        .unwrap();
-    let guard = lir
-        .blocks
-        .iter()
-        .flat_map(|b| &b.instructions)
-        .find_map(|instruction| {
-            if let Operation::GuardInt { value, .. } = instruction.operation {
-                Some(value)
-            } else {
-                None
-            }
-        })
         .unwrap();
     let saved = vm.heap.allocate(tis::Object::List(vec![Value::Int(42)]));
     let locals = function
@@ -164,14 +152,19 @@ fn detached_side_exit_restores_local_values_and_rejects_wrong_layouts() {
         lir.reconstruct(exit.state, env, &[], |_| Ok(Value::None))
             .is_err()
     );
+    let registers = lir.states[exit.state.0]
+        .local_values
+        .iter()
+        .zip(&locals)
+        .filter_map(|(r, v)| r.map(|r| (r, v.unwrap_or(Value::Unbound))))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let frame = lir
-        .reconstruct(exit.state, env, &locals, |register| {
-            Ok(if register == guard {
-                Value::Float(1.25)
-            } else {
-                Value::Float(2.5)
-            })
-        })
+        .reconstruct(
+            exit.state,
+            env,
+            &locals,
+            |register| Ok(registers[&register]),
+        )
         .unwrap();
     let mut invalid = frame.clone();
     invalid.locals.clear();

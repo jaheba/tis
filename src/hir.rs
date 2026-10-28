@@ -1,4 +1,5 @@
 mod analysis;
+mod promote;
 mod view;
 pub use analysis::Analysis;
 
@@ -22,6 +23,8 @@ pub struct BlockId(pub usize);
 
 #[derive(Debug, Clone)]
 pub enum Constant {
+    /// Internal marker carried through local-value joins, never a Python value.
+    Unbound,
     None,
     Bool(bool),
     Int(i64),
@@ -115,6 +118,7 @@ pub enum CoreOp {
     StoreName(String),
     LoadLocal(usize),
     StoreLocal(usize),
+    CheckLocal(usize),
     Binary(String),
     Inplace(String),
     Compare(String),
@@ -152,6 +156,7 @@ pub struct Function {
     pub(crate) kwarg: Option<String>,
     pub(crate) local_names: Vec<String>,
     pub(crate) local_slots: Vec<String>,
+    pub(crate) local_states: Vec<Vec<Vec<Option<ValueId>>>>,
     pub(crate) global_names: Vec<String>,
     pub(crate) nonlocal_names: Vec<String>,
     pub(crate) module: bool,
@@ -175,6 +180,7 @@ impl Function {
             kwarg: None,
             local_names: Vec::new(),
             local_slots: Vec::new(),
+            local_states: Vec::new(),
             global_names: Vec::new(),
             nonlocal_names: Vec::new(),
             module: false,
@@ -192,6 +198,15 @@ impl Function {
 
     pub fn local_slots(&self) -> &[String] {
         &self.local_slots
+    }
+
+    /// Bindings before an operation; None retains the original frame slot during the prologue.
+    pub fn local_state(&self, point: ResumePoint) -> &[Option<ValueId>] {
+        self.local_states
+            .get(point.block.0)
+            .and_then(|states| states.get(point.instruction))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub(crate) fn index_locals(&mut self, class_scope: bool) {
@@ -256,6 +271,10 @@ impl Function {
             instructions: Vec::new(),
             terminator: None,
         });
+        if !self.local_states.is_empty() {
+            self.local_states
+                .push(vec![vec![None; self.local_slots.len()]]);
+        }
         id
     }
 
@@ -264,6 +283,10 @@ impl Function {
     }
 
     pub fn append(&mut self, block: BlockId, op: Op) -> ValueId {
+        if !self.local_states.is_empty() {
+            let states = &mut self.local_states[block.0];
+            states.push(states.last().unwrap().clone());
+        }
         let result = self.value();
         let feedback = matches!(op, Op::Add(..)).then(AddFeedback::default);
         self.locations[result.0] = Some((block.0, self.blocks[block.0].instructions.len()));

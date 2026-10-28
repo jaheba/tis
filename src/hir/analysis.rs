@@ -20,11 +20,25 @@ fn edges(term: &Terminator) -> Vec<&super::Edge> {
 }
 
 pub(super) fn analyze(function: &Function) -> Result<Analysis> {
+    if !function.local_states.is_empty()
+        && (function.local_states.len() != function.blocks.len()
+            || function
+                .blocks
+                .iter()
+                .zip(&function.local_states)
+                .any(|(block, states)| {
+                    states.len() != block.instructions.len() + 1
+                        || states.iter().any(|s| s.len() != function.local_slots.len())
+                }))
+    {
+        return Err(Error::InvalidIr("local reconstruction layout"));
+    }
     for instruction in function.blocks.iter().flat_map(|b| &b.instructions) {
         if let super::Op::Runtime(operation, inputs) = &instruction.op {
             let local = match operation {
                 super::CoreOp::LoadLocal(slot) => Some((*slot, 0)),
                 super::CoreOp::StoreLocal(slot) => Some((*slot, 1)),
+                super::CoreOp::CheckLocal(slot) => Some((*slot, 1)),
                 _ => None,
             };
             if let Some((slot, arity)) = local
@@ -124,9 +138,46 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
     let mut backedges = BTreeSet::new();
     for (block, body) in function.blocks.iter().enumerate() {
         for (index, instruction) in body.instructions.iter().enumerate() {
+            if !function.local_states.is_empty() {
+                match &instruction.op {
+                    super::Op::Runtime(super::CoreOp::StoreLocal(_), _) => {
+                        return Err(Error::InvalidIr("store into an SSA local"));
+                    }
+                    super::Op::Runtime(super::CoreOp::LoadLocal(slot), _)
+                        if function.local_state(super::ResumePoint {
+                            block: BlockId(block),
+                            instruction: index,
+                        })[*slot]
+                            .is_some() =>
+                    {
+                        return Err(Error::InvalidIr("load from an SSA local"));
+                    }
+                    _ => {}
+                }
+            }
             for input in instruction.op.inputs() {
                 check(input, block, index + 1)?;
             }
+            for input in function
+                .local_state(super::ResumePoint {
+                    block: BlockId(block),
+                    instruction: index,
+                })
+                .iter()
+                .flatten()
+            {
+                check(*input, block, index + 1)?;
+            }
+        }
+        for input in function
+            .local_state(super::ResumePoint {
+                block: BlockId(block),
+                instruction: body.instructions.len(),
+            })
+            .iter()
+            .flatten()
+        {
+            check(*input, block, body.instructions.len() + 1)?;
         }
         let term = body.terminator.as_ref().unwrap();
         match term {
@@ -169,11 +220,31 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
             }
             _ => {}
         }
+        live.extend(
+            function
+                .local_state(super::ResumePoint {
+                    block: BlockId(block),
+                    instruction: body.instructions.len(),
+                })
+                .iter()
+                .flatten()
+                .copied(),
+        );
         let terminator_live = live.iter().copied().collect::<Vec<_>>();
         let mut before = vec![vec![]; body.instructions.len()];
         for (index, instruction) in body.instructions.iter().enumerate().rev() {
             live.remove(&instruction.result);
             live.extend(instruction.op.inputs());
+            live.extend(
+                function
+                    .local_state(super::ResumePoint {
+                        block: BlockId(block),
+                        instruction: index,
+                    })
+                    .iter()
+                    .flatten()
+                    .copied(),
+            );
             before[index] = live.iter().copied().collect();
         }
         (live, before, terminator_live)
