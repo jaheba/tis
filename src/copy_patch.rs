@@ -124,10 +124,19 @@ impl Plan {
                 };
                 let stencil = match &instruction.operation {
                     Operation::FloatListView { .. } => {
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = native_runtime::float_view_callback as *const u8 as usize;
                         p.event = FLOAT_VIEW;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "callback"
+                    }
+                    Operation::FloatListUnpack { value, view } => {
+                        p.left = slot(*value)?;
+                        p.right = slot(*view)?;
+                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.event = FINISH;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        p.tag = (!feedback) as u64;
+                        "float_unpack"
                     }
                     Operation::FloatListLoad {
                         view,
@@ -522,7 +531,7 @@ mod tests {
     use super::*;
     #[test]
     fn stencil_library_contains_offline_code() {
-        assert_eq!(generated::STENCILS.len(), 24);
+        assert_eq!(generated::STENCILS.len(), 25);
         assert!(
             generated::STENCILS
                 .iter()

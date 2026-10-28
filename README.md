@@ -226,6 +226,13 @@ Guard failures reconstruct the live frame image on the failure branch. Native GC
 the original frame states remain available for deoptimization. Imported OSR values retain tagged storage until checked,
 and eager feedback artifacts retain immediate boxing. Reopened feedback windows materialize values for observation.
 Float-list views remain block-local; deferred boxing does not extend their lifetime across callbacks or backedges.
+Profiled, fixed-length unpacking of homogeneous float lists uses one exact-length storage guard and direct element
+loads. Lowering requires a contiguous eager unpack bundle and observed float results at every element site.
+All elements are read before assignment targets can mutate the source. Mixed lists, tuples, iterators and starred
+unpacking retain the existing paths; failed guards resume the original unpack without repeating source evaluation.
+Float-view acquisition has a narrow runtime entry point with panic containment and no frame checkpoint, since it
+cannot execute Python, collect or change frames. Views still end at invalidating helpers and block edges.
+LIR retains original HIR observation operands so reopened feedback branches keep only their own inputs and result live.
 `TierStats.native_float_views` and `native_float_view_failures` count view acquisitions and storage guard failures.
 There is no inlining or escape analysis yet.
 Guard failures permit bounded reprofiling and recompilation, using accumulated observations.
@@ -240,7 +247,7 @@ cargo run --release --example backend_compare
 ```
 
 `build.rs` invokes rustc once per target build to compile `src/copy_patch/stencils.rs` at optimization level 3.
-It extracts 24 self-contained function bodies from the object file into the executable's stencil library.
+It extracts 25 self-contained function bodies from the object file into the executable's stencil library.
 The build rejects external relocations and indirect non-tail continuations.
 The shared scalar module supplies float arithmetic and comparison semantics; Python helpers, GC and side exits
 use the same runtime bridge as Cranelift.

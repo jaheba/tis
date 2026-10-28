@@ -114,7 +114,13 @@ pub enum SequenceIndex {
 pub enum Operation {
     FloatListView {
         value: Register,
+        length: Option<usize>,
         failure: ExitId,
+    },
+    /// The view has already checked exact unpack length; preserve the boxed source for frame snapshots.
+    FloatListUnpack {
+        value: Register,
+        view: Register,
     },
     FloatListLoad {
         view: Register,
@@ -229,6 +235,8 @@ pub struct Function {
     pub osr_entries: Vec<OsrEntry>,
     /// Boxed registers correspond directly to interpreter frame slots.
     pub hir_values: Vec<Register>,
+    /// Original boxed HIR operands needed when an active artifact resumes observation.
+    pub observation_inputs: Vec<Vec<Register>>,
     pub local_count: usize,
     /// Primitive loop parameters and entry-invariant scalars retain boxed sources for OSR reconstruction.
     pub scalar_sources: BTreeMap<Register, Register>,
@@ -248,6 +256,7 @@ impl Function {
             exits: vec![],
             osr_entries: vec![],
             hir_values: (0..hir.value_count).map(Register).collect(),
+            observation_inputs: vec![vec![]; hir.value_count],
             local_count: hir.local_slots.len(),
             scalar_sources: BTreeMap::new(),
             scalar_entries: BTreeMap::new(),
@@ -305,6 +314,7 @@ impl Function {
             let mut instructions = vec![];
             let mut sequences = BTreeMap::<hir::ValueId, SequenceKind>::new();
             let mut views = BTreeMap::<hir::ValueId, Register>::new();
+            let mut float_unpacks = BTreeMap::<hir::ValueId, Register>::new();
             // Scalar SSA values survive helper calls; their boxed shadows still support frame reconstruction.
             let mut scalars = globals.clone();
             scalars.extend(
@@ -314,6 +324,12 @@ impl Function {
             );
             for (index, instruction) in body.instructions.iter().enumerate() {
                 let origin = instruction.result;
+                output.observation_inputs[origin.0] = instruction
+                    .op
+                    .inputs()
+                    .into_iter()
+                    .map(|v| Register(v.0))
+                    .collect();
                 let result = Register(origin.0);
                 let state = output.state(
                     hir,
@@ -334,6 +350,73 @@ impl Function {
                         },
                     })
                 };
+                if let hir::Op::Runtime(CoreOp::Unpack(count), inputs) = &instruction.op
+                    && mode == LoweringMode::Profiled
+                    && *count > 0
+                    && unpack_bundle(hir, block_id, index, *count)
+                    && profile.site(origin).is_some_and(|site| {
+                        site.executions >= hir::AddFeedback::WARMUP as u64
+                            && site.operands.first().and_then(|p| p.monomorphic())
+                                == Some(ValueKind::List)
+                    })
+                    && body.instructions[index + 1..index + 1 + count]
+                        .iter()
+                        .all(|item| {
+                            profile.site(item.result).is_some_and(|site| {
+                                site.executions >= hir::AddFeedback::WARMUP as u64
+                                    && site.result.monomorphic() == Some(ValueKind::Float)
+                            })
+                        })
+                {
+                    let view = output.register(Type::FloatView);
+                    let failure = output.exit(state, ExitReason::SequenceGuard);
+                    emit(
+                        &mut instructions,
+                        Some(view),
+                        Operation::FloatListView {
+                            value: Register(inputs[0].0),
+                            length: Some(*count),
+                            failure,
+                        },
+                    );
+                    emit(
+                        &mut instructions,
+                        Some(result),
+                        Operation::FloatListUnpack {
+                            value: Register(inputs[0].0),
+                            view,
+                        },
+                    );
+                    views.clear();
+                    views.insert(inputs[0], view);
+                    views.insert(origin, view);
+                    float_unpacks.insert(origin, view);
+                    continue;
+                }
+                if let hir::Op::Runtime(CoreOp::UnpackItem(index), inputs) = &instruction.op
+                    && let Some(&view) = float_unpacks.get(&inputs[0])
+                    && views.get(&inputs[0]) == Some(&view)
+                {
+                    let failure = output.exit(state, ExitReason::SequenceGuard);
+                    emit(
+                        &mut instructions,
+                        Some(result),
+                        Operation::FloatListLoad {
+                            view,
+                            index: i64::try_from(*index)
+                                .map_err(|_| Error::InvalidIr("unpack index"))?,
+                            failure,
+                        },
+                    );
+                    let scalar = output.register(Type::F64);
+                    emit(
+                        &mut instructions,
+                        Some(scalar),
+                        Operation::UnboxFloat(result),
+                    );
+                    scalars.insert(origin, (ValueKind::Float, scalar));
+                    continue;
+                }
                 let typed = match &instruction.op {
                     hir::Op::GetItem(source, key) => Some((*source, *key, None)),
                     hir::Op::SetItem { object, key, value } => Some((*object, *key, Some(*value))),
@@ -369,6 +452,7 @@ impl Function {
                             Some(view),
                             Operation::FloatListView {
                                 value: Register(source.0),
+                                length: None,
                                 failure,
                             },
                         );
@@ -1002,6 +1086,14 @@ impl Function {
                 return Err(fail());
             }
         }
+        if self.observation_inputs.len() != self.hir_values.len() {
+            return Err(fail());
+        }
+        for inputs in &self.observation_inputs {
+            for &input in inputs {
+                kind(input, Type::Boxed)?;
+            }
+        }
         let mut definitions = BTreeSet::new();
         for body in &self.blocks {
             for &parameter in &body.parameters {
@@ -1021,7 +1113,7 @@ impl Function {
             let mut unboxed_sources = self.scalar_sources.clone();
             for instruction in &body.instructions {
                 let expected = match &instruction.operation {
-                    Operation::FloatListView { value, failure } => {
+                    Operation::FloatListView { value, failure, .. } => {
                         kind(*value, Type::Boxed)?;
                         let snapshot = state(exit(*failure)?.state)?;
                         if exit(*failure)?.reason != ExitReason::SequenceGuard
@@ -1031,6 +1123,20 @@ impl Function {
                             return Err(fail());
                         }
                         Some(Type::FloatView)
+                    }
+                    Operation::FloatListUnpack { value, view } => {
+                        kind(*value, Type::Boxed)?;
+                        kind(*view, Type::FloatView)?;
+                        let producer = body
+                            .instructions
+                            .iter()
+                            .find(|i| i.result == Some(*view))
+                            .ok_or_else(fail)?;
+                        if !matches!(producer.operation, Operation::FloatListView { value: source, length: Some(_), .. } if source == *value)
+                        {
+                            return Err(fail());
+                        }
+                        Some(Type::Boxed)
                     }
                     Operation::FloatListLoad { view, failure, .. }
                     | Operation::FloatListStore { view, failure, .. } => {
@@ -1338,7 +1444,8 @@ impl Function {
                 match &instruction.operation {
                     Operation::FloatListView { .. } => active = instruction.result,
                     Operation::FloatListLoad { view, .. }
-                    | Operation::FloatListStore { view, .. } => {
+                    | Operation::FloatListStore { view, .. }
+                    | Operation::FloatListUnpack { view, .. } => {
                         if active != Some(*view) {
                             return Err(fail());
                         }
@@ -1531,6 +1638,7 @@ impl Operation {
     pub(crate) fn inputs(&self) -> Vec<Register> {
         match self {
             Self::FloatListView { value, .. } => vec![*value],
+            Self::FloatListUnpack { value, view } => vec![*value, *view],
             Self::FloatListLoad { view, .. } => vec![*view],
             Self::FloatListStore { view, value, .. } => vec![*view, *value],
             Self::SequenceUnpack { value, .. } => vec![*value],
@@ -1622,6 +1730,14 @@ impl Function {
             for (index, ins) in block.instructions.iter().enumerate() {
                 for register in ins.operation.inputs() {
                     check(register, id, index + 1)?;
+                }
+                if ins
+                    .result
+                    .is_some_and(|r| self.registers[r.0] == Type::Boxed)
+                {
+                    for &input in self.observation_inputs.get(ins.origin.0).ok_or_else(fail)? {
+                        check(input, id, index + 1)?;
+                    }
                 }
                 let snapshot = match &ins.operation {
                     Operation::GuardInt { exit, .. }

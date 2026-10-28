@@ -217,3 +217,51 @@ def f(depth,x):
         assert_eq!(elements, 3);
     }
 }
+
+#[test]
+fn reopened_window_observes_direct_float_unpack_operands_and_results() {
+    let program = "def f(depth,x):\n    y=x+1.0\n    if depth:\n        f(0,3)\n    a,b,c=[y,y,y]\n    return a+b+c\n";
+    for tier in TIERS {
+        let (mut vm, f) = setup(program, tier);
+        for _ in 0..24 {
+            vm.call(f, &[Value::Int(0), Value::Float(3.0)]).unwrap();
+        }
+        let before = vm.function_hir(f).unwrap().profile();
+        let lir = vm
+            .function_hir(f)
+            .unwrap()
+            .lower_lir(tis::lir::LoweringMode::Profiled)
+            .unwrap();
+        let sites = lir
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i.operation,
+                    tis::lir::Operation::FloatListUnpack { .. }
+                        | tis::lir::Operation::FloatListLoad { .. }
+                )
+            })
+            .map(|i| i.origin.0)
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 4);
+        let misses = vm.tier_stats.deoptimizations;
+        assert_eq!(
+            vm.call(f, &[Value::Int(1), Value::Float(3.0)]).unwrap(),
+            Value::Float(12.0)
+        );
+        assert!(vm.tier_stats.deoptimizations > misses);
+        let after = vm.function_hir(f).unwrap().profile();
+        for site in sites {
+            assert_eq!(
+                after.sites[site].executions,
+                before.sites[site].executions + 2
+            );
+            assert_eq!(
+                after.sites[site].result.observations(),
+                before.sites[site].result.observations() + 2
+            );
+        }
+    }
+}

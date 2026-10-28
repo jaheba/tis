@@ -144,7 +144,7 @@ fn float_view_cannot_survive_a_callback() {
         })
         .unwrap();
     let original = lir.blocks[block].instructions[index].clone();
-    let Operation::FloatListView { value, failure } = original.operation else {
+    let Operation::FloatListView { value, failure, .. } = original.operation else {
         panic!()
     };
     let state = lir.exits[failure.0].state;
@@ -317,4 +317,239 @@ fn deferred_floats_and_heap_roots_survive_collection_inside_native_loops() {
     );
     assert!(vm.tier_stats.native_entries > before);
     assert!(vm.heap.allocation_count() < 4096);
+}
+
+#[test]
+fn float_unpack_uses_direct_loads_and_falls_back_on_length_or_storage_changes() {
+    for tier in TIERS {
+        let (mut vm, f) = setup("def f(xs):\n    a,b,c=xs\n    return [a,b,c]\n", tier);
+        let xs = vm.heap.allocate(Object::List(
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into(),
+        ));
+        for _ in 0..24 {
+            vm.call(f, &[xs]).unwrap();
+        }
+        let lir = vm
+            .function_hir(f)
+            .unwrap()
+            .lower_lir(LoweringMode::Profiled)
+            .unwrap();
+        assert!(
+            lir.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i.operation,
+                    Operation::FloatListView {
+                        length: Some(3),
+                        ..
+                    }
+                ))
+        );
+        assert_eq!(
+            lir.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i.operation, Operation::FloatListLoad { .. }))
+                .count(),
+            3
+        );
+        vm.heap.set_item(xs, Value::Int(1), Value::Int(9)).unwrap();
+        let result = vm.call(f, &[xs]).unwrap();
+        assert_eq!(
+            vm.heap.get_item(result, Value::Int(1)).unwrap(),
+            Value::Int(9)
+        );
+        assert!(vm.tier_stats.deoptimizations > 0);
+        for len in [2, 4] {
+            let short = vm
+                .heap
+                .allocate(Object::List(vec![Value::Float(1.0); len].into()));
+            assert!(
+                vm.call(f, &[short])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ValueError")
+            );
+            assert_eq!(vm.stack_len(), 0);
+        }
+    }
+}
+
+#[test]
+fn float_unpack_snapshots_elements_before_aliasing_assignment_targets_mutate_source() {
+    for tier in TIERS {
+        let (mut vm, f) = setup(
+            "def f(xs):\n    xs[1],xs[0],xs[2]=xs\n    return xs\n",
+            tier,
+        );
+        let xs = vm.heap.allocate(Object::List(
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into(),
+        ));
+        for _ in 0..24 {
+            vm.call(f, &[xs]).unwrap();
+        }
+        vm.heap
+            .set_item(xs, Value::Int(0), Value::Float(7.0))
+            .unwrap();
+        vm.heap
+            .set_item(xs, Value::Int(1), Value::Float(8.0))
+            .unwrap();
+        vm.profiling = ProfileConfig::eager();
+        vm.call(f, &[xs]).unwrap();
+        assert_eq!(
+            vm.heap.get_item(xs, Value::Int(0)).unwrap(),
+            Value::Float(8.0)
+        );
+        assert_eq!(
+            vm.heap.get_item(xs, Value::Int(1)).unwrap(),
+            Value::Float(7.0)
+        );
+    }
+}
+
+#[test]
+fn float_unpack_length_failure_does_not_repeat_source_evaluation_or_assign_targets() {
+    for tier in TIERS {
+        let (mut vm, f) = setup(
+            "count=[0]\nresult=[0,0,0]\ndef source(xs):\n    count[0]+=1\n    return xs\ndef f(xs):\n    result[0],result[1],result[2]=source(xs)\n    return count[0]\n",
+            tier,
+        );
+        let xs = vm.heap.allocate(Object::List(
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into(),
+        ));
+        for _ in 0..24 {
+            vm.call(f, &[xs]).unwrap();
+        }
+        let count = vm.get_global("count").unwrap();
+        let before = vm.heap.get_item(count, Value::Int(0)).unwrap();
+        let result = vm.get_global("result").unwrap();
+        let before_deopts = vm.tier_stats.deoptimizations;
+        let wrong = vm.heap.allocate(Object::List(
+            vec![Value::Float(4.0), Value::Float(5.0)].into(),
+        ));
+        assert!(
+            vm.call(f, &[wrong])
+                .unwrap_err()
+                .to_string()
+                .contains("ValueError")
+        );
+        assert!(vm.tier_stats.deoptimizations > before_deopts);
+        let Value::Int(before) = before else { panic!() };
+        assert_eq!(
+            vm.heap.get_item(count, Value::Int(0)).unwrap(),
+            Value::Int(before + 1)
+        );
+        assert_eq!(
+            vm.heap.get_item(result, Value::Int(0)).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(vm.stack_len(), 0);
+    }
+}
+
+#[test]
+fn float_unpack_exact_length_guards_run_before_assigning_any_target() {
+    for tier in TIERS {
+        for len in [2, 4] {
+            let (mut vm, f) = setup(
+                "result=[0,0,0]\ndef f(xs):\n    result[0],result[1],result[2]=xs\n    return result\n",
+                tier,
+            );
+            let xs = vm.heap.allocate(Object::List(
+                vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into(),
+            ));
+            for _ in 0..24 {
+                vm.call(f, &[xs]).unwrap();
+            }
+            let before = vm.tier_stats.deoptimizations;
+            let wrong = vm
+                .heap
+                .allocate(Object::List(vec![Value::Float(7.0); len].into()));
+            assert!(
+                vm.call(f, &[wrong])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ValueError")
+            );
+            assert!(vm.tier_stats.deoptimizations > before);
+            let result = vm.get_global("result").unwrap();
+            assert_eq!(
+                vm.heap.get_item(result, Value::Int(0)).unwrap(),
+                Value::Float(1.0)
+            );
+            assert_eq!(
+                vm.heap.get_item(result, Value::Int(1)).unwrap(),
+                Value::Float(2.0)
+            );
+            assert_eq!(
+                vm.heap.get_item(result, Value::Int(2)).unwrap(),
+                Value::Float(3.0)
+            );
+        }
+    }
+}
+
+#[test]
+fn float_unpack_kind_change_and_nested_failure_reconstruct_correctly() {
+    for tier in TIERS {
+        let (mut vm, f) = setup(
+            "def f(pair):\n    (a,b,c),(d,e,f)=pair\n    return a+b+c+d+e+f\n",
+            tier,
+        );
+        let xs = vm.heap.allocate(Object::List(
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into(),
+        ));
+        let pair = vm.heap.allocate(Object::Tuple(vec![xs, xs]));
+        for _ in 0..24 {
+            assert_eq!(vm.call(f, &[pair]).unwrap(), Value::Float(12.0));
+        }
+        let tuple = vm.heap.allocate(Object::Tuple(vec![
+            Value::Float(4.0),
+            Value::Float(5.0),
+            Value::Float(6.0),
+        ]));
+        let pair = vm.heap.allocate(Object::Tuple(vec![xs, tuple]));
+        let before = vm.tier_stats.deoptimizations;
+        assert_eq!(vm.call(f, &[pair]).unwrap(), Value::Float(21.0));
+        assert!(vm.tier_stats.deoptimizations > before);
+    }
+}
+
+#[test]
+fn float_unpack_requires_a_view_with_an_exact_length_check() {
+    let (mut vm, f) = setup(
+        "def f(xs):\n    a,b,c=xs\n    return a+b+c\n",
+        Tiering::Native,
+    );
+    let xs = vm.heap.allocate(Object::List(
+        vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into(),
+    ));
+    for _ in 0..24 {
+        vm.call(f, &[xs]).unwrap();
+    }
+    let mut lir = vm
+        .function_hir(f)
+        .unwrap()
+        .lower_lir(LoweringMode::Profiled)
+        .unwrap();
+    let view = lir
+        .blocks
+        .iter_mut()
+        .flat_map(|b| &mut b.instructions)
+        .find(|i| {
+            matches!(
+                i.operation,
+                Operation::FloatListView {
+                    length: Some(_),
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let Operation::FloatListView { length, .. } = &mut view.operation else {
+        panic!()
+    };
+    *length = None;
+    assert!(lir.verify().is_err());
 }

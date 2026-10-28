@@ -58,6 +58,10 @@ impl NativeCode {
         }
         let mut jit = JITBuilder::new(default_libcall_names()).map_err(error)?;
         jit.symbol("tis_callback", callback as *const u8);
+        jit.symbol(
+            "tis_float_view",
+            crate::native_runtime::float_view_callback as *const u8,
+        );
         jit.symbol("tis_power", power as *const u8);
         let recipes = lir.native_boxing_recipes();
         let root_states = lir
@@ -93,6 +97,9 @@ impl NativeCode {
         let callback_id = module
             .declare_function("tis_callback", Linkage::Import, &callback_sig)
             .map_err(error)?;
+        let view_id = module
+            .declare_function("tis_float_view", Linkage::Import, &callback_sig)
+            .map_err(error)?;
         let mut power_sig = module.make_signature();
         power_sig.params = vec![AbiParam::new(types::F64), AbiParam::new(types::F64)];
         power_sig.returns.push(AbiParam::new(types::F64));
@@ -125,6 +132,7 @@ impl NativeCode {
             let (host, registers, start) = (params[0], params[1], params[2]);
             scalars.initialize(&mut b, registers, &owner.lir)?;
             let callback_ref = module.declare_func_in_func(callback_id, b.func);
+            let view_ref = module.declare_func_in_func(view_id, b.func);
             let power_ref = module.declare_func_in_func(power_id, b.func);
             let blocks = (0..owner.lir.blocks.len())
                 .map(|_| b.create_block())
@@ -194,14 +202,11 @@ impl NativeCode {
                     let destination = instruction.result;
                     match &instruction.operation {
                         Operation::FloatListView { .. } => runtime_call!(
-                            &mut b,
-                            callback_ref,
-                            host,
-                            registers,
-                            FLOAT_VIEW,
-                            location,
-                            failed,
+                            &mut b, view_ref, host, registers, FLOAT_VIEW, location, failed,
                         ),
+                        Operation::FloatListUnpack { value, .. } => {
+                            copy_slots(&mut b, registers, &[(*value, destination.unwrap())])?;
+                        }
                         Operation::FloatListLoad {
                             view,
                             index,
@@ -506,7 +511,8 @@ impl NativeCode {
                     }
                     if !feedback
                         && let Operation::FloatListLoad { view, .. }
-                        | Operation::FloatListStore { view, .. } = &instruction.operation
+                        | Operation::FloatListStore { view, .. }
+                        | Operation::FloatListUnpack { view, .. } = &instruction.operation
                     {
                         let sample =
                             load_cached(&mut b, &scalars, registers, *view, 24, types::I64)?;
@@ -898,12 +904,15 @@ fn callback_values(
     if event == ENTER {
         return lir.blocks[location as usize].parameters.clone();
     }
-    if event == FINISH {
-        // A reopened observation window may inspect the original HIR operands as well as the result.
-        return lir.boxing_recipes().keys().copied().collect();
-    }
     let (block, index) = locations[location as usize];
     let instruction = &lir.blocks[block].instructions[index];
+    if event == FINISH {
+        // Reopened windows inspect only this HIR site's operands and result. Keeping unrelated
+        // recipes live here would force spills even on the branch that skips observation.
+        let mut inputs = lir.observation_inputs[instruction.origin.0].clone();
+        inputs.extend(instruction.result);
+        return inputs;
+    }
     instruction.operation.inputs()
 }
 

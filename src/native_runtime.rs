@@ -241,7 +241,90 @@ pub(crate) extern "C" fn callback(
         }
     }
 }
+/// Float views cannot execute Python, collect, or change VM frames, so panic containment needs no frame checkpoint.
+pub(crate) extern "C" fn float_view_callback(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    event: i32,
+    location: i32,
+) -> i32 {
+    // SAFETY: generated callers pass their invocation's live Context; callbacks cannot retain it.
+    let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if event != FLOAT_VIEW {
+            return Err(Error::InvalidIr("float view event"));
+        }
+        context.float_view(registers, location)
+    }));
+    match result {
+        Ok(Ok(())) => i32::from(context.side_exit.is_some()),
+        Ok(Err(error)) => {
+            context.error = Some(error);
+            1
+        }
+        Err(_) => {
+            context.error = Some(Error::Runtime("panic in native float view".into()));
+            1
+        }
+    }
+}
 impl Context<'_> {
+    fn float_view(&mut self, registers: *mut Slot, location: i32) -> Result<()> {
+        if registers != self.registers {
+            return Err(Error::InvalidIr("native register buffer changed"));
+        }
+        let &(block, index) = self
+            .locations
+            .get(location as usize)
+            .ok_or(Error::InvalidIr("float view location"))?;
+        let instruction = &self.lir.blocks[block].instructions[index];
+        // SAFETY: the private native entry owns this fixed-size image for the synchronous callback.
+        let registers =
+            unsafe { std::slice::from_raw_parts_mut(registers, self.lir.registers.len() + 1) };
+        // SAFETY: generated code is suspended and the callback temporarily reborrows its exclusive VM.
+        let vm = unsafe { &mut *self.vm };
+        vm.tier_stats.native_float_views += 1;
+        let Operation::FloatListView {
+            value,
+            length,
+            failure,
+        } = instruction.operation
+        else {
+            return Err(Error::InvalidIr("float view callback"));
+        };
+        let source = registers[value.0].value()?;
+        let view = if matches!(source, Value::Ref(_)) {
+            let mut object = vm.heap.get_mut(source)?;
+            if let crate::Object::List(list) = &mut *object
+                && length.is_none_or(|len| len == list.len())
+            {
+                list.float_view()
+                    .map(|values| (values.as_mut_ptr() as usize, values.len()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Some((pointer, length)) = view else {
+            vm.tier_stats.native_float_view_failures += 1;
+            self.side_exit = Some(failure);
+            return Ok(());
+        };
+        let dst = instruction
+            .result
+            .ok_or(Error::InvalidIr("float view result"))?;
+        // The verifier forbids view access after callbacks or across block edges. The owner stays live
+        // in the register image; no collection or resizing operation occurs while generated code uses it.
+        registers[dst.0] = Slot {
+            tag: FLOAT_VIEW_TAG,
+            a: pointer as u64,
+            b: length as u64,
+            c: self.collecting as u64,
+        };
+        Ok(())
+    }
+
     fn step(&mut self, registers: *mut Slot, event: i32, location: i32) -> Result<()> {
         if registers != self.registers {
             return Err(Error::InvalidIr("native register buffer changed"));
@@ -299,41 +382,6 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
-        if event == FLOAT_VIEW {
-            vm.tier_stats.native_float_views += 1;
-            let Operation::FloatListView { value, failure } = instruction.operation else {
-                return Err(Error::InvalidIr("float view callback"));
-            };
-            let source = registers[value.0].value()?;
-            let view = if matches!(source, Value::Ref(_)) {
-                let mut object = vm.heap.get_mut(source)?;
-                if let crate::Object::List(list) = &mut *object {
-                    list.float_view()
-                        .map(|values| (values.as_mut_ptr() as usize, values.len()))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let Some((pointer, length)) = view else {
-                vm.tier_stats.native_float_view_failures += 1;
-                self.side_exit = Some(failure);
-                return Ok(());
-            };
-            let dst = instruction
-                .result
-                .ok_or(Error::InvalidIr("float view result"))?;
-            // The verifier forbids view access after callbacks or across block edges. The owner stays live
-            // in the register image; no collection or resizing operation occurs while generated code uses it.
-            registers[dst.0] = Slot {
-                tag: FLOAT_VIEW_TAG,
-                a: pointer as u64,
-                b: length as u64,
-                c: self.collecting as u64,
-            };
-            return Ok(());
-        }
         if event == UNPACK_BATCH {
             let Operation::SequenceUnpack {
                 value,

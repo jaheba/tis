@@ -200,11 +200,18 @@ impl Vm {
                 let mut observed = false;
                 let mut checkpoint = false;
                 let result = match &instruction.operation {
-                    Operation::FloatListView { value, failure } => {
+                    Operation::FloatListView {
+                        value,
+                        length,
+                        failure,
+                    } => {
                         let source = read(&registers, *value)?.boxed()?;
                         let valid = if matches!(source, Value::Ref(_)) {
                             match &mut *self.heap.get_mut(source)? {
-                                Object::List(v) => v.float_view().is_some(),
+                                Object::List(v) => {
+                                    length.is_none_or(|len| len == v.len())
+                                        && v.float_view().is_some()
+                                }
                                 _ => false,
                             }
                         } else {
@@ -215,6 +222,7 @@ impl Vm {
                         }
                         Some(Datum::FloatView(source))
                     }
+                    Operation::FloatListUnpack { value, .. } => Some(read(&registers, *value)?),
                     Operation::FloatListLoad {
                         view,
                         index,

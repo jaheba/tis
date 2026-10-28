@@ -330,3 +330,23 @@ pub unsafe extern "C" fn tis_stencil_return(
         0
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_float_unpack(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        write(slots, p.dst, read(slots, p.left));
+        if p.tag != 0 && read(slots, p.right).c != 0 {
+            let callback: extern "C" fn(*mut c_void, *mut Slot, i32, i32) -> i32 =
+                std::mem::transmute(p.callback);
+            if callback(ctx, slots, p.event, p.location) != 0 {
+                return u64::MAX;
+            }
+        }
+        next(ctx, slots, p)
+    }
+}
