@@ -717,6 +717,11 @@ impl NativeCode {
         start: usize,
         skip_probe: bool,
     ) -> Result<Outcome> {
+        if !self.feedback && self.lir.regions.iter().any(|r| r.body.0 == start) {
+            return Err(Error::InvalidIr(
+                "native region entry must pass through its header",
+            ));
+        }
         crate::native_runtime::execute(
             &self.lir,
             &self.locations,
@@ -1065,4 +1070,41 @@ fn callback_failure_values(
         _ => None,
     };
     state.map_or_else(Vec::new, |state| state_values(&lir.states[state.0]))
+}
+
+#[cfg(test)]
+mod region_entry_tests {
+    use super::*;
+    #[test]
+    fn an_unprepared_region_body_is_rejected_before_native_execution() {
+        let mut program = crate::compile(
+            "def f(rows):\n    for xs in rows:\n        a,b=xs\n        xs[0]=a+1.0\n",
+        )
+        .unwrap();
+        let mut vm = Vm::new();
+        vm.tiering = crate::Tiering::Native;
+        vm.thresholds.function_entries = 1;
+        vm.thresholds.loop_backedges = 4;
+        vm.profiling.window_ticks = 16;
+        vm.run_program(&mut program).unwrap();
+        let f = vm.get_global("f").unwrap();
+        let xs = vm.heap.allocate(crate::Object::List(
+            vec![Value::Float(1.0), Value::Float(2.0)].into(),
+        ));
+        let rows = vm.heap.allocate(crate::Object::List(vec![xs; 10].into()));
+        for _ in 0..24 {
+            vm.call(f, &[rows]).unwrap();
+        }
+        let hir = vm.function_hir(f).unwrap();
+        let lir = Rc::new(hir.lower_lir(lir::LoweringMode::Profiled).unwrap());
+        let body = lir.regions.first().unwrap().body.0;
+        let code = hir.code.clone().unwrap();
+        let function = Rc::new(RefCell::new(hir));
+        let native = NativeCode::compile(lir, false).unwrap();
+        assert!(matches!(
+            native.execute(&mut vm, &function, &code, 0, 0, body, true),
+            Err(Error::InvalidIr(_))
+        ));
+        assert_eq!(vm.stack_len(), 0);
+    }
 }

@@ -276,7 +276,9 @@ pub(crate) extern "C" fn float_view_callback(
         }
         context.flush_region()?;
         // Promotion can change a cached descriptor's storage kind as well as its data pointer.
-        context.views.clear();
+        if !context.views.descriptors.is_empty() {
+            context.views.clear();
+        }
         context.float_view(registers, location)
     }));
     match result {
@@ -646,9 +648,9 @@ impl Context<'_> {
                 } => (*state, roots, *effects),
                 _ => return Err(Error::InvalidIr("native helper instruction")),
             };
-            // Current builtin iter/next implementations mutate only iterator state. Their descriptors
-            // are refreshed at region entry; sequence buffers survive unless collection changes the epoch.
-            if (effects.may_write || effects.needs_safepoint())
+            // Builtin iteration changes only iterator state; the invariant iterator is renewed at entry.
+            // Other helpers invalidate owned views or may materialize float-list snapshots.
+            if !self.views.descriptors.is_empty()
                 && !matches!(
                     instruction.operation,
                     Operation::Call {
@@ -661,20 +663,11 @@ impl Context<'_> {
                     }
                 )
             {
-                self.views.clear();
-            }
-            if !matches!(
-                instruction.operation,
-                Operation::Call {
-                    helper: lir::Helper::Python(
-                        crate::hir::CoreOp::Iter
-                            | crate::hir::CoreOp::Next
-                            | crate::hir::CoreOp::IsDone
-                    ),
-                    ..
+                if effects.may_write || effects.needs_safepoint() {
+                    self.views.clear();
+                } else {
+                    self.views.floats_dirty = true;
                 }
-            ) {
-                self.views.floats_dirty = true;
             }
             checkpoint = effects.needs_safepoint();
             if checkpoint {
