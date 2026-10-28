@@ -44,6 +44,8 @@ pub struct TierStats {
     pub retired: u64,
     pub native_feedback_probes: u64,
     pub native_root_syncs: u64,
+    pub native_unpack_batches: u64,
+    pub native_truth_fallbacks: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {

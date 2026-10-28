@@ -13,6 +13,7 @@ pub(crate) const ENTER: i32 = 1;
 pub(crate) const HELPER: i32 = 2;
 pub(crate) const FINISH: i32 = 3;
 pub(crate) const SEQUENCE: i32 = 4;
+pub(crate) const UNPACK_BATCH: i32 = 5;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Slot {

@@ -132,11 +132,28 @@ impl NativeCode {
                     block_index as i32,
                     failed,
                 );
+                let mut unpack_reads = 0;
                 for (instruction_index, instruction) in body.instructions.iter().enumerate() {
                     let location = i32::try_from(owner.locations.len()).map_err(error)?;
                     owner.locations.push((block_index, instruction_index));
+                    if unpack_reads > 0 {
+                        unpack_reads -= 1;
+                        continue;
+                    }
                     let destination = instruction.result;
                     match &instruction.operation {
+                        Operation::SequenceUnpack { count, .. } if !feedback => {
+                            unpack_reads = *count;
+                            call(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                UNPACK_BATCH,
+                                location,
+                                failed,
+                            );
+                        }
                         Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => call(
                             &mut b,
                             callback_ref,
@@ -263,7 +280,43 @@ impl NativeCode {
                             let bits = b.ins().uextend(types::I64, compared);
                             store_scalar(&mut b, registers, destination.unwrap(), RAW_BOOL, bits)?;
                         }
-                        Operation::Truth { .. } | Operation::Call { .. } => call(
+                        Operation::Truth { value, .. } => {
+                            let tag = load(&mut b, registers, *value, 0, types::I64)?;
+                            let scalar = b.ins().icmp_imm_s(
+                                IntCC::UnsignedLessThanOrEqual,
+                                tag,
+                                FLOAT as i64,
+                            );
+                            let fast = b.create_block();
+                            let slow = b.create_block();
+                            let done = b.create_block();
+                            b.ins().brif(scalar, fast, &[], slow, &[]);
+                            b.switch_to_block(fast);
+                            let bits = load(&mut b, registers, *value, 8, types::I64)?;
+                            let float = b.ins().icmp_imm_s(IntCC::Equal, tag, FLOAT as i64);
+                            // Ignore the sign bit so both floating-point zeros are false, while NaNs stay true.
+                            let magnitude = b.ins().ishl_imm_u(bits, 1);
+                            let payload = b.ins().select(float, magnitude, bits);
+                            let nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, payload, 0);
+                            let not_none = b.ins().icmp_imm_s(IntCC::NotEqual, tag, NONE as i64);
+                            let truth = b.ins().band(nonzero, not_none);
+                            let truth = b.ins().uextend(types::I64, truth);
+                            store_scalar(&mut b, registers, destination.unwrap(), RAW_BOOL, truth)?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(slow);
+                            call(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed,
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call { .. } => call(
                             &mut b,
                             callback_ref,
                             host,

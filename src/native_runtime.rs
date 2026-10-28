@@ -183,6 +183,9 @@ pub(crate) extern "C" fn callback(
     let context = unsafe { &mut *raw.cast::<Context<'_>>() };
     // SAFETY: the VM's exclusive borrow is suspended for Entry; callbacks temporarily reborrow it.
     let vm = unsafe { &mut *context.vm };
+    if event == UNPACK_BATCH {
+        vm.tier_stats.native_unpack_batches += 1;
+    }
     let checkpoint = (
         vm.stack.len(),
         vm.environments.len(),
@@ -217,6 +220,28 @@ impl Context<'_> {
         if registers != self.registers {
             return Err(Error::InvalidIr("native register buffer changed"));
         }
+        if event == UNPACK_BATCH && self.collecting {
+            // A recursive call may reopen feedback while an artifact with fused reads is active.
+            let &(block, index) = self
+                .locations
+                .get(location as usize)
+                .ok_or(Error::InvalidIr("native unpack location"))?;
+            let Operation::SequenceUnpack { count, .. } =
+                self.lir.blocks[block].instructions[index].operation
+            else {
+                return Err(Error::InvalidIr("native unpack batch"));
+            };
+            for offset in 0..=count {
+                let location = location
+                    .checked_add(i32::try_from(offset).map_err(error)?)
+                    .ok_or(Error::IntegerOverflow)?;
+                self.step(registers, SEQUENCE, location)?;
+                if self.side_exit.is_some() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         // SAFETY: this is the fixed-size buffer passed to Entry. The callback has sole access while
         // generated code is suspended; helpers cannot resize or retain this buffer.
         let registers =
@@ -245,6 +270,38 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
+        if event == UNPACK_BATCH {
+            let Operation::SequenceUnpack {
+                value,
+                kind,
+                count,
+                failure,
+            } = instruction.operation
+            else {
+                return Err(Error::InvalidIr("native unpack batch"));
+            };
+            let source = registers[value.0].value()?;
+            let Some(items) = crate::sequence::items(&vm.heap, source, kind)?
+                .filter(|items| items.len() == count)
+            else {
+                self.side_exit = Some(failure);
+                return Ok(());
+            };
+            // Verification proves contiguous element reads with distinct destinations and no intervening effects.
+            // Nothing in this batch can collect; later safepoints publish the complete live register image.
+            let result = instruction
+                .result
+                .ok_or(Error::InvalidIr("native unpack result"))?;
+            registers[result.0] = Slot::boxed(source);
+            for (offset, value) in items.iter().enumerate() {
+                let element = &self.lir.blocks[block].instructions[index + offset + 1];
+                let result = element
+                    .result
+                    .ok_or(Error::InvalidIr("native unpack element"))?;
+                registers[result.0] = Slot::boxed(*value);
+            }
+            return Ok(());
+        }
         if event == SEQUENCE {
             // These reads cannot call Python, mutate the heap or collect. Never retain payload borrows.
             let (result, failure) = match &instruction.operation {
@@ -356,12 +413,15 @@ impl Context<'_> {
                     }
                     Slot::boxed(result?)
                 }
-                Operation::Truth { value, .. } => Slot {
-                    tag: RAW_BOOL,
-                    a: crate::runtime::truth(&vm.heap, registers[value.0].value()?)? as u64,
-                    b: 0,
-                    c: 0,
-                },
+                Operation::Truth { value, .. } => {
+                    vm.tier_stats.native_truth_fallbacks += 1;
+                    Slot {
+                        tag: RAW_BOOL,
+                        a: crate::runtime::truth(&vm.heap, registers[value.0].value()?)? as u64,
+                        b: 0,
+                        c: 0,
+                    }
+                }
                 _ => unreachable!(),
             };
             registers[instruction.result.unwrap().0] = result;

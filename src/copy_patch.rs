@@ -109,15 +109,27 @@ impl Plan {
         for (block, body) in lir.blocks.iter().enumerate() {
             plan.blocks.push(plan.nodes.len());
             plan.callback(ENTER, block)?;
+            let mut unpack_reads = 0;
             for (index, instruction) in body.instructions.iter().enumerate() {
                 let location = plan.locations.len();
                 plan.locations.push((block, index));
+                if unpack_reads > 0 {
+                    unpack_reads -= 1;
+                    continue;
+                }
                 let dst = instruction.result.map(slot).transpose()?.unwrap_or(0);
                 let mut p = Patch {
                     dst,
                     ..Patch::default()
                 };
                 let stencil = match &instruction.operation {
+                    Operation::SequenceUnpack { count, .. } if !feedback => {
+                        unpack_reads = *count;
+                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.event = UNPACK_BATCH;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        "callback"
+                    }
                     Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => {
                         p.callback = native_runtime::callback as *const u8 as usize;
                         p.event = SEQUENCE;
@@ -213,7 +225,14 @@ impl Plan {
                             _ => return Err(Error::InvalidIr("stencil comparison")),
                         }
                     }
-                    Operation::Call { .. } | Operation::Truth { .. } => {
+                    Operation::Truth { value, .. } => {
+                        p.left = slot(*value)?;
+                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.event = HELPER;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        "truth"
+                    }
+                    Operation::Call { .. } => {
                         p.callback = native_runtime::callback as *const u8 as usize;
                         p.event = HELPER;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
@@ -471,7 +490,7 @@ mod tests {
     use super::*;
     #[test]
     fn stencil_library_contains_offline_code() {
-        assert_eq!(generated::STENCILS.len(), 21);
+        assert_eq!(generated::STENCILS.len(), 22);
         assert!(
             generated::STENCILS
                 .iter()

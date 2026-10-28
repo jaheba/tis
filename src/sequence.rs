@@ -7,7 +7,7 @@ pub enum SequenceKind {
     Tuple,
 }
 
-fn items(heap: &Heap, source: Value, kind: SequenceKind) -> Result<Option<&[Value]>> {
+pub(crate) fn items(heap: &Heap, source: Value, kind: SequenceKind) -> Result<Option<&[Value]>> {
     if !matches!(source, Value::Ref(_)) {
         return Ok(None);
     }

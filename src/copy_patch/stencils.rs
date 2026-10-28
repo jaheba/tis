@@ -207,6 +207,34 @@ pub unsafe extern "C" fn tis_stencil_callback(
     }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_truth(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        let value = read(slots, p.left);
+        let truth = match value.tag {
+            NONE => Some(false),
+            BOOL | INT => Some(value.a != 0),
+            // Clearing the sign bit makes positive and negative zero false; NaNs are true.
+            FLOAT => Some(value.a << 1 != 0),
+            _ => None,
+        };
+        if let Some(truth) = truth {
+            write(slots, p.dst, scalar(RAW_BOOL, truth as u64));
+        } else {
+            let callback: extern "C" fn(*mut c_void, *mut Slot, i32, i32) -> i32 =
+                std::mem::transmute(p.callback);
+            if callback(ctx, slots, p.event, p.location) != 0 {
+                return u64::MAX;
+            }
+        }
+        next(ctx, slots, p)
+    }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn tis_stencil_branch(
     ctx: *mut c_void,
     slots: *mut Slot,

@@ -200,6 +200,12 @@ Guard misses resume generic bytecode before the operation, preserving errors and
 These reads cannot call Python, mutate containers or collect; they skip full root synchronization and publish result references.
 They still read mutable heap state and cannot be moved across writes or Python calls.
 Unpack views are limited to verified contiguous element reads before assignment targets can mutate the source.
+Staged native code fuses each verified unpack and its element reads into one callback with one kind/length check.
+The batch fills the same boxed register image used by later GC safepoints and deoptimization; it cannot collect or call Python.
+Eager artifacts retain individual callbacks. A reopened window in an active staged artifact observes each original read.
+Native scalar truth tests for None, bool, integer and float run directly in generated code, including NaNs and both zeros.
+Heap-backed or invalid boxed values retain the runtime truth path.
+`TierStats.native_unpack_batches` and `native_truth_fallbacks` expose batch executions and slow truth tests.
 Tuples can be reused during generic unpacking; generic list unpacking copies a snapshot without creating an iterator.
 Iterators and starred targets retain generic collection behavior.
 LIR helper effects distinguish Python heap allocation, Python calls and writes.
@@ -221,7 +227,7 @@ cargo run --release --example backend_compare
 ```
 
 `build.rs` invokes rustc once per target build to compile `src/copy_patch/stencils.rs` at optimization level 3.
-It extracts 21 self-contained function bodies from the object file into the executable's stencil library.
+It extracts 22 self-contained function bodies from the object file into the executable's stencil library.
 The build rejects external relocations and indirect non-tail continuations.
 The shared scalar module supplies float arithmetic and comparison semantics; Python helpers, GC and side exits
 use the same runtime bridge as Cranelift.
