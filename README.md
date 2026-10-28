@@ -451,3 +451,19 @@ Compilation and module definitions precede timing. Complete output is validated 
 on every sample; backend compilation and deoptimization are retained rather than assumed absent.
 Use `--tiers lir copy-patch` to measure the other execution tiers. The existing nbody harness remains
 separate so its reset-and-time-advance protocol does not change.
+
+## One-shot performance
+
+Measure each complete fixture once in a fresh process, with no preparatory calls:
+
+```sh
+python3 tools/bench_oneshot.py --run target/release/examples/run \
+  --python /path/to/python3 --pypy /path/to/pypy3 --output /tmp/tis-oneshot
+```
+
+The default is ten serial, interleaved fresh processes per runtime for nbody (20,000 steps),
+Barnes–Hut (200 particles / 100 steps) and ticket search (1,600 tickets). Timing includes process
+startup, source parsing, compilation, JIT work during that first execution, output and process exit.
+All stdout is validated. This is separate from the warmed worker protocol; OS file caches are not flushed.
+Use `--benchmarks` and `--tiers` to select workloads and tis execution tiers. Results retain commands,
+binary/source hashes, runtime versions, exact output, stderr and every timing sample.
