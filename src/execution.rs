@@ -318,7 +318,7 @@ impl Vm {
             for (name, &value) in names.iter().zip(arguments) {
                 bound.insert(name.clone(), value);
             }
-            let extra = self.heap.allocate(Object::Dict(vec![]));
+            let extra = self.heap.allocate(Object::Dict(Default::default()));
             for (name, value) in keywords {
                 if (names.contains(name) && !names[..template.positional_only].contains(name))
                     || template.keyword_only.contains(name)
@@ -733,7 +733,19 @@ impl Vm {
                 return match name {
                     "pi" => Ok(Value::Float(std::f64::consts::PI)),
                     "sqrt" | "sin" | "cos" | "log" => {
-                        Ok(self.heap.allocate(Object::Native(format!("math.{name}"))))
+                        let key = match name {
+                            "sqrt" => "math.sqrt",
+                            "sin" => "math.sin",
+                            "cos" => "math.cos",
+                            _ => "math.log",
+                        };
+                        if let Some(&function) = self.modules.get(key) {
+                            Ok(function)
+                        } else {
+                            let function = self.heap.allocate(Object::Native(key.into()));
+                            self.modules.insert(key.into(), function);
+                            Ok(function)
+                        }
                     }
                     _ => Err(error(format!("AttributeError: math.{name}"))),
                 };
@@ -1014,7 +1026,7 @@ impl Vm {
             }
             "dict" => {
                 arity(args, 0, 1)?;
-                let dict = self.heap.allocate(Object::Dict(vec![]));
+                let dict = self.heap.allocate(Object::Dict(Default::default()));
                 if let Some(&source) = args.first() {
                     self.method(dict, "update", &[source])?;
                 }
@@ -1352,153 +1364,183 @@ impl Vm {
         Ok(Value::None)
     }
 
+    fn list_method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        match name {
+            "append" => {
+                arity(args, 1, 1)?;
+                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                    items.push(args[0]);
+                }
+            }
+            "extend" => {
+                arity(args, 1, 1)?;
+                // Snapshot before mutation so extending a list with itself terminates.
+                let values = self.collect_iter(args[0])?;
+                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                    for value in values {
+                        items.push(value);
+                    }
+                }
+            }
+            "insert" => {
+                arity(args, 2, 2)?;
+                let n = integer(args[0])?;
+                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                    let index = if n < 0 {
+                        (items.len() as i128 + n as i128).max(0) as usize
+                    } else {
+                        (n as usize).min(items.len())
+                    };
+                    items.insert(index, args[1]);
+                }
+            }
+            "pop" => {
+                arity(args, 0, 1)?;
+                let len = self.heap.len(receiver)?;
+                let index = normalize_index(args.first().copied().unwrap_or(Value::Int(-1)), len)?;
+                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                    return Ok(items.remove(index));
+                }
+            }
+            "clear" | "reverse" => {
+                arity(args, 0, 0)?;
+                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                    if name == "clear" {
+                        items.clear();
+                    } else {
+                        items.reverse();
+                    }
+                }
+            }
+            "copy" => {
+                arity(args, 0, 0)?;
+                let Object::List(items) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                return Ok(self.heap.allocate(Object::List(items.clone())));
+            }
+            "count" | "index" | "remove" => {
+                arity(args, 1, 1)?;
+                let Object::List(items) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                let mut count = 0;
+                let mut found = None;
+                for i in 0..items.len() {
+                    let value = items.value(i).ok_or(Error::Index)?;
+                    if equal(&self.heap, value, args[0], 0)? {
+                        count += 1;
+                        found = Some(i);
+                        if name != "count" {
+                            break;
+                        }
+                    }
+                }
+                if name == "count" {
+                    return Ok(Value::Int(count));
+                }
+                let index = found.ok_or_else(|| error("ValueError: item not in list"))?;
+                if name == "index" {
+                    return Ok(Value::Int(index as i64));
+                }
+                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                    items.remove(index);
+                }
+            }
+            _ => return Err(error("unknown list method")),
+        }
+        Ok(Value::None)
+    }
+
+    fn dict_method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        match name {
+            "values" | "keys" | "items" => {
+                arity(args, 0, 0)?;
+                Ok(self.heap.allocate(Object::View {
+                    source: receiver,
+                    kind: name.into(),
+                }))
+            }
+            "get" | "setdefault" | "pop" => {
+                arity(args, 1, 2)?;
+                let Object::Dict(items) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                if name != "pop"
+                    && let Some(value) = self.heap.dict_get(items, args[0])?
+                {
+                    return Ok(value);
+                }
+                let key = self.heap.key(args[0])?;
+                let Object::Dict(items) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                if let Some(&value) = items.get(&key) {
+                    if name == "pop"
+                        && let Object::Dict(items) = &mut *self.heap.get_mut(receiver)?
+                    {
+                        items.remove(&key);
+                    }
+                    return Ok(value);
+                }
+                let default = args.get(1).copied().unwrap_or(Value::None);
+                if name == "setdefault" {
+                    self.heap.set_item(receiver, args[0], default)?;
+                }
+                if name == "pop" && args.len() == 1 {
+                    return Err(Error::MissingKey);
+                }
+                Ok(default)
+            }
+            "clear" => {
+                arity(args, 0, 0)?;
+                if let Object::Dict(items) = &mut *self.heap.get_mut(receiver)? {
+                    items.clear();
+                }
+                Ok(Value::None)
+            }
+            "copy" => {
+                arity(args, 0, 0)?;
+                let Object::Dict(items) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                Ok(self.heap.allocate(Object::Dict(items.clone())))
+            }
+            "update" => {
+                arity(args, 1, 1)?;
+                let pairs = if let Object::Dict(items) = self.heap.get(args[0])? {
+                    items
+                        .iter()
+                        .map(|(k, v)| (key_value(&self.heap, k), *v))
+                        .collect::<Vec<_>>()
+                } else {
+                    let mut pairs = vec![];
+                    for item in self.collect_iter(args[0])? {
+                        let pair = self.collect_iter(item)?;
+                        if pair.len() != 2 {
+                            return Err(error("ValueError: dictionary pair length"));
+                        }
+                        pairs.push((pair[0], pair[1]));
+                    }
+                    pairs
+                };
+                for (key, value) in pairs {
+                    self.heap.set_item(receiver, key, value)?;
+                }
+                Ok(Value::None)
+            }
+            _ => Err(error("unknown dictionary method")),
+        }
+    }
+
     fn method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        match self.heap.get(receiver)? {
+            Object::List(_) => return self.list_method(receiver, name, args),
+            Object::Dict(_) => return self.dict_method(receiver, name, args),
+            _ => {}
+        }
         let object = self.heap.get(receiver)?.clone();
         match object {
-            Object::List(mut items) => {
-                let result = match name {
-                    "append" => {
-                        arity(args, 1, 1)?;
-                        items.push(args[0]);
-                        Value::None
-                    }
-                    "extend" => {
-                        arity(args, 1, 1)?;
-                        items.extend(self.collect_iter(args[0])?);
-                        Value::None
-                    }
-                    "pop" => {
-                        arity(args, 0, 1)?;
-                        if items.is_empty() {
-                            return Err(Error::Index);
-                        }
-                        let index = normalize_index(
-                            args.first().copied().unwrap_or(Value::Int(-1)),
-                            items.len(),
-                        )?;
-                        items.remove(index)
-                    }
-                    "insert" => {
-                        arity(args, 2, 2)?;
-                        let n = integer(args[0])?;
-                        let index = if n < 0 {
-                            (items.len() as i128 + n as i128).max(0) as usize
-                        } else {
-                            (n as usize).min(items.len())
-                        };
-                        items.insert(index, args[1]);
-                        Value::None
-                    }
-                    "clear" => {
-                        arity(args, 0, 0)?;
-                        items.clear();
-                        Value::None
-                    }
-                    "reverse" => {
-                        arity(args, 0, 0)?;
-                        items.reverse();
-                        Value::None
-                    }
-                    "copy" => {
-                        arity(args, 0, 0)?;
-                        return Ok(self.heap.allocate(Object::List(items)));
-                    }
-                    "count" | "index" | "remove" => {
-                        arity(args, 1, 1)?;
-                        let mut matches = vec![];
-                        for (i, &value) in items.iter().enumerate() {
-                            if equal(&self.heap, value, args[0], 0)? {
-                                matches.push(i);
-                            }
-                        }
-                        match name {
-                            "count" => return Ok(Value::Int(matches.len() as i64)),
-                            "index" => {
-                                return matches
-                                    .first()
-                                    .map(|&i| Value::Int(i as i64))
-                                    .ok_or_else(|| error("ValueError: item not in list"));
-                            }
-                            _ => {
-                                let index = *matches
-                                    .first()
-                                    .ok_or_else(|| error("ValueError: item not in list"))?;
-                                items.remove(index);
-                                Value::None
-                            }
-                        }
-                    }
-                    _ => return Err(error("unknown list method")),
-                };
-                *self.heap.get_mut(receiver)? = Object::List(items);
-                Ok(result)
-            }
-            Object::Dict(items) => match name {
-                "values" | "keys" | "items" => {
-                    arity(args, 0, 0)?;
-                    Ok(self.heap.allocate(Object::View {
-                        source: receiver,
-                        kind: name.into(),
-                    }))
-                }
-                "get" | "setdefault" => {
-                    arity(args, 1, 2)?;
-                    let key = self.heap.key(args[0])?;
-                    if let Some((_, value)) = items.iter().find(|(k, _)| *k == key) {
-                        return Ok(*value);
-                    }
-                    let default = args.get(1).copied().unwrap_or(Value::None);
-                    if name == "setdefault" {
-                        self.heap.set_item(receiver, args[0], default)?;
-                    }
-                    Ok(default)
-                }
-                "pop" => {
-                    arity(args, 1, 2)?;
-                    let key = self.heap.key(args[0])?;
-                    let mut items = items;
-                    if let Some(index) = items.iter().position(|(k, _)| *k == key) {
-                        let (_, value) = items.remove(index);
-                        *self.heap.get_mut(receiver)? = Object::Dict(items);
-                        Ok(value)
-                    } else {
-                        args.get(1).copied().ok_or(Error::MissingKey)
-                    }
-                }
-                "clear" => {
-                    arity(args, 0, 0)?;
-                    *self.heap.get_mut(receiver)? = Object::Dict(vec![]);
-                    Ok(Value::None)
-                }
-                "copy" => {
-                    arity(args, 0, 0)?;
-                    Ok(self.heap.allocate(Object::Dict(items)))
-                }
-                "update" => {
-                    arity(args, 1, 1)?;
-                    let pairs = if let Object::Dict(items) = self.heap.get(args[0])? {
-                        items
-                            .iter()
-                            .map(|(k, v)| (key_value(&self.heap, k), *v))
-                            .collect::<Vec<_>>()
-                    } else {
-                        let mut pairs = vec![];
-                        for item in self.collect_iter(args[0])? {
-                            let pair = self.collect_iter(item)?;
-                            if pair.len() != 2 {
-                                return Err(error("ValueError: dictionary pair length"));
-                            }
-                            pairs.push((pair[0], pair[1]));
-                        }
-                        pairs
-                    };
-                    for (key, value) in pairs {
-                        self.heap.set_item(receiver, key, value)?;
-                    }
-                    Ok(Value::None)
-                }
-                _ => Err(error("unknown dictionary method")),
-            },
             Object::Set(mut items) => {
                 let result = match name {
                     "add" => {
@@ -1883,7 +1925,7 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
                     return Ok(false);
                 }
                 for (key, a) in a {
-                    let Some((_, b)) = b.iter().find(|(k, _)| k == key) else {
+                    let Some(b) = b.get(key) else {
                         return Ok(false);
                     };
                     if !equal(heap, *a, *b, depth + 1)? {
@@ -1905,10 +1947,7 @@ fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool> {
         "is not" => return Ok(a != b),
         "in" | "not in" => {
             let found = match heap.get(b)? {
-                Object::Dict(items) => {
-                    let key = heap.key(a)?;
-                    items.iter().any(|(k, _)| *k == key)
-                }
+                Object::Dict(items) => heap.dict_get(items, a)?.is_some(),
                 object @ (Object::List(_) | Object::Tuple(_) | Object::Set(_)) => {
                     let items = object.values().unwrap();
                     let mut found = false;

@@ -122,21 +122,20 @@ impl Vm {
             .borrow()
             .parameters(function.borrow().entry())
             .to_vec();
-        let mut slots = vec![None; code.slots];
+        // Empty entry windows can be initialized directly on the VM stack, without a
+        // temporary register allocation and a second copy of the cleared window.
+        let mut slots = if parameters.is_empty() {
+            vec![]
+        } else {
+            vec![None; code.slots]
+        };
         for (&parameter, &value) in parameters.iter().zip(arguments) {
             slots[parameter.0] = Some(value);
         }
         let locals = if let Some(bindings) = bindings {
-            let template = function.borrow();
-            code.local_names
+            code.local_parameters
                 .iter()
-                .map(|name| {
-                    template
-                        .parameter_names
-                        .iter()
-                        .position(|parameter| parameter == name)
-                        .map(|index| bindings[index])
-                })
+                .map(|parameter| parameter.map(|index| bindings[index]))
                 .collect()
         } else {
             let mut object = self.heap.get_mut(environment)?;
@@ -168,8 +167,17 @@ impl Vm {
             ));
         }
         let base = self.stack.len();
-        let frame_end = base + slots.len();
-        self.stack.extend(slots);
+        let frame_end = base
+            + if slots.is_empty() {
+                code.slots
+            } else {
+                slots.len()
+            };
+        if slots.is_empty() {
+            self.stack.resize(frame_end, None);
+        } else {
+            self.stack.extend(slots);
+        }
         self.depth += 1;
         self.environments.push(environment);
         self.local_frames.push(LocalFrame {
@@ -580,7 +588,7 @@ impl Vm {
                         Opcode::List => self.heap.allocate(Object::List(values.into())),
                         Opcode::Tuple => self.heap.allocate(Object::Tuple(values)),
                         _ => {
-                            let result = self.heap.allocate(Object::Dict(Vec::new()));
+                            let result = self.heap.allocate(Object::Dict(Default::default()));
                             for pair in values.as_chunks::<2>().0 {
                                 self.heap.set_item(result, pair[0], pair[1])?;
                             }

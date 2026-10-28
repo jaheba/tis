@@ -30,6 +30,7 @@ pub struct Code {
     pub(crate) constants: Vec<Constant>,
     pub(crate) slots: usize,
     pub(crate) local_names: Vec<String>,
+    pub(crate) local_parameters: Vec<Option<usize>>,
     pub(crate) environment_required: bool,
     pub(crate) operations: Vec<(crate::hir::CoreOp, usize)>,
 }
@@ -145,6 +146,16 @@ impl Code {
                 constants: Vec::new(),
                 slots: function.value_count,
                 local_names: function.local_slots.clone(),
+                local_parameters: function
+                    .local_slots
+                    .iter()
+                    .map(|name| {
+                        function
+                            .parameter_names
+                            .iter()
+                            .position(|parameter| parameter == name)
+                    })
+                    .collect(),
                 environment_required: function.environment_required(),
                 operations: Vec::new(),
             },

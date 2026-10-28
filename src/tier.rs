@@ -624,7 +624,7 @@ impl Vm {
             Helper::List => self.heap.allocate(Object::List(args.to_vec().into())),
             Helper::Tuple => self.heap.allocate(Object::Tuple(args.to_vec())),
             Helper::Dict => {
-                let dict = self.heap.allocate(Object::Dict(vec![]));
+                let dict = self.heap.allocate(Object::Dict(Default::default()));
                 for pair in args.as_chunks::<2>().0 {
                     self.heap.set_item(dict, pair[0], pair[1])?;
                 }

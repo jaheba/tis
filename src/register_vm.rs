@@ -199,7 +199,7 @@ impl Vm {
                             }
                             Opcode::Tuple => self.heap.allocate(Object::Tuple(arguments.clone())),
                             Opcode::Dict => {
-                                let dict = self.heap.allocate(Object::Dict(vec![]));
+                                let dict = self.heap.allocate(Object::Dict(Default::default()));
                                 for pair in arguments.as_chunks::<2>().0 {
                                     self.heap.set_item(dict, pair[0], pair[1])?;
                                 }

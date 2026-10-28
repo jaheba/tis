@@ -1,7 +1,9 @@
 //! A Python subset compiled through IR to bytecode, with an independent runtime.
 
 pub mod bytecode;
+mod dict;
 mod error;
+pub use dict::Dict;
 mod execution;
 pub mod frontend;
 mod heap;

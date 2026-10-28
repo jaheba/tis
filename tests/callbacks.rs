@@ -46,7 +46,7 @@ fn scalar_truth_has_no_callback_and_heap_truth_keeps_its_fallback() {
         for (object, truth) in [
             (Object::List(vec![].into()), false),
             (Object::String("x".into()), true),
-            (Object::Dict(vec![]), false),
+            (Object::Dict(Default::default()), false),
         ] {
             let value = vm.heap.allocate(object);
             assert_eq!(

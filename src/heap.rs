@@ -46,7 +46,7 @@ pub enum Object {
     String(String),
     List(crate::List),
     Tuple(Vec<Value>),
-    Dict(Vec<(Key, Value)>),
+    Dict(crate::Dict),
     Set(Vec<Value>),
     Environment(crate::execution::Environment),
     Function(crate::execution::Closure),
@@ -225,16 +225,17 @@ impl Heap {
                 let character = text.chars().nth(position).ok_or(Error::Index)?;
                 Ok(self.allocate(Object::String(character.to_string())))
             }
-            Object::Dict(items) => {
-                let key = self.key(key)?;
-                items
-                    .iter()
-                    .find(|(candidate, _)| *candidate == key)
-                    .map(|(_, value)| *value)
-                    .ok_or(Error::MissingKey)
-            }
+            Object::Dict(items) => self.dict_get(items, key)?.ok_or(Error::MissingKey),
             _ => Err(Error::Type("object is not subscriptable")),
         }
+    }
+
+    pub(crate) fn dict_get(&self, items: &crate::Dict, key: Value) -> Result<Option<Value>> {
+        // Borrow existing string storage for reads; no temporary owned Key is needed.
+        if let Ok(Object::String(text)) = self.get(key) {
+            return Ok(items.get_str(text).copied());
+        }
+        Ok(items.get(&self.key(key)?).copied())
     }
 
     pub fn set_item(&mut self, object: Value, key: Value, value: Value) -> Result<()> {
@@ -254,13 +255,7 @@ impl Heap {
             }
             Object::Dict(items) => {
                 let key = dict_key.expect("dictionary key resolved before mutation");
-                if let Some((_, previous)) =
-                    items.iter_mut().find(|(candidate, _)| *candidate == key)
-                {
-                    *previous = value;
-                } else {
-                    items.push((key, value));
-                }
+                items.insert(key, value);
                 Ok(())
             }
             _ => Err(Error::Type("object does not support item assignment")),

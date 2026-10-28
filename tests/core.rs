@@ -188,17 +188,14 @@ fn item_assignment_preserves_aliases() {
 #[test]
 fn dictionaries_preserve_order_and_canonicalize_boolean_keys() {
     let mut heap = Heap::new();
-    let dict = heap.allocate(Object::Dict(vec![]));
+    let dict = heap.allocate(Object::Dict(Default::default()));
     heap.set_item(dict, Value::Bool(true), Value::Int(10))
         .unwrap();
     heap.set_item(dict, Value::Int(2), Value::Int(20)).unwrap();
     heap.set_item(dict, Value::Int(1), Value::Int(30)).unwrap();
     assert_eq!(
         heap.get(dict).unwrap(),
-        &Object::Dict(vec![
-            (Key::Int(1), Value::Int(30)),
-            (Key::Int(2), Value::Int(20))
-        ])
+        &Object::Dict(vec![(Key::Int(1), Value::Int(30)), (Key::Int(2), Value::Int(20))].into())
     );
     assert_eq!(heap.get_item(dict, Value::Bool(true)), Ok(Value::Int(30)));
     assert_eq!(heap.get_item(dict, Value::Int(3)), Err(Error::MissingKey));

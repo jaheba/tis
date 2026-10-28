@@ -89,6 +89,50 @@ impl List {
             _ => None,
         }
     }
+    /// Preserve compact float storage until a non-float requires the general representation.
+    pub fn push(&mut self, value: Value) {
+        self.snapshot.take();
+        if let (Storage::Floats(values), Value::Float(value)) = (&mut self.storage, value) {
+            values.push(value);
+            return;
+        }
+        if let (Storage::Values(values), Value::Float(value)) = (&self.storage, value)
+            && values.is_empty()
+        {
+            self.storage = Storage::Floats(vec![value]);
+            return;
+        }
+        self.deref_mut().push(value);
+    }
+    pub fn remove(&mut self, index: usize) -> Value {
+        self.snapshot.take();
+        match &mut self.storage {
+            Storage::Values(values) => values.remove(index),
+            Storage::Floats(values) => Value::Float(values.remove(index)),
+        }
+    }
+    pub fn clear(&mut self) {
+        self.snapshot.take();
+        match &mut self.storage {
+            Storage::Values(values) => values.clear(),
+            Storage::Floats(values) => values.clear(),
+        }
+    }
+    pub fn reverse(&mut self) {
+        self.snapshot.take();
+        match &mut self.storage {
+            Storage::Values(values) => values.reverse(),
+            Storage::Floats(values) => values.reverse(),
+        }
+    }
+    pub fn insert(&mut self, index: usize, value: Value) {
+        self.snapshot.take();
+        if let (Storage::Floats(values), Value::Float(value)) = (&mut self.storage, value) {
+            values.insert(index, value);
+            return;
+        }
+        self.deref_mut().insert(index, value);
+    }
     pub fn set(&mut self, index: usize, value: Value) {
         self.snapshot.take();
         if let (Storage::Floats(values), Value::Float(value)) = (&mut self.storage, value) {

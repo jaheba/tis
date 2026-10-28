@@ -486,3 +486,20 @@ For before/after measurement of object workloads, use the existing comparison ru
 `--benchmark barnes-hut` or `--benchmark ticket-search` and generic `examples/bench` binaries.
 The one-shot runner accepts `--baseline-run /path/to/old-run` to interleave an older executable
 with the current one. The default nbody comparison and no-baseline one-shot protocols are unchanged.
+
+## Containers and call-frame setup
+
+Dictionaries use insertion-ordered entries plus a randomized hash index. Numeric-equivalent bool,
+integer and float keys hash consistently, including signed zero and the i64 boundaries; tuple keys
+apply the same rules recursively. String reads borrow their existing storage. Deletion preserves
+order by shifting entries and rebuilding the index, so it remains linear in dictionary size.
+The public `Object::Dict` payload is `Dict`; use `Dict::default()` or convert a vector with `.into()`.
+
+List and dictionary methods mutate their receiver directly. Explicit copies and input snapshots for
+self-extension/update remain separate operations. Float-list append, insert, remove, clear and reverse
+preserve compact storage where operand types permit it. Builtin math callables are cached and rooted
+with the module cache, preserving identity across repeated lookup and collection.
+
+Call entry initializes empty register windows directly on the VM stack. Parameter-to-local-slot
+indices are computed once with bytecode metadata, avoiding repeated name comparisons during binding.
+These runtime paths serve bytecode, LIR, Cranelift and copy-and-patch execution.
