@@ -1,6 +1,9 @@
 # tis
 
-A Rust interpreter for a Python subset, built around an explicit value IR.
+<img src="assets/tis-logo-compact.png" alt="Pixel-art Black Knight with no arms and a red bunny emblem" width="128">
+
+A research Python VM in Rust with a profiling interpreter and two native compilation backends.
+Built around an explicit value IR, tis implements a Python subset.
 Ruff AST → HIR → register bytecode → interpreter.
 Runtime profiles feed HIR → typed LIR → reference execution, Cranelift, or copy-and-patch native code.
 There is no stdlib or sandbox infrastructure.
