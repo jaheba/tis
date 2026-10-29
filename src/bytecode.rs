@@ -30,6 +30,7 @@ pub struct Code {
     pub(crate) constants: Vec<Constant>,
     pub(crate) literal_cache: Vec<std::cell::Cell<Option<crate::Value>>>,
     pub(crate) slots: usize,
+    pub(crate) entry_parameters: Vec<ValueId>,
     pub(crate) local_names: Vec<String>,
     pub(crate) local_parameters: Vec<Option<usize>>,
     pub(crate) environment_required: bool,
@@ -147,6 +148,7 @@ impl Code {
                 constants: Vec::new(),
                 literal_cache: Vec::new(),
                 slots: function.value_count,
+                entry_parameters: function.parameters(function.entry()).to_vec(),
                 local_names: function.local_slots.clone(),
                 local_parameters: function
                     .local_slots

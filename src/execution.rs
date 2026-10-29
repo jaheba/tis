@@ -11,6 +11,45 @@ use std::{
     rc::Rc,
 };
 
+/// Audited scalar builtins: read-only heap access, no Python, VM allocation, collection or frames.
+/// Adding a variant requires preserving this contract on every success and error path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarBuiltin {
+    Len,
+    Sqrt,
+}
+impl ScalarBuiltin {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Len => "len",
+            Self::Sqrt => "math.sqrt",
+        }
+    }
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "len" => Some(Self::Len),
+            "math.sqrt" => Some(Self::Sqrt),
+            _ => None,
+        }
+    }
+    /// The closed implementation calls only heap length, primitive math and argument checks;
+    /// none allocate VM objects or collect. Heap has interior mutability, so this is an audited
+    /// body/callee contract, not a guarantee from &Heap alone. Rust error strings do not trigger GC.
+    fn evaluate(self, heap: &Heap, args: &[Value]) -> Result<Value> {
+        arity(args, 1, 1)?;
+        Ok(match self {
+            Self::Len => Value::Int(heap.len(args[0])? as i64),
+            Self::Sqrt => {
+                let value = number(args[0])?;
+                if value < 0.0 {
+                    return Err(error("ValueError: math domain error"));
+                }
+                Value::Float(value.sqrt())
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Environment {
     pub(crate) parent: Option<Value>,
@@ -389,12 +428,14 @@ impl Vm {
             && arguments.len() <= names.len()
             && arguments.len() + defaults.len() >= names.len()
         {
-            let mut bound = arguments.to_vec();
-            for index in arguments.len()..names.len() {
-                bound.push(defaults[index + defaults.len() - names.len()]);
-            }
+            let count = names.len();
             drop(template);
-            return self.execute_bound_frame(function, parent, arguments, Some(&bound));
+            return self.execute_bound_frame(
+                function,
+                parent,
+                arguments,
+                Some(crate::vm::PositionalBindings { defaults, count }),
+            );
         }
         let environment = if template.module {
             parent
@@ -527,6 +568,23 @@ impl Vm {
         result
     }
 
+    /// Guard the actual object rather than a binding name or cached heap identity. The evaluator's
+    /// audited evaluator cannot collect/reenter while native operands are unpublished.
+    pub(crate) fn try_scalar_call(
+        &mut self,
+        builtin: ScalarBuiltin,
+        callable: Value,
+        argument: Value,
+    ) -> Option<Result<Value>> {
+        if !matches!(self.heap.get(callable), Ok(Object::Native(name)) if name.as_ref() == builtin.name())
+        {
+            return None;
+        }
+        self.tier_stats.bytecode_positional_calls += 1;
+        self.tier_stats.bytecode_leaf_calls += 1;
+        Some(builtin.evaluate(&self.heap, &[argument]))
+    }
+
     /// Register operands remain rooted in their caller's window until the result is stored.
     /// Current builtins cannot execute Python or collect, except keyed list sorting.
     pub(crate) fn call_from_registers(
@@ -585,10 +643,10 @@ impl Vm {
                     .collect::<Vec<_>>();
                 self.call_keywords(function, &args, keywords)
             }
-            Object::Class { .. } => {
+            Object::Class { shape, .. } => {
                 let instance = self.heap.allocate(Object::Instance {
                     class: callable,
-                    attributes: BTreeMap::new(),
+                    attributes: crate::Attributes::new(shape),
                 });
                 if let Some(init) = self.class_attribute(callable, "__init__")? {
                     let args = std::iter::once(instance)
@@ -745,6 +803,7 @@ impl Vm {
                     name: name.clone(),
                     namespace,
                     bases: values.to_vec(),
+                    shape: crate::Shape::new(),
                 })
             }
             CoreOp::GetAttr(name) => self.attribute(values[0], name)?,
@@ -752,7 +811,7 @@ impl Vm {
                 let mut guard = self.heap.get_mut(values[0])?;
                 match &mut *guard {
                     Object::Instance { attributes, .. } => {
-                        attributes.insert(name.clone(), values[1]);
+                        attributes.insert_ref(name, values[1]);
                     }
                     Object::Class { namespace, .. } => {
                         let namespace = *namespace;
@@ -961,7 +1020,47 @@ impl Vm {
         }
     }
 
+    pub(crate) fn get_attribute(
+        &mut self,
+        object: Value,
+        attribute: &crate::Attribute,
+    ) -> Result<Value> {
+        self.attribute_lookup(object, &attribute.text, Some(attribute))
+    }
+
+    pub(crate) fn set_attribute(
+        &mut self,
+        object: Value,
+        attribute: &crate::Attribute,
+        value: Value,
+    ) -> Result<Value> {
+        let mut target = self.heap.get_mut(object)?;
+        match &mut *target {
+            Object::Instance { attributes, .. } => {
+                if attributes.write(attribute, value) {
+                    self.tier_stats.shape_write_hits += 1;
+                }
+            }
+            Object::Class { namespace, .. } => {
+                let namespace = *namespace;
+                drop(target);
+                self.store(namespace, &attribute.text, value)?;
+            }
+            _ => return Err(Error::Type("object has no writable attributes")),
+        }
+        Ok(Value::None)
+    }
+
     fn attribute(&mut self, object: Value, name: &str) -> Result<Value> {
+        self.attribute_lookup(object, name, None)
+    }
+
+    fn attribute_lookup(
+        &mut self,
+        object: Value,
+        name: &str,
+        cached: Option<&crate::Attribute>,
+    ) -> Result<Value> {
         match self.heap.get(object)? {
             Object::Native(module) if module == "math" => {
                 return match name {
@@ -985,8 +1084,16 @@ impl Vm {
                 };
             }
             Object::Instance { class, attributes } => {
-                if let Some(value) = attributes.get(name) {
-                    return Ok(*value);
+                let (value, hit) = if let Some(site) = cached {
+                    attributes.read(site)
+                } else {
+                    (attributes.get(name).copied(), false)
+                };
+                if let Some(value) = value {
+                    if hit {
+                        self.tier_stats.shape_read_hits += 1;
+                    }
+                    return Ok(value);
                 }
                 if let Some(value) = self.class_attribute(*class, name)? {
                     return Ok(if matches!(self.heap.get(value), Ok(Object::Function(_))) {
@@ -1183,10 +1290,7 @@ impl Vm {
                 self.output.push_str(&end);
                 Value::None
             }
-            "len" => {
-                arity(args, 1, 1)?;
-                Value::Int(self.heap.len(args[0])? as i64)
-            }
+            "len" => ScalarBuiltin::Len.evaluate(&self.heap, args)?,
             "range" => {
                 arity(args, 1, 3)?;
                 let (start, stop, step) = match args {
@@ -1300,17 +1404,16 @@ impl Vm {
                 };
                 self.heap.allocate(Object::String(text))
             }
-            "math.sqrt" | "math.sin" | "math.cos" | "math.log" => {
+            "math.sqrt" => ScalarBuiltin::Sqrt.evaluate(&self.heap, args)?,
+            "math.sin" | "math.cos" | "math.log" => {
                 arity(args, 1, 1)?;
                 let value = number(args[0])?;
-                if (name == "math.sqrt" && value < 0.0)
-                    || (name == "math.log" && value <= 0.0)
+                if (name == "math.log" && value <= 0.0)
                     || (matches!(name, "math.sin" | "math.cos") && value.is_infinite())
                 {
                     return Err(error("ValueError: math domain error"));
                 }
                 Value::Float(match name {
-                    "math.sqrt" => value.sqrt(),
                     "math.sin" => value.sin(),
                     "math.log" => value.ln(),
                     _ => value.cos(),

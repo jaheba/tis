@@ -24,6 +24,8 @@ pub(crate) enum Opcode {
     Runtime,
     CallPositional,
     PrepareMethod,
+    GetAttr,
+    SetAttr,
     Numeric,
     LoadLocal,
     LoadName,
@@ -54,6 +56,7 @@ pub(crate) struct RegisterCode {
     pub body: Vec<Instruction>,
     pub edges: Vec<Transfer>,
     pub names: Vec<Cell<Option<crate::bindings::NameSlot>>>,
+    pub fields: Vec<crate::Attribute>,
     // Cells allow recursive frames to share quickening without retaining a mutable code borrow.
     pub numeric: Vec<Cell<Option<Plan>>>,
     quickened_window: Cell<Option<u32>>,
@@ -117,6 +120,15 @@ impl RegisterCode {
                     .as_ref()
                     .ok_or(Error::InvalidIr("register site"))?;
                 output.max_arguments = output.max_arguments.max(site.inputs.len());
+                let field = if let Op::Runtime(CoreOp::GetAttr(name) | CoreOp::SetAttr(name), _) =
+                    &instruction.op
+                {
+                    let id = output.fields.len();
+                    output.fields.push(name.clone().into());
+                    Some(id)
+                } else {
+                    None
+                };
                 let (op, a, b, c) = match &instruction.op {
                     Op::Constant(_) => (
                         Opcode::Constant,
@@ -166,8 +178,14 @@ impl RegisterCode {
                             Opcode::PrepareMethod,
                             inputs[0].0,
                             site.runtime.ok_or(Error::InvalidIr("method lookup"))?,
-                            0,
+                            field.ok_or(Error::InvalidIr("method field site"))?,
                         )
+                    }
+                    Op::Runtime(CoreOp::GetAttr(_), inputs) => {
+                        (Opcode::GetAttr, field.unwrap(), inputs[0].0, 0)
+                    }
+                    Op::Runtime(CoreOp::SetAttr(_), inputs) => {
+                        (Opcode::SetAttr, field.unwrap(), inputs[0].0, inputs[1].0)
                     }
                     Op::Runtime(CoreOp::Call(names), _) if names.iter().all(Option::is_none) => {
                         (Opcode::CallPositional, 0, 0, 0)
@@ -292,7 +310,9 @@ impl RegisterCode {
         for (id, edge) in self.body.iter().enumerate() {
             if matches!(
                 edge.op,
-                Opcode::Runtime
+                Opcode::GetAttr
+                    | Opcode::SetAttr
+                    | Opcode::Runtime
                     | Opcode::Numeric
                     | Opcode::CallPositional
                     | Opcode::PrepareMethod
@@ -302,7 +322,13 @@ impl RegisterCode {
                 let (operation, _) = code
                     .operations
                     .get(
-                        if matches!(edge.op, Opcode::Numeric | Opcode::CallPositional) {
+                        if matches!(
+                            edge.op,
+                            Opcode::Numeric
+                                | Opcode::CallPositional
+                                | Opcode::GetAttr
+                                | Opcode::SetAttr
+                        ) {
                             code.sites[edge.dst as usize]
                                 .as_ref()
                                 .and_then(|site| site.runtime)

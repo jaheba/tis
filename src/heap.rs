@@ -58,10 +58,11 @@ pub enum Object {
         name: String,
         namespace: Value,
         bases: Vec<Value>,
+        shape: std::rc::Rc<crate::Shape>,
     },
     Instance {
         class: Value,
-        attributes: std::collections::BTreeMap<String, Value>,
+        attributes: crate::Attributes,
     },
     Range {
         start: i64,
@@ -109,6 +110,42 @@ struct Entry {
     object: Object,
 }
 
+/// Read-only native view, refreshed after allocation or any mutable object borrow.
+/// Values remain Rust-owned; native code may use a pointer only until its next callback.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NativeFields {
+    pub(crate) generation: u64,
+    pub(crate) shape: u64,
+    pub(crate) values: *const Value,
+    pub(crate) len: usize,
+}
+
+impl NativeFields {
+    fn of(object: &Object, generation: u32) -> Self {
+        match object {
+            Object::Instance { attributes, .. } => {
+                let (shape, values, len) = attributes.native_fields();
+                Self {
+                    generation: generation as u64,
+                    shape,
+                    values,
+                    len,
+                }
+            }
+            _ => Self::default(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NativeFieldDirectory {
+    pub(crate) entries: *const NativeFields,
+    pub(crate) len: usize,
+    pub(crate) heap: u64,
+}
+
 #[derive(Debug)]
 struct Generation {
     version: u32,
@@ -119,6 +156,8 @@ struct Generation {
 #[derive(Debug)]
 pub struct Heap {
     identity: u32,
+    pub(crate) native_fields: Cell<NativeFieldDirectory>,
+    field_rows: RefCell<Vec<NativeFields>>,
     entries: StableHeap<Entry>,
     generations: RefCell<Vec<Generation>>,
     live: Cell<usize>,
@@ -131,6 +170,8 @@ impl Heap {
             identity: NEXT_HEAP
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("heap identity exhausted"),
+            native_fields: Cell::new(NativeFieldDirectory::default()),
+            field_rows: RefCell::new(Vec::new()),
             entries: StableHeap::with_capacity(16),
             generations: RefCell::new(Vec::new()),
             live: Cell::new(0),
@@ -159,6 +200,17 @@ impl Heap {
                 .expect("heap slot generation exhausted");
             slot.live = true;
         }
+        let generation = generations[id.index()].version;
+        if self.native_fields.get().heap != 0 {
+            let mut rows = self.field_rows.borrow_mut();
+            let fields = NativeFields::of(&self.entries.get(id).object, generation);
+            if id.index() == rows.len() {
+                rows.push(fields);
+            } else {
+                rows[id.index()] = fields;
+            }
+            self.publish_field_rows(&rows);
+        }
         Value::Ref(ObjectId {
             heap: self.identity,
             index,
@@ -173,9 +225,56 @@ impl Heap {
 
     pub fn get_mut(&mut self, value: Value) -> Result<impl DerefMut<Target = Object> + '_> {
         let id = self.checked_id(value)?;
+        let fields = if self.native_fields.get().heap != 0 {
+            let rows = self.field_rows.get_mut();
+            let generation = self.generations.get_mut()[id.index()].version;
+            // Invalidate before exposing mutable access. Forgetting the guard must stay safe.
+            rows[id.index()] = NativeFields::default();
+            let mut directory = self.native_fields.get();
+            directory.entries = rows.as_ptr();
+            self.native_fields.set(directory);
+            Some(FieldMutation {
+                rows,
+                index: id.index(),
+                generation,
+                directory: &self.native_fields,
+            })
+        } else {
+            None
+        };
         Ok(ObjectMut(
             self.entries.entry(id).ok_or(Error::InvalidObject)?,
+            fields,
         ))
+    }
+
+    /// The extra directory is needed only by Cranelift field loads, never by bytecode or stencils.
+    pub(crate) fn enable_native_fields(&self) {
+        if self.native_fields.get().heap != 0 {
+            return;
+        }
+        let generations = self.generations.borrow();
+        let mut rows = self.field_rows.borrow_mut();
+        rows.extend(generations.iter().enumerate().map(|(index, generation)| {
+            if generation.live {
+                NativeFields::of(
+                    &self.entries.get(HeapId::from_index(index)).object,
+                    generation.version,
+                )
+            } else {
+                NativeFields::default()
+            }
+        }));
+        self.publish_field_rows(&rows);
+    }
+
+    fn publish_field_rows(&self, rows: &[NativeFields]) {
+        // Allocation can move the row vector; generated code reloads this descriptor after callbacks.
+        self.native_fields.set(NativeFieldDirectory {
+            entries: rows.as_ptr(),
+            len: rows.len(),
+            heap: self.identity as u64,
+        });
     }
 
     pub fn key(&self, value: Value) -> Result<Key> {
@@ -306,9 +405,18 @@ impl Heap {
                     .entry(HeapId::from_index(index))
                     .expect("live generation has an entry")
                     .free();
+                if let Some(row) = self.field_rows.get_mut().get_mut(index) {
+                    *row = NativeFields::default();
+                }
                 generation.live = false;
                 freed += 1;
             }
+        }
+        if self.native_fields.get().heap != 0 {
+            let rows = self.field_rows.get_mut();
+            let mut directory = self.native_fields.get();
+            directory.entries = rows.as_ptr();
+            self.native_fields.set(directory);
         }
         self.live.set(self.live.get() - freed);
         Ok(freed)
@@ -344,16 +452,36 @@ impl Default for Heap {
     }
 }
 
-struct ObjectMut<G>(G);
+struct FieldMutation<'a> {
+    rows: &'a mut Vec<NativeFields>,
+    index: usize,
+    generation: u32,
+    directory: &'a Cell<NativeFieldDirectory>,
+}
 
-impl<G: Deref<Target = Entry>> Deref for ObjectMut<G> {
+struct ObjectMut<'a, G: Deref<Target = Entry>>(G, Option<FieldMutation<'a>>);
+
+impl<G: Deref<Target = Entry>> Drop for ObjectMut<'_, G> {
+    fn drop(&mut self) {
+        if let Some(fields) = &mut self.1 {
+            // Mutation can replace the object, change shape, or reallocate the field vector.
+            // Derive a fresh shared pointer after the mutable object borrow has ended.
+            fields.rows[fields.index] = NativeFields::of(&self.0.object, fields.generation);
+            let mut directory = fields.directory.get();
+            directory.entries = fields.rows.as_ptr();
+            fields.directory.set(directory);
+        }
+    }
+}
+
+impl<G: Deref<Target = Entry>> Deref for ObjectMut<'_, G> {
     type Target = Object;
     fn deref(&self) -> &Self::Target {
         &self.0.object
     }
 }
 
-impl<G: DerefMut<Target = Entry>> DerefMut for ObjectMut<G> {
+impl<G: DerefMut<Target = Entry>> DerefMut for ObjectMut<'_, G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0.object
     }
@@ -408,5 +536,32 @@ impl PartialEq for Key {
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod native_field_tests {
+    use super::*;
+
+    #[test]
+    fn forgotten_mutation_leaves_a_miss_instead_of_a_stale_pointer() {
+        let mut heap = Heap::new();
+        let mut attributes = crate::Attributes::new(crate::Shape::new());
+        attributes.insert("x".into(), Value::Int(42));
+        let object = heap.allocate(Object::Instance {
+            class: Value::None,
+            attributes,
+        });
+        heap.enable_native_fields();
+        let Value::Ref(id) = object else {
+            unreachable!()
+        };
+        assert_ne!(heap.field_rows.borrow()[id.index as usize].generation, 0);
+        let mut guard = heap.get_mut(object).unwrap();
+        *guard = Object::Tuple(vec![]);
+        std::mem::forget(guard);
+        let rows = heap.field_rows.borrow();
+        assert_eq!(rows[id.index as usize].generation, 0);
+        assert!(rows[id.index as usize].values.is_null());
     }
 }

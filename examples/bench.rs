@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run_ns = sample(&mut vm)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{}}}",
+            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"inline_field_hits\":{},\"inline_blocks\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{},\"positional_frames\":{},\"scratch_creations\":{},\"scratch_reuses\":{},\"shape_reads\":{},\"shape_writes\":{},\"body_inlines\":{}}}",
             stats.native_compile_ns + stats.copy_patch_compile_ns
                 - before.native_compile_ns
                 - before.copy_patch_compile_ns,
@@ -95,12 +95,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats.native_runtime_calls - before.native_runtime_calls,
             stats.native_root_syncs - before.native_root_syncs,
             stats.native_field_hits - before.native_field_hits,
+            stats.native_inline_field_hits - before.native_inline_field_hits,
+            stats.native_inline_blocks - before.native_inline_blocks,
             stats.bytecode_positional_calls - before.bytecode_positional_calls,
             stats.bytecode_leaf_calls - before.bytecode_leaf_calls,
             stats.bytecode_method_calls - before.bytecode_method_calls,
             stats.literal_hits - before.literal_hits,
             stats.interned_literals - before.interned_literals,
-            stats.name_cache_hits - before.name_cache_hits
+            stats.name_cache_hits - before.name_cache_hits,
+            stats.positional_frames - before.positional_frames,
+            stats.register_scratch_creations - before.register_scratch_creations,
+            stats.register_scratch_reuses - before.register_scratch_reuses,
+            stats.shape_read_hits - before.shape_read_hits,
+            stats.shape_write_hits - before.shape_write_hits,
+            stats.native_body_inlines - before.native_body_inlines
         );
         io::stdout().flush()?;
     }

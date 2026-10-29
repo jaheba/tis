@@ -91,7 +91,13 @@ impl Effects {
 /// Helpers consume and return boxed values; environment and root maps are explicit call metadata.
 #[derive(Debug, Clone)]
 pub enum Helper {
+    InlineCall {
+        body: std::rc::Rc<crate::body_inline::Plan>,
+        names: Vec<Option<String>>,
+    },
     StringConstant(crate::StringLiteral),
+    GetAttr(crate::Attribute),
+    SetAttr(crate::Attribute),
     LoadName(crate::Name),
     StoreName(crate::Name),
     Add,
@@ -103,8 +109,11 @@ pub enum Helper {
     GetItem,
     SetItem,
     Len,
+    /// A guarded no-GC scalar probe with general positional-call fallback and full Call effects.
+    ScalarCall(ScalarBuiltin),
     Python(CoreOp),
 }
+pub use crate::execution::ScalarBuiltin;
 pub use crate::scalar::FloatOperator;
 pub use crate::sequence::SequenceKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +179,13 @@ pub enum Operation {
         right: Register,
         failure: ExitId,
     },
+    /// Compare exact Int/Float values with an integer literal representable exactly in f64.
+    NumberCompare {
+        value: Register,
+        integer: i64,
+        operator: String,
+        failure: ExitId,
+    },
     FloatCompare {
         operator: String,
         left: Register,
@@ -177,7 +193,15 @@ pub enum Operation {
     },
     BoxFloat(Register),
     BoxBool(Register),
+    BoolNot(Register),
     UnboxInt(Register),
+    /// Exact Int/Float union, returning Int only for Int+Int. No allocation or Python calls.
+    NumericAdd {
+        left: Register,
+        right: Register,
+        guard: ExitId,
+        overflow: ExitId,
+    },
     CheckedAdd {
         left: Register,
         right: Register,
@@ -267,6 +291,18 @@ impl Function {
             regions: vec![],
             nest: None,
         };
+        let integer_constants = hir
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| {
+                if let hir::Op::Constant(Constant::Int(value)) = i.op {
+                    Some((i.result, value))
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut float_values = BTreeSet::new();
         let mut float_params = BTreeSet::new();
         if mode == LoweringMode::Profiled {
@@ -370,6 +406,31 @@ impl Function {
                         &mut instructions,
                         Some(result),
                         Operation::Constant(Constant::Float(-value)),
+                    );
+                    continue;
+                }
+                if let hir::Op::Runtime(CoreOp::Unary(op), inputs) = &instruction.op
+                    && op == "not"
+                {
+                    // Truth retains the original error point and heap fallback; inversion is typed and pure.
+                    views.clear();
+                    let truth = output.register(Type::Bool);
+                    emit(
+                        &mut instructions,
+                        Some(truth),
+                        Operation::Truth {
+                            value: Register(inputs[0].0),
+                            state,
+                            roots: vec![],
+                            effects: Effects::READ_ONLY,
+                        },
+                    );
+                    let inverted = output.register(Type::Bool);
+                    emit(&mut instructions, Some(inverted), Operation::BoolNot(truth));
+                    emit(
+                        &mut instructions,
+                        Some(result),
+                        Operation::BoxBool(inverted),
                     );
                     continue;
                 }
@@ -588,6 +649,43 @@ impl Function {
                     }
                     _ => None,
                 };
+                let number_compare = float_compare.as_ref().and_then(|operator| {
+                    if mode != LoweringMode::Profiled {
+                        return None;
+                    }
+                    let inputs = instruction.op.inputs();
+                    let site = profile.site(origin)?;
+                    if site.executions < hir::AddFeedback::WARMUP as u64 || site.operands.len() != 2
+                    {
+                        return None;
+                    }
+                    let (value_index, integer, operator) =
+                        if let Some(&integer) = integer_constants.get(&inputs[1]) {
+                            (0, integer, operator.clone())
+                        } else if let Some(&integer) = integer_constants.get(&inputs[0]) {
+                            let reversed = match operator.as_str() {
+                                "<" => ">",
+                                "<=" => ">=",
+                                ">" => "<",
+                                ">=" => "<=",
+                                other => other,
+                            };
+                            (1, integer, reversed.to_owned())
+                        } else {
+                            return None;
+                        };
+                    let operand = &site.operands[value_index];
+                    if !exact_float_integer(integer)
+                        || operand.observations() == 0
+                        || operand.observations()
+                            != operand
+                                .count(ValueKind::Int)
+                                .saturating_add(operand.count(ValueKind::Float))
+                    {
+                        return None;
+                    }
+                    Some((Register(inputs[value_index].0), integer, operator))
+                });
                 let sequence_kind = |input: hir::ValueId| {
                     if let Some(kind) = sequences.get(&input) {
                         return Some(*kind);
@@ -639,6 +737,19 @@ impl Function {
                         sequences.insert(origin, kind);
                     }
                     emit(&mut instructions, Some(result), operation);
+                } else if let Some((value, integer, operator)) = number_compare {
+                    let raw = output.register(Type::Bool);
+                    emit(
+                        &mut instructions,
+                        Some(raw),
+                        Operation::NumberCompare {
+                            value,
+                            integer,
+                            operator,
+                            failure: output.exit(state, ExitReason::TypeGuard),
+                        },
+                    );
+                    emit(&mut instructions, Some(result), Operation::BoxBool(raw));
                 } else if let Some(signature) = float_signature
                     && (float_operator.is_some()
                         || (float_compare.is_some()
@@ -761,6 +872,31 @@ impl Function {
                     );
                     emit(&mut instructions, Some(result), Operation::BoxInt(sum));
                     scalars.insert(origin, (ValueKind::Int, sum));
+                } else if float_operator == Some(FloatOperator::Add)
+                    && mode == LoweringMode::Profiled
+                    && profile.site(origin).is_some_and(|site| {
+                        site.executions >= hir::AddFeedback::WARMUP as u64
+                            && site.operands.len() == 2
+                            && site.operands.iter().all(|operand| {
+                                operand.observations() > 0
+                                    && operand.observations()
+                                        == operand
+                                            .count(ValueKind::Int)
+                                            .saturating_add(operand.count(ValueKind::Float))
+                            })
+                    })
+                {
+                    let inputs = instruction.op.inputs();
+                    emit(
+                        &mut instructions,
+                        Some(result),
+                        Operation::NumericAdd {
+                            left: Register(inputs[0].0),
+                            right: Register(inputs[1].0),
+                            guard: output.exit(state, ExitReason::TypeGuard),
+                            overflow: output.exit(state, ExitReason::IntegerOverflow),
+                        },
+                    );
                 } else if let hir::Op::Constant(Constant::String(text)) = &instruction.op {
                     views.clear();
                     let roots = output.states[state.0]
@@ -802,6 +938,69 @@ impl Function {
                         }
                         hir::Op::Runtime(CoreOp::StoreName(name), _) => {
                             Helper::StoreName(name.clone().into())
+                        }
+                        hir::Op::Runtime(CoreOp::GetAttr(name), _) => {
+                            let mut attribute: crate::Attribute = name.clone().into();
+                            // Builtin method sites need no machine-code instance probe or heap directory.
+                            // A later receiver change remains valid through the general helper fallback.
+                            attribute.inline_instances = mode == LoweringMode::Profiled
+                                && profile.site(origin).is_some_and(|site| {
+                                    site.operands.first().is_some_and(|operand| {
+                                        operand.count(ValueKind::Instance) > 0
+                                    })
+                                });
+                            Helper::GetAttr(attribute)
+                        }
+                        hir::Op::Runtime(CoreOp::SetAttr(name), _) => {
+                            Helper::SetAttr(name.clone().into())
+                        }
+                        hir::Op::Runtime(CoreOp::Call(names), _)
+                            if mode == LoweringMode::Profiled
+                                && names.iter().all(Option::is_none)
+                                && profile.site(origin).is_some_and(|site| {
+                                    site.executions >= 8
+                                        && site.call_targets.len() == 1
+                                        && site.other_targets == 0
+                                        && site.inline_body.as_ref().is_some_and(|body| {
+                                            body.source != hir.id()
+                                                && body.parameters
+                                                    == names.len() + usize::from(body.bound)
+                                        })
+                                }) =>
+                        {
+                            Helper::InlineCall {
+                                body: profile.site(origin).unwrap().inline_body.clone().unwrap(),
+                                names: names.clone(),
+                            }
+                        }
+                        hir::Op::Runtime(CoreOp::Call(names), _)
+                            if mode == LoweringMode::Profiled
+                                && names.len() == 1
+                                && names.iter().all(Option::is_none) =>
+                        {
+                            let leaf = profile
+                                .site(origin)
+                                .filter(|site| {
+                                    site.executions >= hir::AddFeedback::WARMUP as u64
+                                        && site.other_targets == 0
+                                        && site.call_targets.len() == 1
+                                        && site
+                                            .operands
+                                            .first()
+                                            .and_then(|operand| operand.monomorphic())
+                                            == Some(ValueKind::Native)
+                                })
+                                .and_then(|site| {
+                                    if let crate::profile::CallTarget::Native(name) =
+                                        site.call_targets.keys().next()?
+                                    {
+                                        ScalarBuiltin::from_name(name)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            leaf.map(Helper::ScalarCall)
+                                .unwrap_or_else(|| Helper::Python(CoreOp::Call(names.clone())))
                         }
                         hir::Op::Runtime(op, _) => Helper::Python(op.clone()),
                         hir::Op::Constant(_) => unreachable!(),
@@ -1077,6 +1276,38 @@ impl Function {
         let id = ExitId(self.exits.len());
         self.exits.push(SideExit { state, reason });
         id
+    }
+
+    /// Uncaptured frame slots without explicit writes are invariant during an invocation.
+    /// Callees can mutate captured environments or referenced objects, but cannot change these slots.
+    pub(crate) fn invariant_local_loads(&self) -> Vec<(Register, usize)> {
+        // A block-zero OSR entry is not necessarily a fresh invocation.
+        if self.osr_entries.iter().any(|entry| entry.header.0 == 0) {
+            return Vec::new();
+        }
+        let written = self
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match &instruction.operation {
+                Operation::Call {
+                    helper: Helper::Python(CoreOp::StoreLocal(slot)),
+                    ..
+                } => Some(*slot),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        self.blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match &instruction.operation {
+                Operation::Call {
+                    helper: Helper::Python(CoreOp::LoadLocal(slot)),
+                    ..
+                } if !written.contains(slot) => Some((instruction.result?, *slot)),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -1364,6 +1595,25 @@ impl Function {
                         }
                         Some(Type::F64)
                     }
+                    Operation::NumberCompare {
+                        value,
+                        integer,
+                        operator,
+                        failure,
+                    } => {
+                        kind(*value, Type::Boxed)?;
+                        let edge = exit(*failure)?;
+                        let snapshot = state(edge.state)?;
+                        if !exact_float_integer(*integer)
+                            || !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str())
+                            || edge.reason != ExitReason::TypeGuard
+                            || snapshot.resume != instruction.point
+                            || !snapshot.values.iter().any(|(_, r)| r == value)
+                        {
+                            return Err(fail());
+                        }
+                        Some(Type::Bool)
+                    }
                     Operation::FloatCompare {
                         operator,
                         left,
@@ -1381,8 +1631,41 @@ impl Function {
                         unboxed_sources.insert(*value, instruction.result.ok_or_else(fail)?);
                         Some(Type::Boxed)
                     }
+                    Operation::BoolNot(value) => {
+                        kind(*value, Type::Bool)?;
+                        Some(Type::Bool)
+                    }
                     Operation::BoxBool(value) => {
                         kind(*value, Type::Bool)?;
+                        Some(Type::Boxed)
+                    }
+                    Operation::NumericAdd {
+                        left,
+                        right,
+                        guard,
+                        overflow,
+                    } => {
+                        for input in [left, right] {
+                            kind(*input, Type::Boxed)?;
+                        }
+                        for (id, reason) in [
+                            (*guard, ExitReason::TypeGuard),
+                            (*overflow, ExitReason::IntegerOverflow),
+                        ] {
+                            let edge = exit(id)?;
+                            let snapshot = state(edge.state)?;
+                            if edge.reason != reason
+                                || snapshot.resume != instruction.point
+                                || [left, right]
+                                    .iter()
+                                    .any(|input| !snapshot.values.iter().any(|(_, r)| r == *input))
+                            {
+                                return Err(fail());
+                            }
+                        }
+                        if exit(*guard)?.state != exit(*overflow)?.state {
+                            return Err(fail());
+                        }
                         Some(Type::Boxed)
                     }
                     Operation::CheckedAdd {
@@ -1763,10 +2046,13 @@ impl Operation {
             | Self::IntToFloat(value)
             | Self::BoxFloat(value)
             | Self::BoxBool(value)
+            | Self::BoolNot(value)
             | Self::UnboxInt(value)
             | Self::BoxInt(value)
+            | Self::NumberCompare { value, .. }
             | Self::Truth { value, .. } => vec![*value],
-            Self::CheckedAdd { left, right, .. }
+            Self::NumericAdd { left, right, .. }
+            | Self::CheckedAdd { left, right, .. }
             | Self::FloatBinary { left, right, .. }
             | Self::FloatCompare { left, right, .. } => vec![*left, *right],
             Self::Call { arguments, .. } => arguments.clone(),
@@ -1850,7 +2136,9 @@ impl Function {
                     }
                 }
                 let snapshot = match &ins.operation {
-                    Operation::GuardInt { exit, .. }
+                    Operation::NumberCompare { failure: exit, .. }
+                    | Operation::NumericAdd { guard: exit, .. }
+                    | Operation::GuardInt { exit, .. }
                     | Operation::GuardFloat { exit, .. }
                     | Operation::FloatBinary { failure: exit, .. }
                     | Operation::CheckedAdd { overflow: exit, .. } => {
@@ -1907,7 +2195,10 @@ impl Helper {
         };
         match self {
             Self::Subtract | Self::Less | Self::Len | Self::LoadName(_) => readonly,
-            Self::SetItem | Self::StoreName(_) => writing,
+            Self::SetItem | Self::StoreName(_) | Self::SetAttr(_) => writing,
+            Self::GetAttr(_) | Self::ScalarCall(_) | Self::InlineCall { .. } => {
+                Effects::CONSERVATIVE
+            }
             Self::StringConstant(_)
             | Self::Add
             | Self::List
@@ -1943,9 +2234,13 @@ impl Helper {
     }
     fn accepts(&self, count: usize) -> bool {
         match self {
+            Self::InlineCall { names, .. } => count == names.len() + 1,
             Self::StringConstant(_) | Self::LoadName(_) => count == 0,
-            Self::StoreName(_) => count == 1,
-            Self::Add | Self::Subtract | Self::Less | Self::GetItem => count == 2,
+            Self::StoreName(_) | Self::GetAttr(_) => count == 1,
+            Self::SetAttr(_) => count == 2,
+            Self::Add | Self::Subtract | Self::Less | Self::GetItem | Self::ScalarCall(_) => {
+                count == 2
+            }
             Self::SetItem => count == 3,
             Self::Len => count == 1,
             Self::List | Self::Tuple => true,
@@ -2060,4 +2355,9 @@ impl Function {
         }
         recipes
     }
+}
+
+/// The wider roundtrip avoids i64 saturation falsely accepting i64::MAX after f64 rounding.
+fn exact_float_integer(value: i64) -> bool {
+    value as f64 as i128 == value as i128
 }

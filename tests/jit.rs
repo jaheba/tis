@@ -180,7 +180,7 @@ fn profiled_integer_addition_has_explicit_guards_overflow_and_boxing() {
 }
 
 #[test]
-fn cold_or_polymorphic_sites_keep_a_generic_runtime_call() {
+fn cold_or_unsupported_polymorphic_sites_keep_a_generic_runtime_call() {
     let (mut function, _) = add();
     let lir = function.lower_lir(LoweringMode::Profiled).unwrap();
     assert!(lir.exits.is_empty());
@@ -191,6 +191,9 @@ fn cold_or_polymorphic_sites_keep_a_generic_runtime_call() {
             .unwrap();
     }
     vm.run(&mut function, &[Value::Float(1.0), Value::Int(2)])
+        .unwrap();
+    // Exact numeric unions now specialize; bool remains outside that guarded representation.
+    vm.run(&mut function, &[Value::Bool(true), Value::Int(2)])
         .unwrap();
     assert!(
         function

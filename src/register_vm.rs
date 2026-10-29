@@ -7,6 +7,13 @@ use crate::{
 };
 use std::{cell::RefCell, rc::Rc};
 
+#[derive(Debug, Default)]
+pub(crate) struct RegisterScratch {
+    arguments: Vec<Value>,
+    transfers: Vec<Value>,
+    methods: Vec<(ValueId, Value, &'static str)>,
+}
+
 impl Vm {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_register(
@@ -15,15 +22,53 @@ impl Vm {
         code: &Code,
         base: usize,
         frame_end: usize,
+        ip: usize,
+        previous: Option<usize>,
+    ) -> Result<Value> {
+        let mut scratch = if let Some(scratch) = self.register_scratch.pop() {
+            self.tier_stats.register_scratch_reuses += 1;
+            scratch
+        } else {
+            self.tier_stats.register_scratch_creations += 1;
+            RegisterScratch::default()
+        };
+        let result = self.execute_register_inner(
+            function,
+            code,
+            base,
+            frame_end,
+            ip,
+            previous,
+            &mut scratch,
+        );
+        scratch.arguments.clear();
+        scratch.transfers.clear();
+        scratch.methods.clear();
+        self.register_scratch.push(scratch);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_register_inner(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        base: usize,
+        frame_end: usize,
         mut ip: usize,
         mut previous: Option<usize>,
+        scratch: &mut RegisterScratch,
     ) -> Result<Value> {
         let register = &code.register;
         let mut collecting = self.collecting(function);
-        let mut arguments = Vec::with_capacity(register.max_arguments.min(8));
-        // A prepared callee's register holds its receiver, so it remains a GC root.
-        let mut methods: Vec<(ValueId, Value, &'static str)> = Vec::new();
-        let mut transfers = Vec::with_capacity(register.max_transfer);
+        let RegisterScratch {
+            arguments,
+            transfers,
+            methods,
+        } = scratch;
+        arguments.reserve(register.max_arguments.min(8));
+        transfers.reserve(register.max_transfer);
+        // Prepared receivers remain rooted in their caller's register window.
         loop {
             let instruction = *register
                 .body
@@ -37,7 +82,7 @@ impl Vm {
             let op = instruction.op;
             match op {
                 Opcode::EnterBlock => {
-                    self.materialize_methods(base, &mut methods)?;
+                    self.materialize_methods(base, methods)?;
                     let backedge = self.record_block(function, code, a, previous)?;
                     collecting = self.collecting(function);
                     previous = Some(a);
@@ -77,7 +122,7 @@ impl Vm {
                     for (_, source) in &edge.pairs {
                         transfers.push(self.read(base, *source)?);
                     }
-                    for ((destination, _), value) in edge.pairs.iter().zip(&transfers) {
+                    for ((destination, _), value) in edge.pairs.iter().zip(transfers.iter()) {
                         self.write(base, *destination, *value)?;
                     }
                     ip = edge.target;
@@ -87,7 +132,7 @@ impl Vm {
                 _ => {}
             }
             if collecting && !methods.is_empty() {
-                self.materialize_methods(base, &mut methods)?;
+                self.materialize_methods(base, methods)?;
             }
             let destination = ValueId(instruction.dst as usize);
             let mut observed =
@@ -202,6 +247,14 @@ impl Vm {
                         self.check_local(a, value)?;
                         value
                     }
+                    Opcode::GetAttr => {
+                        self.get_attribute(self.read(base, ValueId(b))?, &register.fields[a])?
+                    }
+                    Opcode::SetAttr => self.set_attribute(
+                        self.read(base, ValueId(b))?,
+                        &register.fields[a],
+                        self.read(base, ValueId(c))?,
+                    )?,
                     Opcode::PrepareMethod => {
                         let receiver = self.read(base, ValueId(a))?;
                         let (operation, _) = &code.operations[b];
@@ -215,7 +268,7 @@ impl Vm {
                             methods.push((destination, receiver, name));
                             receiver
                         } else {
-                            self.operation(operation, &[receiver])?
+                            self.get_attribute(receiver, &register.fields[c])?
                         }
                     }
                     Opcode::CallPositional => {
@@ -234,9 +287,9 @@ impl Vm {
                         if let Some(index) = methods.iter().position(|(slot, _, _)| *slot == callee)
                         {
                             let (_, receiver, name) = methods.swap_remove(index);
-                            self.call_prepared_method(receiver, name, &arguments)?
+                            self.call_prepared_method(receiver, name, arguments)?
                         } else {
-                            self.call_from_registers(callable, &arguments)?
+                            self.call_from_registers(callable, arguments)?
                         }
                     }
                     Opcode::Runtime
@@ -280,7 +333,7 @@ impl Vm {
                                 }
                                 // Inputs remain in this register window across nested execution.
                                 // Unlike stack bytecode, operand collection does not remove their roots.
-                                self.operation(operation, &arguments)?
+                                self.operation(operation, arguments)?
                             }
                         }
                     }

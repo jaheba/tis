@@ -53,12 +53,20 @@ pub struct TierStats {
     pub native_region_failures: u64,
     pub native_runtime_calls: u64,
     pub native_field_hits: u64,
+    pub native_inline_field_hits: u64,
+    pub native_inline_blocks: u64,
+    pub native_body_inlines: u64,
     pub bytecode_positional_calls: u64,
     pub bytecode_leaf_calls: u64,
     pub bytecode_method_calls: u64,
     pub literal_hits: u64,
     pub interned_literals: u64,
     pub name_cache_hits: u64,
+    pub shape_read_hits: u64,
+    pub shape_write_hits: u64,
+    pub positional_frames: u64,
+    pub register_scratch_creations: u64,
+    pub register_scratch_reuses: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Datum {
@@ -357,6 +365,21 @@ impl Vm {
                         };
                         Some(Datum::Float(result))
                     }
+                    Operation::NumberCompare {
+                        value,
+                        integer,
+                        operator,
+                        failure,
+                    } => {
+                        let Some(value) = runtime::number_compare(
+                            read(&registers, *value)?.boxed()?,
+                            *integer,
+                            operator,
+                        ) else {
+                            return self.lir_exit(function, lir, *failure, &registers);
+                        };
+                        Some(Datum::Bool(value))
+                    }
                     Operation::FloatCompare {
                         operator,
                         left,
@@ -375,6 +398,9 @@ impl Vm {
                     Operation::BoxFloat(value) => Some(Datum::Boxed(Value::Float(
                         read(&registers, *value)?.float()?,
                     ))),
+                    Operation::BoolNot(value) => {
+                        Some(Datum::Bool(!read(&registers, *value)?.boolean()?))
+                    }
                     Operation::BoxBool(value) => Some(Datum::Boxed(Value::Bool(
                         read(&registers, *value)?.boolean()?,
                     ))),
@@ -383,6 +409,27 @@ impl Vm {
                             return Err(Error::InvalidIr("unguarded integer unbox"));
                         };
                         Some(Datum::Int(value))
+                    }
+                    Operation::NumericAdd {
+                        left,
+                        right,
+                        guard,
+                        overflow,
+                    } => {
+                        match runtime::numeric_add(
+                            read(&registers, *left)?.boxed()?,
+                            read(&registers, *right)?.boxed()?,
+                        ) {
+                            Some(Ok(value)) => Some(Datum::Boxed(value)),
+                            miss => {
+                                return self.lir_exit(
+                                    function,
+                                    lir,
+                                    if miss.is_none() { *guard } else { *overflow },
+                                    &registers,
+                                );
+                            }
+                        }
                     }
                     Operation::CheckedAdd {
                         left,
@@ -623,6 +670,9 @@ impl Vm {
     }
     pub(crate) fn lir_helper(&mut self, helper: &Helper, args: &[Value]) -> Result<Value> {
         Ok(match helper {
+            Helper::InlineCall { .. } => self.call_from_registers(args[0], &args[1..])?,
+            Helper::GetAttr(attribute) => self.get_attribute(args[0], attribute)?,
+            Helper::SetAttr(attribute) => self.set_attribute(args[0], attribute, args[1])?,
             Helper::LoadName(name) => self.load_name_slot(&name.text, &name.cache)?,
             Helper::StoreName(name) => {
                 self.store_name_slot(&name.text, args[0], &name.cache)?;
@@ -646,9 +696,18 @@ impl Vm {
                 self.heap.set_item(args[0], args[1], args[2])?;
                 Value::None
             }
+            Helper::ScalarCall(_) => self.call_from_registers(args[0], &args[1..])?,
             Helper::Len => Value::Int(
                 i64::try_from(self.heap.len(args[0])?).map_err(|_| Error::IntegerOverflow)?,
             ),
+            Helper::Python(crate::hir::CoreOp::Call(names))
+                if names.iter().all(Option::is_none) =>
+            {
+                // LIR and native gateways root every operand throughout reentrant calls.
+                // Plain positional calls can share the register path; keywords/starred calls
+                // still require the general binder and its evaluation/duplicate checks.
+                self.call_from_registers(args[0], &args[1..])?
+            }
             Helper::Python(operation) => self.operation(operation, args)?,
         })
     }

@@ -341,3 +341,21 @@ pub unsafe extern "C" fn tis_stencil_float_unpack(
         next(ctx, slots, p)
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_bool_not(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        // The LIR verifier requires a raw Bool operand; normalization also keeps the output canonical.
+        write(
+            slots,
+            p.dst,
+            scalar(RAW_BOOL, u64::from(read(slots, p.left).a == 0)),
+        );
+        next(ctx, slots, p)
+    }
+}

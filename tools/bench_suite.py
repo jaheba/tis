@@ -11,7 +11,7 @@ import sys
 import time
 
 from bench_nbody import digest, summarize
-from compare_runtimes import runtime_info
+from compare_runtimes import runtime_info, checked_stderr
 
 FIXTURES = {'barnes-hut': ('barnes_hut', "\nprint(f'", 'bench_quadtree_nbody', (1, 200, 100, 0.5)),
             'ticket-search': ('ticket_search', '\nsearch()', 'search', ())}
@@ -72,6 +72,10 @@ def main():
                    platform=platform.platform(), samples=args.samples, warmups=args.warmups,
                    binaries={k: dict(path=str(v), sha256=digest(v)) for k, v in binaries.items()},
                    seed=20261028,
+                   runner_sha256=digest(Path(__file__).resolve()),
+                   parameters={b: FIXTURES[b][3] for b in args.benchmarks},
+                   timing='reused-process function invocation; setup, formatting and validation excluded',
+                   worker_warnings={},
                    runtimes={k: runtime_info(v) for k,v in binaries.items() if k!='tis'},
                    source_hashes={b: digest(Path(__file__).resolve().parents[1] / 'tests/fixtures' /
                                            f'{FIXTURES[b][0]}.py') for b in args.benchmarks},
@@ -127,8 +131,12 @@ def main():
             (args.output / 'comparison.json').write_text(json.dumps(results, indent=2) + '\n')
         for mode, p in workers.items():
             text = (args.output / f'{benchmark}-{mode}.stderr').read_text()
-            if p.returncode or text:
+            if p.returncode:
                 raise RuntimeError(f'{benchmark}/{mode} exited {p.returncode}: {text}')
+            # This PyPy build emits a known cache-size warning at startup; preserve it while
+            # rejecting every unexpected diagnostic, matching the other comparison drivers.
+            results['worker_warnings'][f'{benchmark}/{mode}'] = checked_stderr(text, mode == 'pypy')
+        (args.output / 'comparison.json').write_text(json.dumps(results, indent=2) + '\n')
     print(json.dumps(results['summary'], indent=2))
 
 

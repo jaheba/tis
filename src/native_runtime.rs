@@ -52,12 +52,23 @@ impl Slot {
 }
 pub(crate) type Entry = unsafe extern "C" fn(*mut c_void, *mut Slot, u32) -> u64;
 
+/// Each active native invocation owns its buffers. Only empty buffers enter the VM pool,
+/// so inactive capacity never retains Python handles or participates in GC tracing.
+#[derive(Debug, Default)]
+pub(crate) struct Scratch {
+    registers: Vec<Slot>,
+    rooted: Vec<usize>,
+    helper_arguments: Vec<Value>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute(
     lir: &lir::Function,
     locations: &[(usize, usize)],
     root_states: Option<&[lir::FrameState]>,
     lazy_slots: bool,
+    entry_locals: &[(lir::Register, usize)],
+    local_metadata: Option<usize>,
     nest: Option<&crate::region::nest::LoopNest>,
     extra_slots: usize,
     invoke: impl FnOnce(*mut c_void, *mut Slot, u32) -> u64,
@@ -76,12 +87,40 @@ pub(crate) fn execute(
         .len()
         .checked_add(1 + extra_slots)
         .ok_or(Error::IntegerOverflow)?;
-    let mut registers = vm.native_register_pool.pop().unwrap_or_default();
+    let mut scratch = vm.native_register_pool.pop().unwrap_or_default();
+    let mut registers = std::mem::take(&mut scratch.registers);
     registers.resize(size, Slot::default());
     let result = (|| {
+        let mut rooted = std::mem::take(&mut scratch.rooted);
+        // Copy the initial image and record its existing shadow roots in the same frame scan.
         for (index, value) in vm.stack[base..frame_end].iter().enumerate() {
             if let Some(value) = value {
                 registers[index] = Slot::boxed(*value);
+                rooted.push(index);
+            }
+        }
+        let locals_ready = start == 0 && !skip_probe && !entry_locals.is_empty();
+        if let Some(index) = local_metadata {
+            // This native-only flag lies after all HIR/region slots and contains no references.
+            // Keeping it in the image preserves the common Context and VM statistics layouts.
+            registers
+                .get_mut(index)
+                .ok_or(Error::InvalidIr("native local metadata"))?
+                .tag = u64::from(locals_ready);
+        }
+        if locals_ready {
+            // These slots have no writes in this LIR and are inaccessible to reentrant callees.
+            // Copy Values, never pointers into the movable local buffer. The original frame range
+            // remains a GC root. Missing locals stay guarded and raise only at the original load.
+            let locals = vm.local_values()?;
+            for &(result, slot) in entry_locals {
+                registers[result.0] = Slot::boxed(
+                    locals
+                        .get(slot)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(Value::Unbound),
+                );
             }
         }
         let mut entry_failure = None;
@@ -102,13 +141,10 @@ pub(crate) fn execute(
                 }
             }
         }
-        let rooted = vm.stack[base..frame_end]
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| value.map(|_| index))
-            .collect();
         let mut context = Context {
             vm: vm as *mut Vm,
+            inline_field_hits: 0,
+            inline_block_hits: 0,
             function,
             code,
             lir,
@@ -118,65 +154,80 @@ pub(crate) fn execute(
             nest,
             base,
             rooted,
-            previous: None,
+            previous: usize::MAX,
             skip_probe,
             collecting: vm.collecting(function),
             error: None,
             registers: registers.as_mut_ptr(),
-            helper_arguments: Vec::new(),
+            helper_arguments: std::mem::take(&mut scratch.helper_arguments),
             side_exit: entry_failure,
             views: crate::region::HeapViews::default(),
             active_region: None,
             region_done: None,
             schema_key: vec![],
         };
-        // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
-        // synchronous invocation. Generated memory offsets are bounds checked during emission.
-        let status = if context.side_exit.is_some() {
-            u64::MAX
-        } else {
-            invoke(
-                (&mut context as *mut Context<'_>).cast(),
-                registers.as_mut_ptr(),
-                u32::try_from(start).map_err(error)?,
-            )
-        };
-        context.flush_region()?;
-        if let Some(error) = context.error {
-            return Err(error);
-        }
-        if status == 0 && context.side_exit.is_none() {
-            return Ok(Outcome::Return(registers[lir.registers.len()].value()?));
-        }
-        let exit = lir
-            .exits
-            .get(match context.side_exit {
-                Some(exit) => exit.0,
-                None => usize::try_from(status.wrapping_sub(1)).map_err(error)?,
-            })
-            .ok_or(Error::InvalidIr("native exit status"))?;
-        let environment = *vm
-            .environments
-            .last()
-            .ok_or(Error::InvalidIr("native environment"))?;
-        let frame = lir.reconstruct(exit.state, environment, vm.local_values()?, |r| {
-            registers[r.0].value()
-        })?;
-        vm.mark_deoptimization(function, &frame, exit.reason);
-        Ok(Outcome::Deopt(frame))
+        let outcome = (|| {
+            // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
+            // synchronous invocation. Generated memory offsets are bounds checked during emission.
+            let status = if context.side_exit.is_some() {
+                u64::MAX
+            } else {
+                invoke(
+                    (&mut context as *mut Context<'_>).cast(),
+                    registers.as_mut_ptr(),
+                    u32::try_from(start).map_err(error)?,
+                )
+            };
+            vm.tier_stats.native_inline_field_hits += context.inline_field_hits;
+            vm.tier_stats.native_inline_blocks += context.inline_block_hits;
+            vm.tier_stats.native_field_hits += context.inline_field_hits;
+            vm.tier_stats.shape_read_hits += context.inline_field_hits;
+            context.flush_region()?;
+            if let Some(error) = context.error.take() {
+                return Err(error);
+            }
+            if status == 0 && context.side_exit.is_none() {
+                return Ok(Outcome::Return(registers[lir.registers.len()].value()?));
+            }
+            let exit = lir
+                .exits
+                .get(match context.side_exit {
+                    Some(exit) => exit.0,
+                    None => usize::try_from(status.wrapping_sub(1)).map_err(error)?,
+                })
+                .ok_or(Error::InvalidIr("native exit status"))?;
+            let environment = *vm
+                .environments
+                .last()
+                .ok_or(Error::InvalidIr("native environment"))?;
+            let frame = lir.reconstruct(exit.state, environment, vm.local_values()?, |r| {
+                registers[r.0].value()
+            })?;
+            vm.mark_deoptimization(function, &frame, exit.reason);
+            Ok(Outcome::Deopt(frame))
+        })();
+        scratch.rooted = context.rooted;
+        scratch.helper_arguments = context.helper_arguments;
+        outcome
     })();
     // Reuse only after reconstruction and every callback have finished. Clearing also prevents
     // stale references from being read when a later function uses fewer registers.
     registers.clear();
-    vm.native_register_pool.push(registers);
+    scratch.registers = registers;
+    scratch.rooted.clear();
+    scratch.helper_arguments.clear();
+    vm.native_register_pool.push(scratch);
     result
 }
 pub(crate) extern "C" fn power(left: f64, right: f64) -> f64 {
     left.powf(right)
 }
 
-struct Context<'a> {
-    vm: *mut Vm,
+#[repr(C)]
+pub(crate) struct Context<'a> {
+    pub(crate) vm: *mut Vm,
+    pub(crate) inline_field_hits: u64,
+    pub(crate) inline_block_hits: u64,
     function: &'a Rc<RefCell<Function>>,
     code: &'a Code,
     lir: &'a lir::Function,
@@ -187,9 +238,10 @@ struct Context<'a> {
     nest: Option<&'a crate::region::nest::LoopNest>,
     base: usize,
     rooted: Vec<usize>,
-    previous: Option<usize>,
-    skip_probe: bool,
-    collecting: bool,
+    // A word-sized sentinel lets native quiet blocks update bookkeeping without a Rust callback.
+    pub(crate) previous: usize,
+    pub(crate) skip_probe: bool,
+    pub(crate) collecting: bool,
     error: Option<Error>,
     registers: *mut Slot,
     // Each native invocation owns its scratch buffer, including during recursive helper calls.
@@ -224,7 +276,7 @@ pub(crate) extern "C" fn field_callback(
             .ok_or(Error::InvalidIr("field location"))?;
         let instruction = &context.lir.blocks[block].instructions[index];
         let Operation::Call {
-            helper: lir::Helper::Python(crate::hir::CoreOp::GetAttr(name)),
+            helper: lir::Helper::GetAttr(attribute),
             arguments,
             ..
         } = &instruction.operation
@@ -234,7 +286,13 @@ pub(crate) extern "C" fn field_callback(
         // Verification proves the operand and destination lie inside this invocation's image.
         let receiver = unsafe { (*registers.add(arguments[0].0)).value()? };
         let value = match vm.heap.get(receiver) {
-            Ok(crate::Object::Instance { attributes, .. }) => attributes.get(name).copied(),
+            Ok(crate::Object::Instance { attributes, .. }) => {
+                let (value, hit) = attributes.read(attribute);
+                if hit {
+                    vm.tier_stats.shape_read_hits += 1;
+                }
+                value
+            }
             _ => None,
         };
         if let Some(value) = value {
@@ -290,6 +348,8 @@ pub(crate) extern "C" fn callback(
         vm.environments.len(),
         vm.transient_roots.len(),
         vm.depth,
+        vm.local_frames.len(),
+        vm.local_slots.len(),
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         context.flush_region()?;
@@ -307,7 +367,8 @@ pub(crate) extern "C" fn callback(
             let vm = unsafe { &mut *context.vm };
             vm.stack.truncate(checkpoint.0);
             vm.environments.truncate(checkpoint.1);
-            vm.local_frames.truncate(checkpoint.1);
+            vm.local_frames.truncate(checkpoint.4);
+            vm.local_slots.truncate(checkpoint.5);
             vm.transient_roots.truncate(checkpoint.2);
             vm.depth = checkpoint.3;
             context.error = Some(Error::Runtime("panic in native runtime helper".into()));
@@ -315,6 +376,163 @@ pub(crate) extern "C" fn callback(
         }
     }
 }
+/// Validate identity/revision, binding and primitive operands only. The body executes in the
+/// caller's generated code, never here. No VM allocation/GC/Python/frame mutation is permitted.
+pub(crate) extern "C" fn inline_preflight(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    location: i32,
+    output: *mut Slot,
+) -> i32 {
+    // SAFETY: the synchronous generated caller owns Context and its fixed image/scratch allocation.
+    let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
+        context.flush_region()?;
+        // SAFETY: this is the only temporary reborrow of the suspended caller's exclusive VM.
+        let vm = unsafe { &mut *context.vm };
+        vm.tier_stats.native_runtime_calls += 1;
+        // Preserve the skipped callee-entry recursion/collection checkpoints. Pressure must use
+        // the fully rooted original call before any speculative field access or body execution.
+        if context.collecting || vm.depth >= 256 || !vm.allocation_fits_without_collection(0) {
+            return Ok(false);
+        }
+        if registers != context.registers {
+            return Err(Error::InvalidIr("inline image"));
+        }
+        let &(block, index) = context
+            .locations
+            .get(location as usize)
+            .ok_or(Error::InvalidIr("inline location"))?;
+        let Operation::Call {
+            helper: lir::Helper::InlineCall { body, .. },
+            arguments,
+            ..
+        } = &context.lir.blocks[block].instructions[index].operation
+        else {
+            return Err(Error::InvalidIr("inline body"));
+        };
+        // SAFETY: native installation reserves the maximum plan length after all region/local
+        // metadata. Neither image nor scratch moves; no raw pointer survives this callback.
+        let slots =
+            unsafe { std::slice::from_raw_parts(registers, context.lir.registers.len() + 1) };
+        let output = unsafe { std::slice::from_raw_parts_mut(output, body.nodes.len()) };
+        let arguments = arguments
+            .iter()
+            .map(|r| slots[r.0].value())
+            .collect::<Result<Vec<_>>>()?;
+        let hit = body.prepare(&vm.heap, &arguments, output).is_some();
+        if hit {
+            vm.tier_stats.native_body_inlines += 1;
+        }
+        Ok(hit)
+    }));
+    match result {
+        Ok(Ok(hit)) => i32::from(!hit),
+        Ok(Err(error)) => {
+            context.error = Some(error);
+            -1
+        }
+        Err(_) => {
+            context.error = Some(Error::Runtime("panic in inline preflight".into()));
+            -1
+        }
+    }
+}
+
+/// Closed scalar/name evaluation and budgeted tuple allocation cannot collect or alter VM frames.
+/// Status is 0=hit, 1=miss, -1=error. A miss occurs before allocation/effects and uses the original
+/// fully rooted helper exactly once. Heap::allocate must remain non-collecting for this contract.
+pub(crate) extern "C" fn guarded_helper_callback(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    event: i32,
+    location: i32,
+) -> i32 {
+    // SAFETY: the synchronous native caller owns this Context and fixed register image throughout.
+    let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    // Count this C boundary honestly even though it bypasses the general dispatcher.
+    unsafe {
+        (&mut *context.vm).tier_stats.native_runtime_calls += 1;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
+        if !matches!(event, SCALAR_CALL | TUPLE_ALLOC | NAME_LOAD) || registers != context.registers
+        {
+            return Err(Error::InvalidIr("guarded helper gateway"));
+        }
+        if context.collecting {
+            return Ok(false);
+        }
+        context.flush_region()?;
+        let &(block, index) = context
+            .locations
+            .get(location as usize)
+            .ok_or(Error::InvalidIr("guarded helper location"))?;
+        let instruction = &context.lir.blocks[block].instructions[index];
+        let Operation::Call {
+            helper, arguments, ..
+        } = &instruction.operation
+        else {
+            return Err(Error::InvalidIr("guarded helper instruction"));
+        };
+        // SAFETY: installation verifies offsets; the synchronous caller owns this fixed image.
+        let slots =
+            unsafe { std::slice::from_raw_parts_mut(registers, context.lir.registers.len() + 1) };
+        // SAFETY: only this gateway temporarily reborrows the suspended caller's exclusive VM.
+        let vm = unsafe { &mut *context.vm };
+        let value = match (event, helper) {
+            (SCALAR_CALL, lir::Helper::ScalarCall(builtin)) => {
+                let [callee, argument] = arguments.as_slice() else {
+                    return Err(Error::InvalidIr("scalar call operands"));
+                };
+                let Some(value) = vm.try_scalar_call(
+                    *builtin,
+                    slots[callee.0].value()?,
+                    slots[argument.0].value()?,
+                ) else {
+                    return Ok(false);
+                };
+                let value = value?;
+                debug_assert!(matches!(value, Value::Int(_) | Value::Float(_)));
+                value
+            }
+            (NAME_LOAD, lir::Helper::LoadName(name)) => {
+                // The authoritative cache/scope lookup only reads environments and updates metadata.
+                // It cannot allocate VM objects, collect, or enter Python; Ref results stay in the image.
+                vm.load_name_slot(&name.text, &name.cache)?
+            }
+            (TUPLE_ALLOC, lir::Helper::Tuple) => {
+                // Tuple literals allocate exactly one arena entry. Neither operand decoding nor
+                // Heap::allocate collects/calls Python; reject pressure BEFORE creating the tuple.
+                if !vm.allocation_fits_without_collection(1) {
+                    return Ok(false);
+                }
+                let values = arguments
+                    .iter()
+                    .map(|r| slots[r.0].value())
+                    .collect::<Result<Vec<_>>>()?;
+                vm.heap.allocate(crate::Object::Tuple(values))
+            }
+            _ => return Err(Error::InvalidIr("guarded helper contract")),
+        };
+        slots[instruction
+            .result
+            .ok_or(Error::InvalidIr("guarded helper result"))?
+            .0] = Slot::boxed(value);
+        Ok(true)
+    }));
+    match result {
+        Ok(Ok(hit)) => i32::from(!hit),
+        Ok(Err(error)) => {
+            context.error = Some(error);
+            -1
+        }
+        Err(_) => {
+            context.error = Some(Error::Runtime("panic in native guarded helper".into()));
+            -1
+        }
+    }
+}
+
 /// Float views cannot execute Python, collect, or change VM frames, so panic containment needs no frame checkpoint.
 pub(crate) extern "C" fn float_view_callback(
     raw: *mut c_void,
@@ -424,7 +642,7 @@ impl Context<'_> {
                 .or_default();
             *count = count.saturating_add(counts.a);
         }
-        self.previous = Some(metadata.tag as usize);
+        self.previous = metadata.tag as usize;
         Ok(())
     }
     fn prepare_nest(&mut self) -> Result<()> {
@@ -696,10 +914,15 @@ impl Context<'_> {
             if self.skip_probe {
                 self.skip_probe = false;
             } else {
-                vm.record_block(self.function, self.code, location as usize, self.previous)?;
+                vm.record_block(
+                    self.function,
+                    self.code,
+                    location as usize,
+                    (self.previous != usize::MAX).then_some(self.previous),
+                )?;
             }
             self.collecting = vm.collecting(self.function);
-            self.previous = Some(location as usize);
+            self.previous = location as usize;
             return Ok(());
         }
         let &(block, index) = self
@@ -707,6 +930,64 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
+        if event == HELPER
+            && let Operation::NumberCompare {
+                value,
+                integer,
+                ref operator,
+                failure,
+            } = instruction.operation
+        {
+            let Some(value) =
+                crate::runtime::number_compare(registers[value.0].value()?, integer, operator)
+            else {
+                self.side_exit = Some(failure);
+                return Ok(());
+            };
+            registers[instruction
+                .result
+                .ok_or(Error::InvalidIr("number comparison result"))?
+                .0] = Slot {
+                tag: RAW_BOOL,
+                a: u64::from(value),
+            };
+            return Ok(());
+        }
+        if event == HELPER
+            && let Operation::NumericAdd {
+                left,
+                right,
+                guard,
+                overflow,
+            } = instruction.operation
+        {
+            let observed = self.collecting && {
+                vm.tier_stats.native_feedback_probes += 1;
+                vm.observe_site_with(self.function, self.code, instruction.origin, |r| {
+                    registers[r.0].value()
+                })?
+            };
+            let value = match crate::runtime::numeric_add(
+                registers[left.0].value()?,
+                registers[right.0].value()?,
+            ) {
+                Some(Ok(value)) => value,
+                miss => {
+                    self.side_exit = Some(if miss.is_none() { guard } else { overflow });
+                    return Ok(());
+                }
+            };
+            registers[instruction
+                .result
+                .ok_or(Error::InvalidIr("numeric add result"))?
+                .0] = Slot::boxed(value);
+            if observed {
+                self.function.borrow().profile.borrow_mut().sites[instruction.origin.0]
+                    .result
+                    .observe(crate::profile::ValueKind::of(&vm.heap, value));
+            }
+            return Ok(());
+        }
         if event == UNPACK_BATCH {
             let Operation::SequenceUnpack {
                 value,
@@ -929,6 +1210,35 @@ impl Context<'_> {
 #[cfg(test)]
 mod compact_value_tests {
     use super::*;
+
+    #[test]
+    fn pooled_scratch_is_empty_after_nested_calls_and_helper_errors() {
+        let mut vm = Vm::new();
+        vm.tiering = crate::Tiering::Native;
+        vm.thresholds.function_entries = 1;
+        vm.thresholds.loop_backedges = 4;
+        vm.run_program(&mut crate::compile(
+            "def recurse(n):\n    if n:\n        return recurse(n-1)\n    return len([1,2])\ndef repeat(n):\n    return 'abc'*n\nfor i in range(300):\n    assert recurse(4)==2\n    repeat(1)\n",
+        ).unwrap()).unwrap();
+        assert!(vm.native_register_pool.len() >= 2);
+        assert!(
+            vm.native_register_pool
+                .iter()
+                .any(|s| s.helper_arguments.capacity() > 0)
+        );
+        let repeat = vm.get_global("repeat").unwrap();
+        assert!(vm.call(repeat, &[Value::Int(i64::MAX)]).is_err());
+        assert!(vm.native_register_pool.iter().all(|s| {
+            s.registers.is_empty() && s.rooted.is_empty() && s.helper_arguments.is_empty()
+        }));
+        vm.collect_garbage(&[]).unwrap();
+        let value = vm.call(repeat, &[Value::Int(2)]).unwrap();
+        assert_eq!(
+            vm.heap.get(value).unwrap(),
+            &crate::Object::String("abcabc".into())
+        );
+        assert_eq!(vm.stack_len(), 0);
+    }
 
     #[test]
     fn boxed_slots_preserve_all_value_bits() {

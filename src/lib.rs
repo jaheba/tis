@@ -1,7 +1,10 @@
 //! A Python subset compiled through IR to bytecode, with an independent runtime.
 
 mod bindings;
+mod body_inline;
+mod shape;
 pub use bindings::Name;
+pub use shape::{Attribute, Attributes, Shape};
 pub mod bytecode;
 mod dict;
 mod error;

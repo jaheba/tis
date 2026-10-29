@@ -95,6 +95,42 @@ the canonical objects during collection. Sharing compiled code between VMs does 
 objects. Dynamically constructed strings are not interned. This changes neither the 16-byte value
 layout nor the tracing-GC ownership model.
 
+## Call frames
+
+Uncaptured locals occupy ranges in one reusable VM local-value stack. A frame stores offsets,
+length and code metadata; nested calls can grow the buffer without invalidating a parent's range.
+GC scans the active local-value stack, and both normal return and errors truncate the callee's range.
+Native side exits restore locals into that range. Native callback panic recovery restores the saved
+register/local-stack lengths and frame headers before returning an error.
+
+Ordinary positional calls bind arguments and trailing defaults directly into local slots. Entry
+parameter IDs are cached in bytecode instead of copied from HIR on every call. Profile windows
+still collect argument observations. Keyword/starred calls retain the general binder.
+Register execution checks out reusable argument, edge-transfer and prepared-method buffers.
+Each active invocation owns separate buffers; returned buffers are cleared and are not GC roots.
+
+Calls still recurse through Rust with `stacker` protection. Register calls still gather arguments
+into their scratch buffer, bound receivers can require an argument vector, and captured variables
+still use heap environments. This is shared frame storage, not an inlining or trampoline dispatcher.
+
+## Instance shapes
+
+Each class owns an empty shape. Assigning a new instance field follows a shared transition to
+an immutable layout; instances with the same class and field-addition order share that layout.
+An instance stores its values in a vector indexed by the layout. Overwriting a field keeps the
+shape, while adding one changes it. Following an existing transition copies no field-name string.
+Shapes use `Rc` for Rust layout metadata; copying a Python `Value` still performs no reference counting.
+
+Register bytecode field sites and LIR attribute helpers cache a shape ID and slot index. A matching
+shape reads or writes the vector directly. IDs never wrap, and caches hold neither instances nor
+pointers into their vectors. Different layouts miss the guard and resolve the slot by name.
+Class attributes and inherited methods are not cached, so their replacement remains visible.
+The stack interpreter uses the same shaped storage through the general runtime operations.
+
+Cranelift's existing field-probe callback also uses these guarded slots, and copy-and-patch uses
+the shared LIR helpers. Generated code still calls into Rust for field access; direct machine-code
+loads and stores require a later LIR/heap-view lowering. The 16-byte value/native-slot ABI is unchanged.
+
 ## Rust API
 
 ```rust
@@ -510,12 +546,23 @@ into the frame and use their lexical parent without allocating an environment. C
 nonlocal/global declarations, keyword binding and explicit namespace access retain the environment path.
 The eligibility check comes from HIR and is cached with immutable bytecode metadata.
 
-Cranelift probes existing instance fields through a small nonallocating gateway. Successful reads
-publish only the receiver and result; missing fields, methods, other receiver types and active
-feedback windows use the full runtime path. Attribute writes remain noncollecting under the current
+Cranelift reads field sites with observed instance receivers directly after checking heap identity,
+slot generation,
+shape identity and field bounds. A weak native directory initializes on demand, invalidates rows
+before mutable object access and refreshes them after mutation. Native pointers are consumed before
+the next callback; collection clears dead rows. Cache misses use the nonallocating field gateway,
+then the general attribute helper when needed. Builtin-only sites retain the compact callback path;
+new receiver types remain supported. Active feedback windows retain runtime observation. Attribute writes remain noncollecting under the current
 object model, which has no descriptors or Python setters. Other allocating/calling operations retain
 fresh root maps. Inactive native register buffers are cleared and reused; active nested frames always
 own distinct buffers. Retained buffer capacity follows the invocation high-water mark.
+
+Stable Cranelift artifacts publish live roots at allocating/calling safepoints. Quiet ordinary blocks
+update predecessor bookkeeping directly; loop headers, region exits and observation windows retain
+callbacks, preserving backedge counts and reopened feedback. Values and native slots remain 16 bytes.
+Field loads use explicit Value discriminants and the C layout of ObjectId without retaining Python
+objects through native caches. Measurements and validation are in
+[the native-fields report](benchmarks/results/2026-10-28-native-fields/README.md).
 
 For before/after measurement of object workloads, use the existing comparison runner with
 `--benchmark barnes-hut` or `--benchmark ticket-search` and generic `examples/bench` binaries.
@@ -538,6 +585,50 @@ with the module cache, preserving identity across repeated lookup and collection
 Call entry initializes empty register windows directly on the VM stack. Parameter-to-local-slot
 indices are computed once with bytecode metadata, avoiding repeated name comparisons during binding.
 These runtime paths serve bytecode, LIR, Cranelift and copy-and-patch execution.
+
+LIR, Cranelift and copy-and-patch helpers share register bytecode's positional dispatcher when every
+argument is positional. Root publication and call effects stay explicit at the helper boundary;
+keyword/starred calls retain the general binder. Borrowed builtin names avoid cloning callable
+objects, and ordinary positional calls reuse the already gathered argument slice. The legacy
+`bytecode_positional_calls` and `bytecode_leaf_calls` counters also count this shared helper path.
+See [positional helper measurements](benchmarks/results/2026-10-29-positional-helpers/README.md).
+
+Stable native entries seed boxed values for invariant uncaptured local slots when at least two
+load sites can share the setup. Explicit slot writes disable this optimization; OSR, unbound values
+and active feedback retain the original helpers and their error order. Values stay rooted through
+the original frame local range. See [invariant local measurements](benchmarks/results/2026-10-29-invariant-locals/README.md).
+
+Native and copy-and-patch entries pool register images, rooted-index vectors and helper-argument
+vectors together. Every active recursive invocation owns separate buffers, which are cleared on
+return or error before reuse. See [native scratch measurements](benchmarks/results/2026-10-29-native-scratch/README.md).
+
+Profiled LIR specializes numeric-only Int/Float union addition with explicit type and overflow
+exits. Int+Int stays checked integer arithmetic; any Float operand produces a Float. Unsupported
+operands resume the original operation before effects. See [numeric union measurements](benchmarks/results/2026-10-29-numeric-add/README.md).
+
+Typed literal comparisons guard exact Int/Float values and compare integers without rounding.
+The floating path is available only for integer literals exactly representable in f64; unsupported
+values resume the original comparison. See [literal comparison measurements](benchmarks/results/2026-10-29-number-compare/README.md).
+
+Unary `not` lowers to explicit truth conversion, typed boolean inversion and boxing. Native
+primitive truth avoids the general helper; heap truth and eager observation keep their existing
+paths. See [typed unary-not measurements](benchmarks/results/2026-10-29-bool-not/README.md).
+
+Profiled positional `len` and `math.sqrt` calls can use an audited scalar gateway with read-only
+heap access. Actual callable names are guarded; eager/mismatching calls keep the original full
+rooted fallback. See [scalar call measurements](benchmarks/results/2026-10-29-leaf-calls/README.md).
+
+Native entry copies its initial register image and records existing shadow roots in one frame
+scan. See [entry scan measurements](benchmarks/results/2026-10-29-entry-scan/README.md).
+
+Quiet native tuple literals guard the allocation budget before using an audited allocation gateway.
+Pressure falls back to the full rooted helper before allocation. See [tuple budget measurements](benchmarks/results/2026-10-29-tuple-budget/README.md).
+
+Quiet native name loads use the audited existing cache/scope lookup through a closed gateway.
+See [name-load measurements and backend tradeoff](benchmarks/results/2026-10-29-name-load/README.md).
+
+Bounded readonly Python callee bodies can be incorporated into native callers with identity/revision,
+binding and primitive operand guards. See [body inlining, safety and measured PyPy gap](benchmarks/results/2026-10-29-body-inline/README.md).
 
 ## Matched Monty comparisons
 

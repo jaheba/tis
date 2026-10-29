@@ -1,4 +1,6 @@
 //! Cranelift gateway with guarded heap views and explicit runtime materialization boundaries.
+mod fields;
+mod locals;
 mod region;
 mod virtual_iter;
 use crate::{
@@ -34,6 +36,9 @@ pub(crate) struct NativeCode {
     root_states: Vec<lir::FrameState>,
     pub bytes: usize,
     pub feedback: bool,
+    inline_fields: bool,
+    entry_locals: Vec<(Register, usize)>,
+    inline_scratch: usize,
     pub diagnostics: Option<NativeDiagnostics>,
     pub nest: Option<crate::region::nest::LoopNest>,
 }
@@ -76,6 +81,14 @@ impl NativeCode {
             .map_err(error)?;
         jit.symbol("tis_callback", callback as *const u8);
         jit.symbol(
+            "tis_inline_preflight",
+            crate::native_runtime::inline_preflight as *const u8,
+        );
+        jit.symbol(
+            "tis_guarded_helper",
+            crate::native_runtime::guarded_helper_callback as *const u8,
+        );
+        jit.symbol(
             "tis_field",
             crate::native_runtime::field_callback as *const u8,
         );
@@ -108,6 +121,32 @@ impl NativeCode {
             root_states,
             bytes: 0,
             feedback,
+            inline_fields: !feedback
+                && cfg!(target_endian = "little")
+                && lir.blocks.iter().any(|block| {
+                    block.instructions.iter().any(|instruction| {
+                        matches!(
+                            instruction.operation,
+                            Operation::Call {
+                                helper: lir::Helper::GetAttr(ref attribute),
+                                ..
+                            } if attribute.inline_instances
+                        )
+                    })
+                }),
+            entry_locals: if feedback {
+                Vec::new()
+            } else {
+                let loads = lir.invariant_local_loads();
+                // The descriptor walk and guarded entry setup need multiple loads to amortize.
+                // Single-load functions keep the compact helper path.
+                if loads.len() >= 2 { loads } else { Vec::new() }
+            },
+            inline_scratch: if feedback {
+                0
+            } else {
+                crate::body_inline::scratch_slots(&lir)
+            },
             diagnostics: None,
             nest: (!feedback && allow_nest)
                 .then(|| lir.nest.clone())
@@ -125,6 +164,20 @@ impl NativeCode {
         callback_sig.returns.push(AbiParam::new(types::I32));
         let callback_id = module
             .declare_function("tis_callback", Linkage::Import, &callback_sig)
+            .map_err(error)?;
+        let guarded_helper_id = module
+            .declare_function("tis_guarded_helper", Linkage::Import, &callback_sig)
+            .map_err(error)?;
+        let mut inline_sig = module.make_signature();
+        inline_sig.params = vec![
+            AbiParam::new(ptr),
+            AbiParam::new(ptr),
+            AbiParam::new(types::I32),
+            AbiParam::new(ptr),
+        ];
+        inline_sig.returns.push(AbiParam::new(types::I32));
+        let inline_id = module
+            .declare_function("tis_inline_preflight", Linkage::Import, &inline_sig)
             .map_err(error)?;
         let field_id = module
             .declare_function("tis_field", Linkage::Import, &callback_sig)
@@ -169,6 +222,8 @@ impl NativeCode {
             scalars.initialize(&mut b, registers, &owner.lir)?;
             let callback_ref = module.declare_func_in_func(callback_id, b.func);
             let field_ref = module.declare_func_in_func(field_id, b.func);
+            let guarded_helper_ref = module.declare_func_in_func(guarded_helper_id, b.func);
+            let inline_ref = module.declare_func_in_func(inline_id, b.func);
             let view_ref = module.declare_func_in_func(view_id, b.func);
             let region_ref = module.declare_func_in_func(region_id, b.func);
             let region_active = owner
@@ -221,6 +276,7 @@ impl NativeCode {
             let blocks = (0..owner.lir.blocks.len())
                 .map(|_| b.create_block())
                 .collect::<Vec<_>>();
+            let block_callbacks = block_callback_targets(&owner.lir, owner.nest.as_ref());
             let failed = b.create_block();
             for (index, &target) in blocks.iter().enumerate() {
                 if owner.nest.as_ref().is_some_and(|n| {
@@ -365,6 +421,62 @@ impl NativeCode {
                         registers,
                         offset(Register(owner.lir.registers.len() + 1), 0)?,
                     );
+                } else if !feedback && !block_callbacks.contains(&block_index) {
+                    // Frozen profiles need callbacks only at loop headers and region exits.
+                    // Reentrant calls may reopen observation, so check the invocation's current flag.
+                    let collecting = b.ins().load(
+                        types::I8,
+                        MemFlagsData::new(),
+                        host,
+                        std::mem::offset_of!(crate::native_runtime::Context<'_>, collecting) as i32,
+                    );
+                    let observe = b.create_block();
+                    let quiet = b.create_block();
+                    let ready = b.create_block();
+                    b.ins().brif(collecting, observe, &[], quiet, &[]);
+                    b.switch_to_block(observe);
+                    runtime_call!(
+                        &mut b,
+                        callback_ref,
+                        host,
+                        registers,
+                        ENTER,
+                        block_index as i32,
+                        failed
+                    );
+                    b.ins().jump(ready, &[]);
+                    b.switch_to_block(quiet);
+                    let block = b.ins().iconst(types::I64, block_index as i64);
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        block,
+                        host,
+                        std::mem::offset_of!(crate::native_runtime::Context<'_>, previous) as i32,
+                    );
+                    let zero = b.ins().iconst(types::I8, 0);
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        zero,
+                        host,
+                        std::mem::offset_of!(crate::native_runtime::Context<'_>, skip_probe) as i32,
+                    );
+                    let count = b.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        host,
+                        std::mem::offset_of!(crate::native_runtime::Context<'_>, inline_block_hits)
+                            as i32,
+                    );
+                    let count = b.ins().iadd_imm_s(count, 1);
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        count,
+                        host,
+                        std::mem::offset_of!(crate::native_runtime::Context<'_>, inline_block_hits)
+                            as i32,
+                    );
+                    b.ins().jump(ready, &[]);
+                    b.switch_to_block(ready);
                 } else {
                     runtime_call!(
                         &mut b,
@@ -582,6 +694,20 @@ impl NativeCode {
                                 bits,
                             )?;
                         }
+                        Operation::BoolNot(value) => {
+                            let value =
+                                load_cached(&mut b, &scalars, registers, *value, 8, types::I64)?;
+                            let inverted = b.ins().icmp_imm_s(IntCC::Equal, value, 0);
+                            let bits = b.ins().uextend(types::I64, inverted);
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                RAW_BOOL,
+                                bits,
+                            )?;
+                        }
                         Operation::IntToFloat(value) => {
                             let value =
                                 load_cached(&mut b, &scalars, registers, *value, 8, types::I64)?;
@@ -593,6 +719,75 @@ impl NativeCode {
                                 destination.unwrap(),
                                 converted,
                             )?;
+                        }
+                        Operation::NumericAdd {
+                            left,
+                            right,
+                            guard,
+                            overflow,
+                        } => {
+                            let left_tag =
+                                load_cached(&mut b, &scalars, registers, *left, 0, types::I64)?;
+                            let right_tag =
+                                load_cached(&mut b, &scalars, registers, *right, 0, types::I64)?;
+                            let left_kind = b.ins().iadd_imm_s(left_tag, -(INT as i64));
+                            let right_kind = b.ins().iadd_imm_s(right_tag, -(INT as i64));
+                            let left_number =
+                                b.ins()
+                                    .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, left_kind, 1);
+                            let right_number =
+                                b.ins()
+                                    .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, right_kind, 1);
+                            let valid = b.ins().band(left_number, right_number);
+                            side_exit!(&mut b, valid, *guard);
+                            let left_bits =
+                                load_cached(&mut b, &scalars, registers, *left, 8, types::I64)?;
+                            let right_bits =
+                                load_cached(&mut b, &scalars, registers, *right, 8, types::I64)?;
+                            let left_int = b.ins().icmp_imm_s(IntCC::Equal, left_tag, INT as i64);
+                            let right_int = b.ins().icmp_imm_s(IntCC::Equal, right_tag, INT as i64);
+                            let integers = b.ins().band(left_int, right_int);
+                            let ints = b.create_block();
+                            let floats = b.create_block();
+                            let done = b.create_block();
+                            b.ins().brif(integers, ints, &[], floats, &[]);
+                            b.switch_to_block(ints);
+                            let sum = b.ins().iadd(left_bits, right_bits);
+                            let x = b.ins().bxor(left_bits, sum);
+                            let y = b.ins().bxor(right_bits, sum);
+                            let both = b.ins().band(x, y);
+                            let safe = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, both, 0);
+                            side_exit!(&mut b, safe, *overflow);
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                INT,
+                                sum,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(floats);
+                            // Convert integers only according to their actual tag; Float payloads retain all bits.
+                            let left_as_int = b.ins().fcvt_from_sint(types::F64, left_bits);
+                            let right_as_int = b.ins().fcvt_from_sint(types::F64, right_bits);
+                            let left_as_float =
+                                b.ins().bitcast(types::F64, MemFlagsData::new(), left_bits);
+                            let right_as_float =
+                                b.ins().bitcast(types::F64, MemFlagsData::new(), right_bits);
+                            let left = b.ins().select(left_int, left_as_int, left_as_float);
+                            let right = b.ins().select(right_int, right_as_int, right_as_float);
+                            let sum = b.ins().fadd(left, right);
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                FLOAT,
+                                sum,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
                         }
                         Operation::CheckedAdd {
                             left,
@@ -657,6 +852,49 @@ impl NativeCode {
                                 &scalars,
                                 registers,
                                 destination.unwrap(),
+                                result,
+                            )?;
+                        }
+                        Operation::NumberCompare {
+                            value,
+                            integer,
+                            operator,
+                            failure,
+                        } => {
+                            let tag =
+                                load_cached(&mut b, &scalars, registers, *value, 0, types::I64)?;
+                            let kind = b.ins().iadd_imm_s(tag, -(INT as i64));
+                            let numeric =
+                                b.ins().icmp_imm_s(IntCC::UnsignedLessThanOrEqual, kind, 1);
+                            side_exit!(&mut b, numeric, *failure);
+                            let bits =
+                                load_cached(&mut b, &scalars, registers, *value, 8, types::I64)?;
+                            let (int_cc, float_cc) = match operator.as_str() {
+                                "==" => (IntCC::Equal, FloatCC::Equal),
+                                "!=" => (IntCC::NotEqual, FloatCC::NotEqual),
+                                "<" => (IntCC::SignedLessThan, FloatCC::LessThan),
+                                "<=" => (IntCC::SignedLessThanOrEqual, FloatCC::LessThanOrEqual),
+                                ">" => (IntCC::SignedGreaterThan, FloatCC::GreaterThan),
+                                ">=" => {
+                                    (IntCC::SignedGreaterThanOrEqual, FloatCC::GreaterThanOrEqual)
+                                }
+                                _ => return Err(error("number comparison")),
+                            };
+                            // Int payloads compare without conversion; only the exact literal becomes f64.
+                            let literal = b.ins().iconst(types::I64, *integer);
+                            let int_result = b.ins().icmp(int_cc, bits, literal);
+                            let float = b.ins().bitcast(types::F64, MemFlagsData::new(), bits);
+                            let literal = b.ins().f64const(*integer as f64);
+                            let float_result = b.ins().fcmp(float_cc, float, literal);
+                            let is_int = b.ins().icmp_imm_s(IntCC::Equal, tag, INT as i64);
+                            let result = b.ins().select(is_int, int_result, float_result);
+                            let result = b.ins().uextend(types::I64, result);
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                RAW_BOOL,
                                 result,
                             )?;
                         }
@@ -745,10 +983,61 @@ impl NativeCode {
                             b.switch_to_block(done);
                         }
                         Operation::Call {
-                            helper: lir::Helper::Python(crate::hir::CoreOp::GetAttr(_)),
+                            helper: lir::Helper::Python(crate::hir::CoreOp::LoadLocal(_)),
+                            ..
+                        } if !feedback
+                            && owner
+                                .entry_locals
+                                .iter()
+                                .any(|(r, _)| Some(*r) == destination) =>
+                        {
+                            let done = b.create_block();
+                            locals::probe(
+                                &mut b,
+                                &scalars,
+                                host,
+                                registers,
+                                destination.unwrap(),
+                                Register(
+                                    owner.lir.registers.len()
+                                        + 4
+                                        + owner
+                                            .nest
+                                            .as_ref()
+                                            .map_or(0, |n| n.edges(&owner.lir).len()),
+                                ),
+                                done,
+                            )?;
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::GetAttr(attribute),
                             arguments,
                             ..
                         } if !feedback => {
+                            let done = b.create_block();
+                            if attribute.inline_instances {
+                                fields::load(
+                                    &mut b,
+                                    &scalars,
+                                    host,
+                                    registers,
+                                    arguments[0],
+                                    destination.unwrap(),
+                                    attribute,
+                                    done,
+                                )?;
+                            }
                             // The miss path retains full observation, allocation and GC handling.
                             // A successful field probe needs only its receiver published, not a root map.
                             scalars.materialize(&mut b, registers, arguments.iter().copied())?;
@@ -758,7 +1047,6 @@ impl NativeCode {
                             let status = b.inst_results(call)[0];
                             let hit = b.create_block();
                             let miss = b.create_block();
-                            let done = b.create_block();
                             let success = b.ins().icmp_imm_s(IntCC::Equal, status, 0);
                             b.ins().brif(success, hit, &[], miss, &[]);
                             b.switch_to_block(hit);
@@ -776,6 +1064,168 @@ impl NativeCode {
                             let retry = b.ins().icmp_imm_s(IntCC::Equal, status, 1);
                             b.ins().brif(retry, fallback, &[], failed, &[]);
                             b.switch_to_block(fallback);
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::InlineCall { body, .. },
+                            ..
+                        } if !feedback && !in_nest && region_index.is_none() => {
+                            // All guards finish before the copied readonly body. Misses execute the
+                            // original Call once with full caller roots; no nested frame is needed.
+                            scalars.materialize(
+                                &mut b,
+                                registers,
+                                instruction.operation.inputs(),
+                            )?;
+                            let scratch_index = owner.lir.registers.len()
+                                + 4
+                                + usize::from(!owner.entry_locals.is_empty())
+                                + owner.nest.as_ref().map_or(0, |n| n.edges(&owner.lir).len());
+                            let scratch =
+                                b.ins().iadd_imm_s(registers, (scratch_index * 16) as i64);
+                            let site = b.ins().iconst(types::I32, location as i64);
+                            let call = b.ins().call(inline_ref, &[host, registers, site, scratch]);
+                            let status = b.inst_results(call)[0];
+                            let fast = b.create_block();
+                            let slow = b.create_block();
+                            let dispatch = b.create_block();
+                            let done = b.create_block();
+                            let error = b.ins().icmp_imm_s(IntCC::SignedLessThan, status, 0);
+                            b.ins().brif(error, failed, &[], dispatch, &[]);
+                            b.switch_to_block(dispatch);
+                            let hit = b.ins().icmp_imm_s(IntCC::Equal, status, 0);
+                            b.ins().brif(hit, fast, &[], slow, &[]);
+                            b.switch_to_block(fast);
+                            let mut values: Vec<ir::Value> = Vec::with_capacity(body.nodes.len());
+                            for (index, node) in body.nodes.iter().enumerate() {
+                                use crate::body_inline::Node;
+                                let value = match node {
+                                    Node::Argument(_) | Node::Field(..) => b.ins().load(
+                                        types::F64,
+                                        MemFlagsData::new(),
+                                        scratch,
+                                        (index * 16 + 8) as i32,
+                                    ),
+                                    Node::Constant(value) => b.ins().f64const(*value),
+                                    Node::Add(a, c) => b.ins().fadd(values[*a], values[*c]),
+                                    Node::Subtract(a, c) => b.ins().fsub(values[*a], values[*c]),
+                                    Node::Multiply(a, c) => b.ins().fmul(values[*a], values[*c]),
+                                    Node::Compare(operator, a, c) => {
+                                        let cc = match operator.as_str() {
+                                            "<" => FloatCC::LessThan,
+                                            "<=" => FloatCC::LessThanOrEqual,
+                                            ">" => FloatCC::GreaterThan,
+                                            ">=" => FloatCC::GreaterThanOrEqual,
+                                            "==" => FloatCC::Equal,
+                                            _ => FloatCC::NotEqual,
+                                        };
+                                        b.ins().fcmp(cc, values[*a], values[*c])
+                                    }
+                                    Node::Not(a) => b.ins().icmp_imm_s(IntCC::Equal, values[*a], 0),
+                                    Node::Select(condition, yes, no) => b.ins().select(
+                                        values[*condition],
+                                        values[*yes],
+                                        values[*no],
+                                    ),
+                                    Node::Less(a, c) => {
+                                        b.ins().fcmp(FloatCC::LessThan, values[*a], values[*c])
+                                    }
+                                };
+                                values.push(value);
+                            }
+                            let (tag, bits) = if body.boolean {
+                                (BOOL, b.ins().uextend(types::I64, values[body.result]))
+                            } else {
+                                (
+                                    FLOAT,
+                                    b.ins().bitcast(
+                                        types::I64,
+                                        MemFlagsData::new(),
+                                        values[body.result],
+                                    ),
+                                )
+                            };
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                tag,
+                                bits,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(slow);
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call { helper, .. }
+                            if !feedback
+                                && !in_nest
+                                && region_index.is_none()
+                                && matches!(
+                                    helper,
+                                    lir::Helper::ScalarCall(_)
+                                        | lir::Helper::Tuple
+                                        | lir::Helper::LoadName(_)
+                                ) =>
+                        {
+                            // The closed probe reads only operands. Its scalar contract or one-object
+                            // budget prevents collection; a miss materializes the full original state.
+                            let probe_event = match helper {
+                                lir::Helper::Tuple => TUPLE_ALLOC,
+                                lir::Helper::LoadName(_) => NAME_LOAD,
+                                _ => SCALAR_CALL,
+                            };
+                            scalars.materialize(
+                                &mut b,
+                                registers,
+                                instruction.operation.inputs(),
+                            )?;
+                            let event = b.ins().iconst(types::I32, probe_event as i64);
+                            let site = b.ins().iconst(types::I32, location as i64);
+                            let call = b
+                                .ins()
+                                .call(guarded_helper_ref, &[host, registers, event, site]);
+                            let status = b.inst_results(call)[0];
+                            let error = b.ins().icmp_imm_s(IntCC::SignedLessThan, status, 0);
+                            let dispatch = b.create_block();
+                            b.ins().brif(error, failed, &[], dispatch, &[]);
+                            b.switch_to_block(dispatch);
+                            let hit = b.ins().icmp_imm_s(IntCC::Equal, status, 0);
+                            let fast = b.create_block();
+                            let slow = b.create_block();
+                            let done = b.create_block();
+                            b.ins().brif(hit, fast, &[], slow, &[]);
+                            b.switch_to_block(fast);
+                            scalars.reload_callback(
+                                &mut b,
+                                registers,
+                                &owner.lir,
+                                &owner.locations,
+                                probe_event,
+                                location,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(slow);
                             runtime_call!(
                                 &mut b,
                                 callback_ref,
@@ -1001,13 +1451,24 @@ impl NativeCode {
                 "native region entry must pass through its header",
             ));
         }
+        if self.inline_fields {
+            vm.heap.enable_native_fields();
+        }
         crate::native_runtime::execute(
             &self.lir,
             &self.locations,
             Some(&self.root_states),
-            !self.feedback && !self.lir.regions.is_empty(),
+            !self.feedback,
+            &self.entry_locals,
+            (!self.entry_locals.is_empty()).then(|| {
+                self.lir.registers.len()
+                    + 4
+                    + self.nest.as_ref().map_or(0, |n| n.edges(&self.lir).len())
+            }),
             self.nest.as_ref(),
-            3 + self.nest.as_ref().map_or(0, |n| n.edges(&self.lir).len()),
+            3 + usize::from(!self.entry_locals.is_empty())
+                + self.nest.as_ref().map_or(0, |n| n.edges(&self.lir).len())
+                + self.inline_scratch,
             |context, registers, start| {
                 // SAFETY: the shared bridge keeps its Context and register allocation alive for this call.
                 unsafe { self.entry.unwrap()(context, registers, start) }
@@ -1245,7 +1706,10 @@ impl ScalarVars {
         event: i32,
         location: i32,
     ) -> Result<()> {
-        if !matches!(event, HELPER | SEQUENCE | UNPACK_BATCH | FLOAT_VIEW) {
+        if !matches!(
+            event,
+            HELPER | SEQUENCE | UNPACK_BATCH | FLOAT_VIEW | SCALAR_CALL | TUPLE_ALLOC | NAME_LOAD
+        ) {
             return Ok(());
         }
         let (block, index) = locations[location as usize];
@@ -1493,12 +1957,48 @@ fn callback_failure_values(
     let (block, index) = locations[location as usize];
     let instruction = &lir.blocks[block].instructions[index];
     let state = match instruction.operation {
-        Operation::FloatListView { failure, .. }
+        Operation::NumberCompare { failure, .. }
+        | Operation::NumericAdd { guard: failure, .. }
+        | Operation::FloatListView { failure, .. }
         | Operation::SequenceGet { failure, .. }
         | Operation::SequenceUnpack { failure, .. } => Some(lir.exits[failure.0].state),
         _ => None,
     };
     state.map_or_else(Vec::new, |state| state_values(&lir.states[state.0]))
+}
+
+/// OSR entries name every HIR backedge target, including forward-layout backedges.
+/// A region exit must flush its deferred iterator/profile state before ordinary blocks run.
+fn block_callback_targets(
+    lir: &lir::Function,
+    nest: Option<&crate::region::nest::LoopNest>,
+) -> std::collections::BTreeSet<usize> {
+    let mut targets = lir
+        .osr_entries
+        .iter()
+        .map(|entry| entry.header.0)
+        .collect::<std::collections::BTreeSet<_>>();
+    for (index, block) in lir.blocks.iter().enumerate() {
+        if !lir
+            .regions
+            .iter()
+            .any(|r| r.header.0 == index || r.body.0 == index)
+            && !nest.is_some_and(|n| n.blocks.contains(&crate::hir::BlockId(index)))
+        {
+            continue;
+        }
+        match &block.terminator {
+            Terminator::Return(_) => {}
+            Terminator::Jump(edge) => {
+                targets.insert(edge.block.0);
+            }
+            Terminator::Branch { yes, no, .. } => {
+                targets.insert(yes.block.0);
+                targets.insert(no.block.0);
+            }
+        }
+    }
+    targets
 }
 
 #[cfg(test)]

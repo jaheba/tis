@@ -126,11 +126,21 @@ fn detached_side_exit_restores_local_values_and_rejects_wrong_layouts() {
     );
     let mut function = vm.function_hir(vm.get_global("f").unwrap()).unwrap();
     let lir = function.lower_lir(LoweringMode::Profiled).unwrap();
-    let exit = lir
-        .exits
+    // Earlier inplace operations can now guard too; choose the scalar unboxing guard for a+b.
+    let id = lir
+        .blocks
         .iter()
-        .find(|exit| exit.reason == ExitReason::TypeGuard)
+        .flat_map(|b| &b.instructions)
+        .find_map(|i| {
+            if let tis::lir::Operation::GuardInt { exit, .. } = i.operation {
+                Some(exit)
+            } else {
+                None
+            }
+        })
         .unwrap();
+    let exit = &lir.exits[id.0];
+    assert_eq!(exit.reason, ExitReason::TypeGuard);
     let saved = vm
         .heap
         .allocate(tis::Object::List(vec![Value::Int(42)].into()));

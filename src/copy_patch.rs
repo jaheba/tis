@@ -214,6 +214,10 @@ impl Plan {
                         };
                         "retag"
                     }
+                    Operation::BoolNot(value) => {
+                        p.left = slot(*value)?;
+                        "bool_not"
+                    }
                     Operation::IntToFloat(value) => {
                         p.left = slot(*value)?;
                         "to_float"
@@ -270,7 +274,9 @@ impl Plan {
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "truth"
                     }
-                    Operation::Call { .. } => {
+                    Operation::NumberCompare { .. }
+                    | Operation::NumericAdd { .. }
+                    | Operation::Call { .. } => {
                         p.callback = native_runtime::callback as *const u8 as usize;
                         p.event = HELPER;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
@@ -285,7 +291,8 @@ impl Plan {
                         .is_some_and(|register| lir.registers[register.0] == lir::Type::Boxed)
                     && !matches!(
                         instruction.operation,
-                        Operation::Call { .. }
+                        Operation::NumericAdd { .. }
+                            | Operation::Call { .. }
                             | Operation::SequenceUnpack { .. }
                             | Operation::SequenceGet { .. }
                     )
@@ -505,6 +512,8 @@ impl CopyCode {
             &self.locations,
             None,
             false,
+            &[],
+            None,
             None,
             self.scratch,
             |context, registers, _| {
@@ -531,7 +540,7 @@ mod tests {
     use super::*;
     #[test]
     fn stencil_library_contains_offline_code() {
-        assert_eq!(generated::STENCILS.len(), 25);
+        assert_eq!(generated::STENCILS.len(), 26);
         assert!(
             generated::STENCILS
                 .iter()

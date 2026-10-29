@@ -120,7 +120,7 @@ fn main() {
         generated.push_str(&format!("({name:?}, &{code:?}),\n"));
         count += 1;
     }
-    assert_eq!(count, 25, "missing or unexpected stencil symbols");
+    assert_eq!(count, 26, "missing or unexpected stencil symbols");
     generated.push_str("];\n");
     fs::write(out.join("stencils.rs"), generated).unwrap();
 }

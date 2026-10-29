@@ -1,4 +1,5 @@
 /// A non-owning, generation-checked identity. Keep it rooted across explicit collection.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId {
     pub(crate) heap: u32,
@@ -6,16 +7,17 @@ pub struct ObjectId {
     pub(crate) generation: u32,
 }
 
+// Native field loads use these explicit discriminants and the repr(u32) C-union layout.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     #[doc(hidden)]
-    Unbound,
-    None,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Ref(ObjectId),
+    Unbound = 0,
+    None = 1,
+    Bool(bool) = 2,
+    Int(i64) = 3,
+    Float(f64) = 4,
+    Ref(ObjectId) = 5,
 }
 
 // The 32-bit discriminant leaves twelve bytes for the reference identity.

@@ -6,10 +6,38 @@ use crate::{
 };
 use std::{cell::RefCell, rc::Rc};
 
+// Offsets stay valid when nested calls grow the shared local-value buffer.
 #[derive(Debug)]
 pub(crate) struct LocalFrame {
-    values: Vec<Option<Value>>,
+    start: usize,
+    len: usize,
     code: Rc<Code>,
+}
+
+/// Trailing defaults for an arity-checked positional call.
+#[derive(Clone, Copy)]
+pub(crate) struct PositionalBindings<'a> {
+    pub defaults: &'a [Value],
+    pub count: usize,
+}
+impl PositionalBindings<'_> {
+    fn value(self, arguments: &[Value], index: usize) -> Value {
+        arguments
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| self.defaults[index + self.defaults.len() - self.count])
+    }
+}
+
+enum FrameInput<'a> {
+    Fresh {
+        arguments: &'a [Value],
+        bindings: Option<PositionalBindings<'a>>,
+    },
+    Resume {
+        slots: Vec<Option<Value>>,
+        locals: Vec<Option<Value>>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -35,9 +63,11 @@ pub struct Vm {
         std::collections::BTreeMap<(crate::profile::FunctionId, u64), Rc<crate::lir::Function>>,
     pub(crate) environments: Vec<Value>,
     pub(crate) local_frames: Vec<LocalFrame>,
+    pub(crate) local_slots: Vec<Option<Value>>,
+    pub(crate) register_scratch: Vec<crate::register_vm::RegisterScratch>,
     pub(crate) globals: Option<Value>,
     // Inactive buffers contain no roots. Each active native frame owns a distinct allocation.
-    pub(crate) native_register_pool: Vec<Vec<crate::native_abi::Slot>>,
+    pub(crate) native_register_pool: Vec<crate::native_runtime::Scratch>,
     pub(crate) modules: std::collections::BTreeMap<String, Value>,
     pub(crate) literal_pool: std::collections::HashMap<String, Value>,
     pub output: String,
@@ -112,12 +142,15 @@ impl Vm {
         function: Rc<RefCell<Function>>,
         environment: Value,
         arguments: &[Value],
-        bindings: Option<&[Value]>,
+        bindings: Option<PositionalBindings<'_>>,
     ) -> Result<Value> {
         if self.depth >= 256 {
             return Err(Error::Runtime(
                 "RecursionError: maximum recursion depth exceeded".into(),
             ));
+        }
+        if bindings.is_some() {
+            self.tier_stats.positional_frames += 1;
         }
         let code = function.borrow_mut().shared_bytecode()?;
         {
@@ -130,7 +163,9 @@ impl Vm {
         let collecting = self.collecting(&function);
         if collecting {
             let values = if let Some(bindings) = bindings {
-                bindings.to_vec()
+                (0..bindings.count)
+                    .map(|index| bindings.value(arguments, index))
+                    .collect()
             } else {
                 self.bound_arguments(&function.borrow(), environment, arguments)?
             };
@@ -143,36 +178,17 @@ impl Vm {
                 profile.observe(crate::profile::ValueKind::of(&self.heap, value));
             }
         }
-        let parameters = function
-            .borrow()
-            .parameters(function.borrow().entry())
-            .to_vec();
-        // Empty entry windows can be initialized directly on the VM stack, without a
-        // temporary register allocation and a second copy of the cleared window.
-        let mut slots = if parameters.is_empty() {
-            vec![]
-        } else {
-            vec![None; code.slots]
-        };
-        for (&parameter, &value) in parameters.iter().zip(arguments) {
-            slots[parameter.0] = Some(value);
-        }
-        let locals = if let Some(bindings) = bindings {
-            code.local_parameters
-                .iter()
-                .map(|parameter| parameter.map(|index| bindings[index]))
-                .collect()
-        } else {
-            let mut object = self.heap.get_mut(environment)?;
-            let Object::Environment(env) = &mut *object else {
-                return Err(Error::InvalidIr("frame environment"));
-            };
-            code.local_names
-                .iter()
-                .map(|name| env.values.remove(name))
-                .collect()
-        };
-        self.execute_window(function, code, environment, slots, locals, 0, None)
+        self.execute_window(
+            function,
+            code,
+            environment,
+            FrameInput::Fresh {
+                arguments,
+                bindings,
+            },
+            0,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -181,8 +197,7 @@ impl Vm {
         function: Rc<RefCell<Function>>,
         code: Rc<Code>,
         environment: Value,
-        slots: Vec<Option<Value>>,
-        locals: Vec<Option<Value>>,
+        input: FrameInput<'_>,
         ip: usize,
         block: Option<usize>,
     ) -> Result<Value> {
@@ -192,21 +207,55 @@ impl Vm {
             ));
         }
         let base = self.stack.len();
-        let frame_end = base
-            + if slots.is_empty() {
-                code.slots
-            } else {
-                slots.len()
-            };
-        if slots.is_empty() {
-            self.stack.resize(frame_end, None);
-        } else {
-            self.stack.extend(slots);
+        let local_start = self.local_slots.len();
+        let (register_len, local_len) = match &input {
+            FrameInput::Fresh { .. } => (code.slots, code.local_names.len()),
+            FrameInput::Resume { slots, locals } => (slots.len(), locals.len()),
+        };
+        let frame_end = base + register_len;
+        let initialized = (|| -> Result<()> {
+            match input {
+                FrameInput::Fresh {
+                    arguments,
+                    bindings,
+                } => {
+                    self.stack.resize(frame_end, None);
+                    self.local_slots.resize(local_start + local_len, None);
+                    for (&parameter, &value) in code.entry_parameters.iter().zip(arguments) {
+                        self.stack[base + parameter.0] = Some(value);
+                    }
+                    if let Some(bindings) = bindings {
+                        for (slot, parameter) in code.local_parameters.iter().enumerate() {
+                            self.local_slots[local_start + slot] =
+                                parameter.map(|index| bindings.value(arguments, index));
+                        }
+                    } else {
+                        let mut object = self.heap.get_mut(environment)?;
+                        let Object::Environment(env) = &mut *object else {
+                            return Err(Error::InvalidIr("frame environment"));
+                        };
+                        for (slot, name) in code.local_names.iter().enumerate() {
+                            self.local_slots[local_start + slot] = env.values.remove(name);
+                        }
+                    }
+                }
+                FrameInput::Resume { slots, locals } => {
+                    self.stack.extend(slots);
+                    self.local_slots.extend(locals);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = initialized {
+            self.local_slots.truncate(local_start);
+            self.stack.truncate(base);
+            return Err(error);
         }
         self.depth += 1;
         self.environments.push(environment);
         self.local_frames.push(LocalFrame {
-            values: locals,
+            start: local_start,
+            len: local_len,
             code: code.clone(),
         });
         // Runtime calls currently recurse through Rust; grow before entering another frame
@@ -248,6 +297,7 @@ impl Vm {
         }
         self.environments.pop();
         self.local_frames.pop();
+        self.local_slots.truncate(local_start);
         self.depth -= 1;
         self.stack.truncate(base);
         result
@@ -266,10 +316,15 @@ impl Vm {
             crate::tier::Outcome::Deopt(frame) => {
                 let ip = code.resume_in(self.bytecode, frame.resume)?;
                 self.stack[base..frame_end].copy_from_slice(&frame.slots);
-                self.local_frames
-                    .last_mut()
-                    .ok_or(Error::InvalidIr("local frame"))?
-                    .values = frame.locals;
+                let locals = self
+                    .local_frames
+                    .last()
+                    .ok_or(Error::InvalidIr("local frame"))?;
+                if frame.locals.len() != locals.len {
+                    return Err(Error::InvalidIr("deoptimization locals"));
+                }
+                self.local_slots[locals.start..locals.start + locals.len]
+                    .copy_from_slice(&frame.locals);
                 self.execute(
                     function,
                     code,
@@ -324,8 +379,10 @@ impl Vm {
             handle.clone(),
             code,
             frame.environment,
-            frame.slots,
-            frame.locals,
+            FrameInput::Resume {
+                slots: frame.slots,
+                locals: frame.locals,
+            },
             ip,
             Some(frame.resume.block.0),
         );
@@ -339,11 +396,7 @@ impl Vm {
             .iter()
             .filter_map(|value| *value)
             .chain(self.environments.iter().copied())
-            .chain(
-                self.local_frames
-                    .iter()
-                    .flat_map(|frame| frame.values.iter().filter_map(|v| *v)),
-            )
+            .chain(self.local_slots.iter().filter_map(|value| *value))
             .chain(self.transient_roots.iter().copied())
             .chain(self.pinned.values().copied())
             .chain(self.modules.values().copied())
@@ -698,11 +751,11 @@ impl Vm {
     }
 
     pub(crate) fn local_values(&self) -> Result<&[Option<Value>]> {
-        Ok(&self
+        let frame = self
             .local_frames
             .last()
-            .ok_or(Error::InvalidIr("local frame"))?
-            .values)
+            .ok_or(Error::InvalidIr("local frame"))?;
+        Ok(&self.local_slots[frame.start..frame.start + frame.len])
     }
 
     pub(crate) fn load_local(&self, slot: usize) -> Result<Value> {
@@ -710,16 +763,15 @@ impl Vm {
             .local_frames
             .last()
             .ok_or(Error::InvalidIr("local frame"))?;
-        frame
-            .values
-            .get(slot)
-            .ok_or(Error::InvalidIr("local slot"))?
-            .ok_or_else(|| {
-                Error::Runtime(format!(
-                    "UnboundLocalError: {}",
-                    frame.code.local_names[slot]
-                ))
-            })
+        if slot >= frame.len {
+            return Err(Error::InvalidIr("local slot"));
+        }
+        self.local_slots[frame.start + slot].ok_or_else(|| {
+            Error::Runtime(format!(
+                "UnboundLocalError: {}",
+                frame.code.local_names[slot]
+            ))
+        })
     }
 
     pub(crate) fn check_local(&self, slot: usize, value: Value) -> Result<()> {
@@ -741,12 +793,12 @@ impl Vm {
     pub(crate) fn store_local(&mut self, slot: usize, value: Value) -> Result<()> {
         let frame = self
             .local_frames
-            .last_mut()
+            .last()
             .ok_or(Error::InvalidIr("local frame"))?;
-        *frame
-            .values
-            .get_mut(slot)
-            .ok_or(Error::InvalidIr("local slot"))? = Some(value);
+        if slot >= frame.len {
+            return Err(Error::InvalidIr("local slot"));
+        }
+        self.local_slots[frame.start + slot] = Some(value);
         Ok(())
     }
 
@@ -933,15 +985,137 @@ impl Vm {
             operand.observe(crate::profile::ValueKind::of(&self.heap, read(input)?));
         }
         if let Some(target) = target {
+            if site.inline_body.is_none() {
+                site.inline_body =
+                    crate::body_inline::Plan::observe(&self.heap, read(metadata.inputs[0])?);
+            }
             site.call(target);
         }
         Ok(true)
     }
+    /// A budget is useful only for an audited operation with this exact allocation bound and
+    /// no internal GC/reentrancy. It does not make arbitrary allocating helpers safe to elide.
+    #[inline]
+    pub(crate) fn allocation_fits_without_collection(&self, objects: usize) -> bool {
+        self.heap
+            .allocation_count()
+            .checked_add(objects)
+            .is_some_and(|count| count < self.next_collection.max(4096))
+    }
     pub(crate) fn maybe_collect(&mut self) -> Result<()> {
-        if self.heap.allocation_count() >= self.next_collection.max(4096) {
+        if !self.allocation_fits_without_collection(0) {
             self.collect_garbage(&[])?;
             self.next_collection = self.heap.allocation_count().saturating_mul(2).max(4096);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod frame_storage_tests {
+    use super::*;
+    #[test]
+    fn local_stack_ranges_are_released_on_success_and_failure() {
+        let mut vm = Vm::new();
+        vm.run_program(
+            &mut crate::compile("def f(x=42):\n    return x\ndef fail(x):\n    return 1//0\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let f = vm.get_global("f").unwrap();
+        let fail = vm.get_global("fail").unwrap();
+        for _ in 0..10 {
+            assert_eq!(vm.call(f, &[]).unwrap(), Value::Int(42));
+            assert!(vm.call(fail, &[Value::Int(1)]).is_err());
+            assert!(vm.local_slots.is_empty());
+            assert!(vm.local_frames.is_empty());
+            assert!(vm.stack.is_empty());
+            assert!(vm.environments.is_empty());
+        }
+        assert!(vm.tier_stats.register_scratch_reuses > 0);
+    }
+}
+
+#[cfg(test)]
+mod tuple_budget_tests {
+    use super::*;
+
+    #[test]
+    fn tuple_budget_preserves_hidden_roots_at_the_collection_boundary() {
+        for due in [false, true] {
+            let mut vm = Vm::new();
+            vm.tiering = crate::Tiering::Native;
+            vm.thresholds.function_entries = 1;
+            vm.thresholds.loop_backedges = 4;
+            vm.next_collection = usize::MAX;
+            vm.run_program(&mut crate::compile("class Box:\n    def __init__(self,x):\n        self.value=x\nholder=Box([1])\ndef f(holder):\n    keep=holder.value\n    holder.value=None\n    temporary=(7,)\n    return keep,temporary\nfor i in range(300):\n    holder.value=[i]\n    f(holder)\n").unwrap()).unwrap();
+            let f = vm.get_global("f").unwrap();
+            // Keep must live only in SSA/native state, not an independently traced local slot.
+            let hir = vm.function_hir(f).unwrap();
+            assert!(!hir.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+                matches!(
+                    i.op,
+                    crate::hir::Op::Runtime(crate::hir::CoreOp::StoreLocal(_), _)
+                )
+            }));
+            let holder = vm.get_global("holder").unwrap();
+            let attribute: crate::Attribute = "value".to_owned().into();
+            let child = vm.heap.allocate(Object::List(vec![Value::Int(1)].into()));
+            vm.set_attribute(holder, &attribute, child).unwrap();
+            let count = vm.heap.allocation_count();
+            vm.call(f, &[holder]).unwrap();
+            // Entry environments also allocate. Measure the closed call's exact total, then
+            // place pressure at its FIRST tuple, whose contents do not include the live keep value.
+            let delta = vm.heap.allocation_count() - count;
+            assert!(delta >= 2);
+            for _ in 0..6000 {
+                vm.heap.allocate(Object::Tuple(vec![]));
+            }
+            let keep = vm.heap.allocate(Object::List(vec![Value::Int(456)].into()));
+            vm.set_attribute(holder, &attribute, keep).unwrap();
+            let count = vm.heap.allocation_count();
+            vm.next_collection = if due {
+                count + delta - 1
+            } else {
+                count + delta + 1
+            };
+            let epoch = vm.heap.collection_epoch();
+            let roots = vm.tier_stats.native_root_syncs;
+            let fields = vm.tier_stats.native_inline_field_hits;
+            let result = vm.call(f, &[holder]).unwrap();
+            assert!(vm.tier_stats.native_inline_field_hits > fields);
+            assert_eq!(vm.heap.get_item(result, Value::Int(0)).unwrap(), keep);
+            assert_eq!(
+                vm.heap.get_item(keep, Value::Int(0)).unwrap(),
+                Value::Int(456)
+            );
+            let temporary = vm.heap.get_item(result, Value::Int(1)).unwrap();
+            assert_eq!(
+                vm.heap.get_item(temporary, Value::Int(0)).unwrap(),
+                Value::Int(7)
+            );
+            if due {
+                assert!(vm.heap.collection_epoch() > epoch);
+                assert_eq!(vm.tier_stats.native_root_syncs - roots, 1);
+                assert!(vm.heap.allocation_count() < count);
+            } else {
+                assert_eq!(vm.heap.collection_epoch(), epoch);
+                assert_eq!(vm.tier_stats.native_root_syncs, roots);
+                assert_eq!(vm.heap.allocation_count(), count + delta);
+            }
+            vm.collect_garbage(&[result]).unwrap();
+            assert!(vm.heap.get(keep).is_ok());
+            vm.collect_garbage(&[]).unwrap();
+            assert!(vm.heap.get(keep).is_err());
+            assert_eq!(vm.stack_len(), 0);
+        }
+    }
+
+    #[test]
+    fn allocation_budget_overflow_uses_the_slow_path() {
+        let mut vm = Vm::new();
+        vm.heap.allocate(Object::Tuple(vec![]));
+        vm.next_collection = usize::MAX;
+        assert!(!vm.allocation_fits_without_collection(usize::MAX));
     }
 }

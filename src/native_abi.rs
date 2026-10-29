@@ -18,6 +18,9 @@ pub(crate) const UNPACK_BATCH: i32 = 5;
 pub(crate) const FLOAT_VIEW: i32 = 6;
 pub(crate) const REGION_ENTER: i32 = 7;
 pub(crate) const NEST_ENTER: i32 = 8;
+pub(crate) const SCALAR_CALL: i32 = 9;
+pub(crate) const TUPLE_ALLOC: i32 = 10;
+pub(crate) const NAME_LOAD: i32 = 11;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Slot {

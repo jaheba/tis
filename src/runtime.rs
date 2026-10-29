@@ -84,3 +84,38 @@ fn number(value: Value) -> Option<f64> {
         other => integer(other).map(|value| value as f64),
     }
 }
+
+/// Only exact Int/Float operands are supported. None requests the original Python operation;
+/// integer overflow is distinct so speculative callers preserve its side-exit reason.
+pub(crate) fn numeric_add(lhs: Value, rhs: Value) -> Option<Result<Value>> {
+    Some(match (lhs, rhs) {
+        (Value::Int(a), Value::Int(b)) => a
+            .checked_add(b)
+            .map(Value::Int)
+            .ok_or(Error::IntegerOverflow),
+        (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
+        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+        _ => return None,
+    })
+}
+
+/// Integer comparisons stay exact; callers verify the literal's f64 representation before use.
+/// Bool and heap operands require the original Python comparison.
+pub(crate) fn number_compare(value: Value, integer: i64, operator: &str) -> Option<bool> {
+    match value {
+        Value::Int(value) => Some(match operator {
+            "==" => value == integer,
+            "!=" => value != integer,
+            "<" => value < integer,
+            "<=" => value <= integer,
+            ">" => value > integer,
+            ">=" => value >= integer,
+            _ => return None,
+        }),
+        Value::Float(value) => Some(
+            crate::scalar::FloatCondition::from_symbol(operator)?.evaluate(value, integer as f64),
+        ),
+        _ => None,
+    }
+}
