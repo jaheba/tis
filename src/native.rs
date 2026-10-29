@@ -1,6 +1,7 @@
 //! Cranelift gateway with guarded heap views and explicit runtime materialization boundaries.
 mod fields;
 mod locals;
+mod readonly;
 mod region;
 mod virtual_iter;
 use crate::{
@@ -24,6 +25,8 @@ use crate::native_abi::*;
 use crate::native_runtime::{Entry, callback, power};
 #[derive(Debug, Clone)]
 pub struct NativeDiagnostics {
+    pub readonly_clif: Option<String>,
+    pub mutation_clif: Option<String>,
     pub clif: String,
     pub disassembly: String,
     pub machine_code: Vec<u8>,
@@ -41,6 +44,7 @@ pub(crate) struct NativeCode {
     inline_scratch: usize,
     pub diagnostics: Option<NativeDiagnostics>,
     pub nest: Option<crate::region::nest::LoopNest>,
+    pub(crate) readonly: Option<readonly::Kernel>,
 }
 impl fmt::Debug for NativeCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -79,7 +83,12 @@ impl NativeCode {
         // Region code exposes enough SSA to optimize; Cranelift's default skips its optimization pipeline.
         let mut jit = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names())
             .map_err(error)?;
-        jit.symbol("tis_callback", callback as *const u8);
+        let gateway = if lir.inline_scopes.is_empty() {
+            crate::native_runtime::callback_no_inline as *const u8
+        } else {
+            callback as *const u8
+        };
+        jit.symbol("tis_callback", gateway);
         jit.symbol(
             "tis_inline_preflight",
             crate::native_runtime::inline_preflight as *const u8,
@@ -118,6 +127,7 @@ impl NativeCode {
             entry: None,
             lir: lir.clone(),
             locations: vec![],
+            readonly: None,
             root_states,
             bytes: 0,
             feedback,
@@ -339,7 +349,11 @@ impl NativeCode {
                         vars.publish($builder, registers, &owner.lir)?;
                     }
                     let state = &owner.lir.states[owner.lir.exits[exit.0].state.0];
-                    scalars.materialize($builder, registers, state_values(state))?;
+                    scalars.materialize(
+                        $builder,
+                        registers,
+                        state_values(state, owner.lir.inline_roots(owner.lir.exits[exit.0].state)),
+                    )?;
                     let status = $builder.ins().iconst(types::I64, exit.0 as i64 + 1);
                     $builder.ins().return_(&[status]);
                     $builder.switch_to_block(success);
@@ -360,7 +374,9 @@ impl NativeCode {
                     .nest
                     .as_ref()
                     .is_some_and(|n| n.blocks.contains(&crate::hir::BlockId(block_index)));
-                if in_nest {
+                if owner.lir.block_origins[block_index].is_none() {
+                    // Synthetic CFG edges carry registers, not physical profiling events.
+                } else if in_nest {
                     let n = owner.nest.as_ref().unwrap();
                     if n.header.0 == block_index {
                         let active = b.use_var(*region_active.last().unwrap());
@@ -488,12 +504,20 @@ impl NativeCode {
                         failed
                     );
                 }
+                let bootstrap_reads = if !feedback {
+                    crate::leaf_inline::bootstrap_reads(&body.instructions)
+                } else {
+                    Default::default()
+                };
                 let mut unpack_reads = 0;
                 for (instruction_index, instruction) in body.instructions.iter().enumerate() {
                     let location = i32::try_from(owner.locations.len()).map_err(error)?;
                     owner.locations.push((block_index, instruction_index));
                     if unpack_reads > 0 {
                         unpack_reads -= 1;
+                        continue;
+                    }
+                    if bootstrap_reads.contains(&instruction_index) {
                         continue;
                     }
                     let destination = instruction.result;
@@ -1181,12 +1205,12 @@ impl NativeCode {
                             if !feedback
                                 && !in_nest
                                 && region_index.is_none()
-                                && matches!(
+                                && (matches!(
                                     helper,
                                     lir::Helper::ScalarCall(_)
                                         | lir::Helper::Tuple
                                         | lir::Helper::LoadName(_)
-                                ) =>
+                                ) || matches!(helper, lir::Helper::Scoped(inner) if matches!(inner.as_ref(), lir::Helper::ScalarCall(_)))) =>
                         {
                             // The closed probe reads only operands. Its scalar contract or one-object
                             // budget prevents collection; a miss materializes the full original state.
@@ -1237,6 +1261,26 @@ impl NativeCode {
                             );
                             b.ins().jump(done, &[]);
                             b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::LeafGuard(_),
+                            ..
+                        } if !feedback
+                            && crate::leaf_inline::bootstrap_end(
+                                &body.instructions,
+                                instruction_index,
+                            )
+                            .is_some() =>
+                        {
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                LEAF_ENTER,
+                                location,
+                                failed,
+                            )
                         }
                         Operation::Call { .. } => runtime_call!(
                             &mut b,
@@ -1414,6 +1458,8 @@ impl NativeCode {
             // SAFETY: the finalized module owns this complete function image until owner is dropped.
             let machine_code = unsafe { std::slice::from_raw_parts(pointer, owner.bytes) }.to_vec();
             owner.diagnostics = Some(NativeDiagnostics {
+                readonly_clif: None,
+                mutation_clif: None,
                 clif,
                 disassembly: context
                     .compiled_code()
@@ -1450,6 +1496,14 @@ impl NativeCode {
             return Err(Error::InvalidIr(
                 "native region entry must pass through its header",
             ));
+        }
+        if start == 0
+            && !skip_probe
+            && !vm.collecting(function)
+            && let Some(kernel) = &self.readonly
+            && let Some(outcome) = kernel.execute(vm, function)?
+        {
+            return Ok(outcome);
         }
         if self.inline_fields {
             vm.heap.enable_native_fields();
@@ -1708,12 +1762,23 @@ impl ScalarVars {
     ) -> Result<()> {
         if !matches!(
             event,
-            HELPER | SEQUENCE | UNPACK_BATCH | FLOAT_VIEW | SCALAR_CALL | TUPLE_ALLOC | NAME_LOAD
+            HELPER
+                | SEQUENCE
+                | UNPACK_BATCH
+                | FLOAT_VIEW
+                | SCALAR_CALL
+                | TUPLE_ALLOC
+                | NAME_LOAD
+                | LEAF_ENTER
         ) {
             return Ok(());
         }
         let (block, index) = locations[location as usize];
-        let count = if event == UNPACK_BATCH {
+        let count = if event == LEAF_ENTER {
+            crate::leaf_inline::bootstrap_end(&lir.blocks[block].instructions, index)
+                .ok_or(Error::InvalidIr("native leaf bootstrap"))?
+                - index
+        } else if event == UNPACK_BATCH {
             match lir.blocks[block].instructions[index].operation {
                 Operation::SequenceUnpack { count, .. } => count,
                 _ => 0,
@@ -1887,12 +1952,13 @@ fn store_float_cached(
     store_float(b, registers, register, value)
 }
 
-fn state_values(state: &lir::FrameState) -> Vec<Register> {
+fn state_values(state: &lir::FrameState, inline: &[Register]) -> Vec<Register> {
     state
         .values
         .iter()
         .map(|(_, register)| *register)
         .chain(state.local_values.iter().flatten().copied())
+        .chain(inline.iter().copied())
         .collect()
 }
 fn callback_values(
@@ -1915,17 +1981,24 @@ fn callback_values(
     if event == FINISH {
         // Reopened windows inspect only this HIR site's operands and result. Keeping unrelated
         // recipes live here would force spills even on the branch that skips observation.
-        let mut inputs = lir.observation_inputs[instruction.origin.0].clone();
+        let mut inputs = if lir.is_scoped_instruction(instruction) {
+            vec![]
+        } else {
+            lir.observation_inputs[instruction.origin.0].clone()
+        };
         inputs.extend(instruction.result);
         return inputs;
     }
     let mut values = instruction.operation.inputs();
-    values.extend(&lir.observation_inputs[instruction.origin.0]);
+    if !lir.is_scoped_instruction(instruction) {
+        values.extend(&lir.observation_inputs[instruction.origin.0]);
+    }
     if let Operation::Call { state, effects, .. } | Operation::Truth { state, effects, .. } =
         instruction.operation
         && effects.needs_safepoint()
     {
         let floats = lir.native_boxing_recipes();
+        values.extend(lir.inline_gc_roots(state));
         values.extend(
             lir.states[state.0]
                 .values
@@ -1944,12 +2017,12 @@ fn callback_failure_values(
     location: i32,
 ) -> Vec<Register> {
     if event == NEST_ENTER {
-        return state_values(&lir.states[lir.exits[lir.nest.as_ref().unwrap().entry.0].state.0]);
+        let id = lir.exits[lir.nest.as_ref().unwrap().entry.0].state;
+        return state_values(&lir.states[id.0], lir.inline_roots(id));
     }
     if event == REGION_ENTER {
-        return state_values(
-            &lir.states[lir.exits[lir.regions[location as usize].entry.0].state.0],
-        );
+        let id = lir.exits[lir.regions[location as usize].entry.0].state;
+        return state_values(&lir.states[id.0], lir.inline_roots(id));
     }
     if event == ENTER || event == FINISH {
         return vec![];
@@ -1964,7 +2037,9 @@ fn callback_failure_values(
         | Operation::SequenceUnpack { failure, .. } => Some(lir.exits[failure.0].state),
         _ => None,
     };
-    state.map_or_else(Vec::new, |state| state_values(&lir.states[state.0]))
+    state.map_or_else(Vec::new, |state| {
+        state_values(&lir.states[state.0], lir.inline_roots(state))
+    })
 }
 
 /// OSR entries name every HIR backedge target, including forward-layout backedges.

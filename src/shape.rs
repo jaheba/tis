@@ -89,6 +89,15 @@ impl Attributes {
         self.shape = shape;
         (index, None)
     }
+    /// Native buffered stores commit only existing slots, retaining the shape and backing storage.
+    pub(crate) fn write_existing(&mut self, slot: usize, value: Value) -> crate::Result<()> {
+        *self
+            .values
+            .get_mut(slot)
+            .ok_or(crate::Error::InvalidIr("native field slot"))? = value;
+        Ok(())
+    }
+
     pub(crate) fn native_fields(&self) -> (u64, *const Value, usize) {
         (self.shape.id, self.values.as_ptr(), self.values.len())
     }

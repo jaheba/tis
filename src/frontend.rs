@@ -226,10 +226,26 @@ impl Builder {
         match statement {
             Stmt::Import(stmt) => {
                 for alias in &stmt.names {
-                    if alias.name.as_str() != "math" {
-                        return Err(Error::Unsupported("only builtin math imports"));
+                    if !matches!(alias.name.as_str(), "math" | "json") {
+                        return Err(Error::Unsupported("only builtin math and json imports"));
                     }
                     let value = self.runtime(block, CoreOp::Import(alias.name.to_string()), vec![]);
+                    let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                    self.store_target(Target::Name(name), value, block)?;
+                }
+            }
+            Stmt::ImportFrom(stmt) => {
+                let module = stmt.module.as_ref().map(|name| name.as_str());
+                if stmt.level != 0 || !matches!(module, Some("math" | "json")) {
+                    return Err(Error::Unsupported("only builtin math and json imports"));
+                }
+                let module = self.runtime(block, CoreOp::Import(module.unwrap().into()), vec![]);
+                for alias in &stmt.names {
+                    if alias.name.as_str() == "*" {
+                        return Err(Error::Unsupported("star imports"));
+                    }
+                    let value =
+                        self.runtime(block, CoreOp::GetAttr(alias.name.to_string()), vec![module]);
                     let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                     self.store_target(Target::Name(name), value, block)?;
                 }
@@ -1037,6 +1053,11 @@ fn bindings(
     for statement in body {
         match statement {
             Stmt::Import(stmt) => {
+                for alias in &stmt.names {
+                    locals.insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
+                }
+            }
+            Stmt::ImportFrom(stmt) => {
                 for alias in &stmt.names {
                     locals.insert(alias.asname.as_ref().unwrap_or(&alias.name).to_string());
                 }

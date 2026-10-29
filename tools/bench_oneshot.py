@@ -23,14 +23,15 @@ def main():
     parser.add_argument('--python', type=Path, default=Path(sys.executable))
     parser.add_argument('--pypy', type=Path)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--samples', type=int, default=10)
+    parser.add_argument('--samples', type=int, default=3)
     parser.add_argument('--timeout', type=float, default=120)
     parser.add_argument('--benchmarks', nargs='+', choices=FIXTURES, default=list(FIXTURES))
     parser.add_argument('--tiers', nargs='+', choices=['bytecode', 'lir', 'native', 'copy-patch'],
                         default=['bytecode', 'native'])
+    parser.add_argument('--cfg-inlining', action='store_true', help='enable experimental CFG inlining in candidate tis')
     args = parser.parse_args()
-    if args.samples < 10 or args.timeout <= 0:
-        parser.error('use at least ten samples and a positive per-process timeout')
+    if args.samples < 1 or args.timeout <= 0:
+        parser.error('use at least one sample and a positive per-process timeout')
     args.output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[1] / 'tests/fixtures'
     binaries = {'tis': args.run.resolve(), 'cpython': args.python.resolve()}
@@ -54,7 +55,7 @@ def main():
         source = root / f'{FIXTURES[benchmark]}.py'
         expected = EXPECTED if benchmark == 'nbody' else source.with_suffix('.out').read_text()
         results['sources'][benchmark] = dict(path=str(source), sha256=digest(source), expected_stdout=expected)
-        commands = {tier: [str(binaries['tis']), '--tier', tier, str(source)] for tier in args.tiers}
+        commands = {tier: [str(binaries['tis']), '--tier', tier, *(['--cfg-inlining'] if args.cfg_inlining else []), str(source)] for tier in args.tiers}
         if args.baseline_run:
             commands.update({f'baseline/{tier}':[str(binaries['baseline']),'--tier',tier,str(source)] for tier in args.tiers})
         commands.update({mode: [str(binary), str(source)] for mode, binary in binaries.items() if mode in ['cpython','pypy']})

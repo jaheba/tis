@@ -61,6 +61,13 @@ impl List {
             Storage::Floats(v) => v.get(index).copied().map(Value::Float),
         }
     }
+    pub(crate) fn native_values(&self) -> Option<&[Value]> {
+        match &self.storage {
+            Storage::Values(values) => Some(values),
+            Storage::Floats(_) => None,
+        }
+    }
+
     pub fn floats(&self) -> Option<&[f64]> {
         match &self.storage {
             Storage::Floats(v) => Some(v),

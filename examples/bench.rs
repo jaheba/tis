@@ -10,6 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let benchmark = args.next().ok_or("expected barnes-hut or ticket-search")?;
     let mut tier = Tiering::Native;
     let mut warmups = 2usize;
+    let mut cfg_inlining = false;
+    let mut readonly_regions = false;
+    let mut mutation_regions = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--tier" => {
@@ -21,6 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => return Err("invalid tier".into()),
                 }
             }
+            "--cfg-inlining" => cfg_inlining = true,
+            "--readonly-regions" => readonly_regions = true,
+            "--mutation-regions" => mutation_regions = true,
             "--warmups" => warmups = args.next().ok_or("missing warmups")?.parse()?,
             _ => return Err("unknown option".into()),
         }
@@ -53,6 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compile_ns = start.elapsed().as_nanos();
     let mut vm = Vm::new();
     vm.tiering = tier;
+    vm.cfg_inlining = cfg_inlining;
+    vm.readonly_regions = readonly_regions;
+    vm.mutation_regions = mutation_regions;
     vm.run_program(&mut p)?;
     let f = vm.get_global(name)?;
     let sample = |vm: &mut Vm| -> Result<u128, Box<dyn std::error::Error>> {
@@ -75,7 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..warmups {
         warmup_ns.push(sample(&mut vm)?);
     }
-    println!("{{\"ready\":true,\"compile_ns\":{compile_ns},\"warmup_ns\":{warmup_ns:?}}}");
+    println!(
+        "{{\"ready\":true,\"compile_ns\":{compile_ns},\"warmup_ns\":{warmup_ns:?},\"compilation_errors_total\":{}}}",
+        vm.tier_stats.compilation_errors
+    );
     io::stdout().flush()?;
     for line in io::stdin().lock().lines() {
         match line?.as_str() {
@@ -87,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run_ns = sample(&mut vm)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"inline_field_hits\":{},\"inline_blocks\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{},\"positional_frames\":{},\"scratch_creations\":{},\"scratch_reuses\":{},\"shape_reads\":{},\"shape_writes\":{},\"body_inlines\":{}}}",
+            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"inline_field_hits\":{},\"inline_blocks\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{},\"positional_frames\":{},\"scratch_creations\":{},\"scratch_reuses\":{},\"shape_reads\":{},\"shape_writes\":{},\"body_inlines\":{},\"leaf_body_inlines\":{},\"native_leaf_entry_batches\":{},\"virtual_tuple_returns\":{},\"readonly_entries\":{},\"readonly_misses\":{},\"mutation_entries\":{},\"mutation_writes\":{},\"mutation_guard_exits\":{},\"mutation_cold_misses\":{},\"compilation_errors_total\":{}}}",
             stats.native_compile_ns + stats.copy_patch_compile_ns
                 - before.native_compile_ns
                 - before.copy_patch_compile_ns,
@@ -108,7 +120,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats.register_scratch_reuses - before.register_scratch_reuses,
             stats.shape_read_hits - before.shape_read_hits,
             stats.shape_write_hits - before.shape_write_hits,
-            stats.native_body_inlines - before.native_body_inlines
+            stats.native_body_inlines - before.native_body_inlines,
+            stats.leaf_body_inlines - before.leaf_body_inlines,
+            stats.native_leaf_entry_batches - before.native_leaf_entry_batches,
+            stats.virtual_tuple_returns - before.virtual_tuple_returns,
+            stats.readonly_entries - before.readonly_entries,
+            stats.readonly_misses - before.readonly_misses,
+            stats.mutation_entries - before.mutation_entries,
+            stats.mutation_writes - before.mutation_writes,
+            stats.mutation_guard_exits - before.mutation_guard_exits,
+            stats.mutation_cold_misses - before.mutation_cold_misses,
+            stats.compilation_errors
         );
         io::stdout().flush()?;
     }

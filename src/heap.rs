@@ -115,6 +115,10 @@ struct Entry {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NativeFields {
+    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = compact float list (length only).
+    pub(crate) kind: u64,
+    pub(crate) class_tag: u64,
+    pub(crate) class_payload: u64,
     pub(crate) generation: u64,
     pub(crate) shape: u64,
     pub(crate) values: *const Value,
@@ -124,15 +128,35 @@ pub(crate) struct NativeFields {
 impl NativeFields {
     fn of(object: &Object, generation: u32) -> Self {
         match object {
-            Object::Instance { attributes, .. } => {
+            Object::Instance { class, attributes } => {
+                let class = crate::native_abi::Slot::boxed(*class);
                 let (shape, values, len) = attributes.native_fields();
                 Self {
+                    kind: 1,
+                    class_tag: class.tag,
+                    class_payload: class.a,
                     generation: generation as u64,
                     shape,
                     values,
                     len,
                 }
             }
+            Object::List(values) => Self {
+                kind: if values.is_float() { 4 } else { 2 },
+                generation: generation as u64,
+                values: values
+                    .native_values()
+                    .map_or(std::ptr::null(), |v| v.as_ptr()),
+                len: values.len(),
+                ..Self::default()
+            },
+            Object::Tuple(values) => Self {
+                kind: 3,
+                generation: generation as u64,
+                values: values.as_ptr(),
+                len: values.len(),
+                ..Self::default()
+            },
             _ => Self::default(),
         }
     }

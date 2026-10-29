@@ -167,6 +167,7 @@ pub struct SiteProfile {
     pub result: TypeProfile,
     pub call_targets: BTreeMap<CallTarget, u64>,
     pub other_targets: u64,
+    pub(crate) leaf_body: Option<std::rc::Rc<crate::leaf_inline::Plan>>,
     pub(crate) inline_body: Option<std::rc::Rc<crate::body_inline::Plan>>,
     pub exit_reasons: BTreeMap<crate::lir::ExitReason, u64>,
     window: u32,

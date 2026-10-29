@@ -317,7 +317,10 @@ fn root_maps_truth_conversion_and_string_allocation_are_explicit() {
             ))
     );
     for state in &lir.states {
-        assert!(state.environment_root);
+        assert!(matches!(
+            state.environment_root,
+            tis::lir::FrameEnvironment::Current
+        ));
     }
     let mut invalid = lir.clone();
     let call = invalid

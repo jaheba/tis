@@ -16,7 +16,8 @@ def main():
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--samples', type=int, default=10)
+    parser.add_argument('--samples', type=int, default=3)
+    parser.add_argument('--warmups', type=int, default=1)
     parser.add_argument('--fresh-processes', action='store_true',
                         help='warm a new worker for every sample to expose process layout variation')
     parser.add_argument('--benchmark',choices=['barnes-hut','ticket-search'],help='compare generic bench workers instead of nbody')
@@ -27,18 +28,29 @@ def main():
     parser.add_argument('--candidate-bytecode', choices=['stack', 'register'])
     parser.add_argument('--baseline-numeric', choices=['disabled', 'adaptive'])
     parser.add_argument('--candidate-numeric', choices=['disabled', 'adaptive'])
+    parser.add_argument('--baseline-mutation-regions', action='store_true')
+    parser.add_argument('--candidate-mutation-regions', action='store_true')
+    parser.add_argument('--baseline-readonly-regions', action='store_true')
+    parser.add_argument('--candidate-readonly-regions', action='store_true')
+    parser.add_argument('--baseline-cfg-inlining', action='store_true')
+    parser.add_argument('--candidate-cfg-inlining', action='store_true')
     args = parser.parse_args()
-    if args.samples < 10:
-        parser.error('use at least 10 samples')
+    if (args.baseline_cfg_inlining or args.candidate_cfg_inlining or args.baseline_readonly_regions or args.candidate_readonly_regions or args.baseline_mutation_regions or args.candidate_mutation_regions) and not args.benchmark:
+        parser.error('native region and CFG inlining experiments require --benchmark')
+    if args.samples < 1 or args.warmups < 1:
+        parser.error('use at least one sample and one warmup')
     args.output.mkdir(parents=True, exist_ok=False)
     binaries = {name: path.resolve() for name, path in
                 [('baseline', args.baseline), ('candidate', args.candidate)]}
     results = dict(timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                   platform=platform.platform(), samples=args.samples, warmups=2, seed=args.seed, tiers=args.tiers,
+                   platform=platform.platform(), samples=args.samples, warmups=args.warmups, seed=args.seed, tiers=args.tiers,
                    binaries={name: dict(path=str(path), sha256=digest(path))
                              for name, path in binaries.items()},
                    bytecode_modes={'baseline': args.baseline_bytecode, 'candidate': args.candidate_bytecode},
                    numeric_modes={'baseline': args.baseline_numeric, 'candidate': args.candidate_numeric},
+                   mutation_regions={'baseline':args.baseline_mutation_regions,'candidate':args.candidate_mutation_regions},
+                   readonly_regions={'baseline':args.baseline_readonly_regions,'candidate':args.candidate_readonly_regions},
+                   cfg_inlining={'baseline':args.baseline_cfg_inlining,'candidate':args.candidate_cfg_inlining},
                    benchmark=args.benchmark or 'nbody',
                    fresh_processes=args.fresh_processes, readiness={}, samples_raw=[])
     workers = {}
@@ -48,7 +60,13 @@ def main():
 
     def start(label):
         name, mode = label.split('/')
-        command = [str(binaries[name]), *([args.benchmark] if args.benchmark else []), '--tier', mode, '--warmups', '2']
+        command = [str(binaries[name]), *([args.benchmark] if args.benchmark else []), '--tier', mode, '--warmups', str(args.warmups)]
+        if results['mutation_regions'][name]:
+            command += ['--mutation-regions']
+        if results['readonly_regions'][name]:
+            command += ['--readonly-regions']
+        if results['cfg_inlining'][name]:
+            command += ['--cfg-inlining']
         encoding = results['bytecode_modes'][name]
         if encoding:
             command += ['--bytecode', encoding]

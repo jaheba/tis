@@ -1,6 +1,9 @@
 //! Typed, register-based lowering for a future native backend.
 //! All speculative exits precede Python-visible effects and resume an unchanged HIR operation.
 
+mod prune;
+mod remap;
+
 use crate::{
     Error, Result,
     hir::{self, BlockId, Constant, CoreOp, ResumePoint, ValueId},
@@ -26,20 +29,63 @@ pub enum Type {
     F64,
     Bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StateId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitId(pub usize);
 
+// Keep the GC value map and environment mode adjacent in the hot metadata header.
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FrameState {
-    pub resume: ResumePoint,
     pub values: Vec<(ValueId, Register)>,
     /// The current lexical environment is a separate implicit boxed input and GC root.
-    pub environment_root: bool,
+    pub environment_root: FrameEnvironment,
+    pub resume: ResumePoint,
     /// Mutable frame locals stay rooted independently of temporary register liveness.
     pub local_count: usize,
     pub local_values: Vec<Option<Register>>,
+}
+/// The VM always roots the physical environment; copied bodies add logical frame roots.
+/// The non-null Rc lets this replace the old boolean plus padding without growing FrameState.
+#[derive(Debug, Clone)]
+pub enum FrameEnvironment {
+    Current,
+    Inline(std::rc::Rc<InlineState>),
+}
+/// Copied safepoints keep their additional metadata outside ordinary frame states.
+#[derive(Debug, Clone)]
+pub struct InlineState {
+    pub snapshot: std::rc::Rc<crate::inline_frames::Snapshot>,
+    pub roots: Vec<Register>,
+    pub gc_roots: Vec<Register>,
+}
+impl InlineState {
+    pub fn new(
+        snapshot: std::rc::Rc<crate::inline_frames::Snapshot>,
+        registers: &[Type],
+    ) -> Result<Self> {
+        let roots = snapshot.roots(registers)?;
+        Ok(Self {
+            snapshot,
+            gc_roots: roots.clone(),
+            roots,
+        })
+    }
+}
+impl FrameState {
+    pub fn inline(&self) -> Option<&InlineState> {
+        match &self.environment_root {
+            FrameEnvironment::Current => None,
+            FrameEnvironment::Inline(state) => Some(state),
+        }
+    }
+    pub fn inline_roots(&self) -> &[Register] {
+        self.inline().map_or(&[], |state| state.roots.as_slice())
+    }
+    pub fn inline_gc_roots(&self) -> &[Register] {
+        self.inline().map_or(&[], |state| state.gc_roots.as_slice())
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExitReason {
@@ -50,6 +96,8 @@ pub enum ExitReason {
 }
 #[derive(Debug, Clone)]
 pub struct SideExit {
+    /// Logical caller-to-callee frames; root publication uses the enclosing physical state.
+    pub inline: Option<std::rc::Rc<crate::inline_frames::Snapshot>>,
     pub state: StateId,
     pub reason: ExitReason,
 }
@@ -91,6 +139,14 @@ impl Effects {
 /// Helpers consume and return boxed values; environment and root maps are explicit call metadata.
 #[derive(Debug, Clone)]
 pub enum Helper {
+    Scoped(Box<Helper>),
+    LeafGuard(std::rc::Rc<crate::leaf_inline::Plan>),
+    LeafReceiver,
+    LeafEnvironment,
+    CurrentEnvironment,
+    LeafReturn(std::rc::Rc<crate::leaf_inline::Plan>),
+    /// Return accounting for a tuple whose components flow directly to the caller.
+    TupleReturn(std::rc::Rc<crate::leaf_inline::Plan>),
     InlineCall {
         body: std::rc::Rc<crate::body_inline::Plan>,
         names: Vec<Option<String>>,
@@ -252,10 +308,16 @@ pub struct OsrEntry {
 
 #[derive(Debug, Clone)]
 pub struct Function {
+    pub inline_origins: BTreeMap<Register, (crate::inline_frames::ScopeId, ValueId)>,
+    pub inline_scopes: Vec<crate::leaf_inline::Scope>,
+    pub scoped_results: BTreeSet<Register>,
+    pub shadow_slots: usize,
     pub source: FunctionId,
     pub revision: u64,
     pub registers: Vec<Type>,
     pub blocks: Vec<Block>,
+    /// Synthetic inline blocks do not create physical HIR block observations.
+    pub block_origins: Vec<Option<BlockId>>,
     pub states: Vec<FrameState>,
     pub exits: Vec<SideExit>,
     pub osr_entries: Vec<OsrEntry>,
@@ -272,14 +334,102 @@ pub struct Function {
 }
 
 impl Function {
+    /// Copied caches are initialized by their own guards, not by a physical caller OSR entry.
+    pub(crate) fn scalar_imports(&self) -> impl Iterator<Item = (&Register, &Register)> {
+        self.scalar_sources.iter().filter(|(raw, _)| {
+            !self
+                .inline_scopes
+                .iter()
+                .any(|scope| scope.registers.contains(&raw.0))
+        })
+    }
+
+    pub(crate) fn is_scoped_instruction(&self, instruction: &Instruction) -> bool {
+        instruction
+            .result
+            .is_some_and(|result| self.scoped_results.contains(&result))
+            || match &instruction.operation {
+                Operation::NumberCompare { failure, .. } => self.exits[failure.0].inline.is_some(),
+                Operation::Truth { state, .. } => self.states[state.0].inline().is_some(),
+                _ => false,
+            }
+    }
+
+    pub fn inline_roots(&self, id: StateId) -> &[Register] {
+        self.states.get(id.0).map_or(&[], FrameState::inline_roots)
+    }
+    pub fn inline_gc_roots(&self, id: StateId) -> &[Register] {
+        self.states
+            .get(id.0)
+            .map_or(&[], FrameState::inline_gc_roots)
+    }
+    // These producers always return immediate values. Feedback alone cannot prove that a
+    // boxed register is safe to omit, and native float recipes may not yet have a boxed slot.
+    fn primitive_registers(&self) -> BTreeSet<Register> {
+        self.blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
+                let primitive = matches!(
+                    instruction.operation,
+                    Operation::BoxFloat(_)
+                        | Operation::BoxInt(_)
+                        | Operation::BoxBool(_)
+                        | Operation::NumericAdd { .. }
+                        | Operation::Constant(
+                            Constant::None
+                                | Constant::Unbound
+                                | Constant::Bool(_)
+                                | Constant::Int(_)
+                                | Constant::Float(_)
+                        )
+                );
+                primitive.then_some(instruction.result).flatten()
+            })
+            .collect()
+    }
+    fn refresh_inline_gc_roots(&mut self) {
+        let primitives = self.primitive_registers();
+        for state in &mut self.states {
+            let FrameEnvironment::Inline(state) = &mut state.environment_root else {
+                continue;
+            };
+            let state = std::rc::Rc::make_mut(state);
+            state.gc_roots = state
+                .roots
+                .iter()
+                .copied()
+                .filter(|register| !primitives.contains(register))
+                .collect();
+        }
+    }
     pub fn lower(hir: &hir::Function, mode: LoweringMode) -> Result<Self> {
+        Self::lower_with_inline(hir, mode, true, false)
+    }
+
+    /// Experimental bounded multi-block incorporation using the same verifier and backends.
+    pub fn lower_with_cfg(hir: &hir::Function, mode: LoweringMode) -> Result<Self> {
+        Self::lower_with_inline(hir, mode, true, true)
+    }
+
+    pub(crate) fn lower_with_inline(
+        hir: &hir::Function,
+        mode: LoweringMode,
+        allow_inline: bool,
+        allow_cfg: bool,
+    ) -> Result<Self> {
         let analysis = hir.analyze()?;
         let profile = hir.profile();
         let mut output = Self {
+            inline_origins: BTreeMap::new(),
+            inline_scopes: vec![],
+            scoped_results: BTreeSet::new(),
+            shadow_slots: 0,
             source: hir.id(),
             revision: hir.revision(),
             registers: vec![Type::Boxed; hir.value_count],
             blocks: vec![],
+            block_origins: (0..hir.blocks.len()).map(|i| Some(BlockId(i))).collect(),
             states: vec![],
             exits: vec![],
             osr_entries: vec![],
@@ -1224,7 +1374,10 @@ impl Function {
                 state,
             });
         }
-        if mode == LoweringMode::Profiled {
+        if mode == LoweringMode::Profiled && allow_inline {
+            crate::leaf_inline::merge(hir, &mut output, allow_cfg)?;
+        }
+        if mode == LoweringMode::Profiled && output.blocks.len() == hir.blocks.len() {
             for (header, body, iterator, state) in crate::region::LoopRegion::candidates(&output) {
                 let entry = output.exit(state, ExitReason::TypeGuard);
                 let imports = crate::region::LoopRegion::imports(&output, header, body);
@@ -1239,10 +1392,14 @@ impl Function {
                 });
             }
         }
-        if let Some((mut nest, state)) = crate::region::nest::LoopNest::discover(&output) {
+        if let Some((mut nest, state)) = (output.blocks.len() == hir.blocks.len())
+            .then(|| crate::region::nest::LoopNest::discover(&output))
+            .flatten()
+        {
             nest.entry = output.exit(state, ExitReason::TypeGuard);
             output.nest = Some(nest);
         }
+        output.refresh_inline_gc_roots();
         output.verify()?;
         Ok(output)
     }
@@ -1259,7 +1416,7 @@ impl Function {
                 .iter()
                 .map(|value| (*value, Register(value.0)))
                 .collect(),
-            environment_root: true,
+            environment_root: FrameEnvironment::Current,
             local_count: self.local_count,
             local_values: if hir.local_state(resume).is_empty() {
                 vec![None; self.local_count]
@@ -1274,7 +1431,11 @@ impl Function {
     }
     fn exit(&mut self, state: StateId, reason: ExitReason) -> ExitId {
         let id = ExitId(self.exits.len());
-        self.exits.push(SideExit { state, reason });
+        self.exits.push(SideExit {
+            inline: None,
+            state,
+            reason,
+        });
         id
     }
 
@@ -1312,6 +1473,27 @@ impl Function {
 
     pub fn verify(&self) -> Result<()> {
         let fail = || Error::InvalidIr("invalid LIR");
+        let physical_blocks = self
+            .states
+            .iter()
+            .find_map(|state| {
+                state
+                    .inline()
+                    .and_then(|state| state.snapshot.frames.first())
+                    .map(|frame| frame.source.blocks.len())
+            })
+            .unwrap_or(self.blocks.len());
+        if self.block_origins.len() != self.blocks.len()
+            || self
+                .block_origins
+                .iter()
+                .enumerate()
+                .any(|(index, origin)| {
+                    *origin != (index < physical_blocks).then_some(BlockId(index))
+                })
+        {
+            return Err(Error::InvalidIr("inline block origin map"));
+        }
         let kind = |register: Register, expected: Type| -> Result<()> {
             if self.registers.get(register.0) != Some(&expected) {
                 Err(fail())
@@ -1325,10 +1507,30 @@ impl Function {
             state(exit.state)?;
             Ok(exit)
         };
+        for side_exit in &self.exits {
+            let physical = state(side_exit.state)?;
+            if let Some(snapshot) = &side_exit.inline {
+                snapshot.verify(&self.registers)?;
+                let outer = &snapshot.frames[0].source;
+                if outer.id() != self.source || outer.revision() != self.revision {
+                    return Err(Error::InvalidIr("inline exit source"));
+                }
+                // Every logical value needs an ordinary HIR slot or an explicitly mapped
+                // shadow register; unrelated callee ValueIds cannot alias caller slots.
+                if snapshot.roots(&self.registers)?.iter().any(|register| {
+                    !physical.values.iter().any(|(_, root)| root == register)
+                        && !self.inline_roots(side_exit.state).contains(register)
+                }) {
+                    return Err(Error::InvalidIr("inline exit lacks physical root mapping"));
+                }
+            }
+        }
         for (raw, source) in &self.scalar_sources {
             kind(*raw, Type::F64)?;
             kind(*source, Type::Boxed)?;
-            if self.hir_values.get(source.0) != Some(source) {
+            if self.hir_values.get(source.0) != Some(source)
+                && !self.scoped_results.contains(source)
+            {
                 return Err(fail());
             }
             let parameter = self.blocks.iter().any(|b| b.parameters.contains(raw));
@@ -1344,12 +1546,11 @@ impl Function {
         for entry in &self.osr_entries {
             let state = state(entry.state)?;
             if self
-                .scalar_sources
-                .values()
-                .any(|source| state.values.iter().any(|(_, r)| r == source))
+                .scalar_imports()
+                .any(|(_, source)| state.values.iter().any(|(_, r)| r == source))
                 && !self.scalar_entries.contains_key(&entry.header)
             {
-                return Err(fail());
+                return Err(Error::InvalidIr("missing scalar OSR entry guard"));
             }
         }
         for (block, id) in &self.scalar_entries {
@@ -1432,13 +1633,24 @@ impl Function {
             let mut guarded = BTreeMap::new();
             let mut unboxed_sources = self.scalar_sources.clone();
             for instruction in &body.instructions {
+                if instruction
+                    .result
+                    .is_some_and(|result| self.scoped_results.contains(&result))
+                    && !self.inline_scopes.iter().any(|scope| {
+                        scope.callsite == instruction.point
+                            && scope.destination == instruction.origin
+                    })
+                {
+                    return Err(Error::InvalidIr("inline instruction source scope"));
+                }
                 let expected = match &instruction.operation {
                     Operation::FloatListView { value, failure, .. } => {
                         kind(*value, Type::Boxed)?;
                         let snapshot = state(exit(*failure)?.state)?;
                         if exit(*failure)?.reason != ExitReason::SequenceGuard
                             || snapshot.resume != instruction.point
-                            || !snapshot.values.iter().any(|(_, r)| r == value)
+                            || (!snapshot.values.iter().any(|(_, r)| r == value)
+                                && !snapshot.inline_roots().contains(value))
                         {
                             return Err(fail());
                         }
@@ -1484,7 +1696,9 @@ impl Function {
                         }
                         for input in instruction.operation.inputs() {
                             kind(input, Type::Boxed)?;
-                            if !snapshot.values.iter().any(|(_, r)| *r == input) {
+                            if !snapshot.values.iter().any(|(_, r)| *r == input)
+                                && !snapshot.inline_roots().contains(&input)
+                            {
                                 return Err(fail());
                             }
                         }
@@ -1504,6 +1718,7 @@ impl Function {
                             .values
                             .iter()
                             .any(|(_, register)| register == value)
+                            && !snapshot.inline_roots().contains(value)
                             || snapshot.resume != instruction.point
                             || !effects.covers(Effects::READ_ONLY)
                             || roots.iter().copied().collect::<BTreeSet<_>>()
@@ -1534,6 +1749,8 @@ impl Function {
                             .values
                             .iter()
                             .any(|(_, register)| register == value)
+                            && !self.inline_roots(exit(*id)?.state).contains(value)
+                            && !self.scoped_results.contains(value)
                         {
                             return Err(fail());
                         }
@@ -1589,6 +1806,7 @@ impl Function {
                                 .values
                                 .iter()
                                 .any(|(_, register)| register == source)
+                                && !self.inline_roots(exit(*failure)?.state).contains(source)
                             {
                                 return Err(fail());
                             }
@@ -1608,7 +1826,8 @@ impl Function {
                             || !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str())
                             || edge.reason != ExitReason::TypeGuard
                             || snapshot.resume != instruction.point
-                            || !snapshot.values.iter().any(|(_, r)| r == value)
+                            || (!snapshot.values.iter().any(|(_, r)| r == value)
+                                && !snapshot.inline_roots().contains(value))
                         {
                             return Err(fail());
                         }
@@ -1656,9 +1875,10 @@ impl Function {
                             let snapshot = state(edge.state)?;
                             if edge.reason != reason
                                 || snapshot.resume != instruction.point
-                                || [left, right]
-                                    .iter()
-                                    .any(|input| !snapshot.values.iter().any(|(_, r)| r == *input))
+                                || [left, right].iter().any(|input| {
+                                    !snapshot.values.iter().any(|(_, r)| r == *input)
+                                        && !self.inline_roots(edge.state).contains(input)
+                                })
                             {
                                 return Err(fail());
                             }
@@ -1682,6 +1902,7 @@ impl Function {
                                 .values
                                 .iter()
                                 .any(|(_, register)| register == boxed)
+                                && !snapshot.inline_roots().contains(boxed)
                             {
                                 return Err(fail());
                             }
@@ -1707,6 +1928,48 @@ impl Function {
                         effects,
                         ..
                     } => {
+                        if let Helper::TupleReturn(plan) = helper {
+                            let frame = state(*id)?
+                                .inline()
+                                .and_then(|state| state.snapshot.frames.last())
+                                .ok_or(Error::InvalidIr("tuple return without inline frame"))?;
+                            let body = &frame.source.blocks[frame.resume.block.0];
+                            let tuple = body
+                                .instructions
+                                .get(frame.resume.instruction)
+                                .ok_or_else(fail)?;
+                            let hir::Op::Tuple(fields) = &tuple.op else {
+                                return Err(fail());
+                            };
+                            if frame.source.id() != plan.source.id()
+                                || frame.source.revision() != plan.source.revision()
+                                || frame.resume.instruction + 1 != body.instructions.len()
+                                || !matches!(body.terminator, Some(hir::Terminator::Return(value)) if value == tuple.result)
+                                || !(1..=4).contains(&fields.len())
+                                || frame
+                                    .values
+                                    .iter()
+                                    .find(|(value, _)| *value == fields[0])
+                                    .map(|(_, r)| *r)
+                                    != arguments.first().copied()
+                            {
+                                return Err(Error::InvalidIr("invalid scalarized tuple return"));
+                            }
+                        }
+                        if let Helper::Scoped(inner) = helper
+                            && (!matches!(
+                                inner.as_ref(),
+                                Helper::LoadName(_)
+                                    | Helper::ScalarCall(_)
+                                    | Helper::Python(CoreOp::Call(_))
+                            ) || state(*id)?
+                                .inline()
+                                .and_then(|state| state.snapshot.frames.last())
+                                .map(|frame| frame.environment)
+                                != arguments.first().copied())
+                        {
+                            return Err(Error::InvalidIr("invalid scoped runtime context"));
+                        }
                         if !helper.accepts(arguments.len())
                             || matches!(helper, Helper::Python(CoreOp::LoadLocal(slot) | CoreOp::StoreLocal(slot) | CoreOp::CheckLocal(slot)) if *slot >= self.local_count)
                         {
@@ -1714,6 +1977,19 @@ impl Function {
                         }
                         for &arg in arguments {
                             kind(arg, Type::Boxed)?;
+                        }
+                        if let Some((scope, _)) = instruction
+                            .result
+                            .and_then(|result| self.inline_origins.get(&result))
+                            && !state(*id)?.inline().is_some_and(|state| {
+                                state
+                                    .snapshot
+                                    .frames
+                                    .last()
+                                    .is_some_and(|frame| frame.scope == *scope)
+                            })
+                        {
+                            return Err(Error::InvalidIr("missing inline helper state"));
                         }
                         let snapshot = state(*id)?;
                         if snapshot.resume != instruction.point {
@@ -1723,11 +1999,11 @@ impl Function {
                             .values
                             .iter()
                             .map(|(_, r)| *r)
+                            .chain(self.inline_roots(*id).iter().copied())
                             .collect::<BTreeSet<_>>();
                         if arguments
                             .iter()
                             .any(|argument| !required.contains(argument))
-                            || !snapshot.environment_root
                             || roots.iter().copied().collect::<BTreeSet<_>>()
                                 != if effects.needs_safepoint() {
                                     required
@@ -1787,9 +2063,86 @@ impl Function {
                 }
             }
         }
+        if self.shadow_slots > self.registers.len()
+            || (self.shadow_slots != 0 && self.shadow_slots < self.hir_values.len())
+        {
+            return Err(Error::InvalidIr("inline shadow register layout"));
+        }
+        for &register in &self.scoped_results {
+            kind(register, Type::Boxed)?;
+            if self.shadow_slots == 0 || register.0 >= self.shadow_slots {
+                return Err(Error::InvalidIr("inline boxed result storage"));
+            }
+            if !self.inline_scopes.iter().any(|scope| {
+                scope.registers.contains(&register.0) || scope.destination.0 == register.0
+            }) {
+                return Err(Error::InvalidIr("unowned inline register"));
+            }
+        }
+        let mut scope_ids = BTreeSet::new();
+        for scope in &self.inline_scopes {
+            scope.source.analyze()?;
+            if scope.id.0 == 0
+                || !scope_ids.insert(scope.id)
+                || scope.registers.start < self.hir_values.len()
+                || scope.registers.end > self.shadow_slots
+                || scope.registers.start >= scope.registers.end
+                || scope.destination.0 >= self.hir_values.len()
+            {
+                return Err(Error::InvalidIr("invalid inline scope layout"));
+            }
+        }
+        for (register, (scope, value)) in &self.inline_origins {
+            if !self.scoped_results.contains(register)
+                || !self
+                    .inline_scopes
+                    .iter()
+                    .any(|source| source.id == *scope && value.0 < source.source.value_count)
+            {
+                return Err(Error::InvalidIr("invalid scoped HIR origin"));
+            }
+        }
+        let primitives = self.primitive_registers();
+        for (index, frame) in self.states.iter().enumerate() {
+            let id = StateId(index);
+            let Some(state) = frame.inline() else {
+                continue;
+            };
+            let inline = &state.snapshot;
+            inline.verify(&self.registers)?;
+            let outer = &inline.frames[0].source;
+            let inner = &inline.frames[inline.frames.len() - 1];
+            if outer.id() != self.source
+                || outer.revision() != self.revision
+                || !self.inline_scopes.iter().any(|scope| {
+                    scope.id == inner.scope
+                        && scope.source.id() == inner.source.id()
+                        && scope.source.revision() == inner.source.revision()
+                })
+            {
+                return Err(Error::InvalidIr("unknown inline frame scope"));
+            }
+            if self.inline_roots(id) != inline.roots(&self.registers)? {
+                return Err(Error::InvalidIr("inline root recipe mismatch"));
+            }
+            let expected_gc: Vec<_> = state
+                .roots
+                .iter()
+                .copied()
+                .filter(|register| !primitives.contains(register))
+                .collect();
+            if state.gc_roots != expected_gc {
+                return Err(Error::InvalidIr("inline GC roots"));
+            }
+            for register in self.inline_roots(id) {
+                kind(*register, Type::Boxed)?;
+                if register.0 >= self.shadow_slots {
+                    return Err(Error::InvalidIr("inline shadow root bounds"));
+                }
+            }
+        }
         for snapshot in &self.states {
             if snapshot.resume.block.0 >= self.blocks.len()
-                || !snapshot.environment_root
                 || snapshot.local_count != self.local_count
                 || snapshot.local_values.len() != self.local_count
             {
@@ -1943,8 +2296,58 @@ impl Function {
         for (boxed, raw) in self.boxing_recipes() {
             writeln!(text, "materialize {boxed:?} = Float({raw:?})").unwrap();
         }
+        for (register, (scope, value)) in &self.inline_origins {
+            writeln!(
+                text,
+                "origin r{} = scope{}:%{}",
+                register.0, scope.0, value.0
+            )
+            .unwrap();
+        }
+        for (index, origin) in self
+            .block_origins
+            .iter()
+            .enumerate()
+            .filter(|(_, origin)| origin.is_none())
+        {
+            writeln!(&mut text, "synthetic block b{index} origin={origin:?}").unwrap();
+        }
+        for scope in &self.inline_scopes {
+            writeln!(
+                text,
+                "inline scope{} {} {:?}@{} call=b{}:{} result=%{} registers={:?}",
+                scope.id.0,
+                scope.source.name,
+                scope.source.id(),
+                scope.source.revision(),
+                scope.callsite.block.0,
+                scope.callsite.instruction,
+                scope.destination.0,
+                scope.registers
+            )
+            .unwrap();
+        }
+        for (id, frame) in self.states.iter().enumerate() {
+            let Some(state) = frame.inline() else {
+                continue;
+            };
+            writeln!(
+                text,
+                "s{} inline roots={:?} gc={:?}",
+                id, state.roots, state.gc_roots
+            )
+            .unwrap();
+        }
         for (id, exit) in self.exits.iter().enumerate() {
             writeln!(text, "exit{id}: {:?} -> s{}", exit.reason, exit.state.0).unwrap();
+            if let Some(snapshot) = &exit.inline {
+                for frame in &snapshot.frames {
+                    writeln!(text, "  scope{} parent={:?} source={:?}@{} resume=b{}:{} env={:?} slots={:?} locals={:?} pending={:?}",
+                        frame.scope.0, frame.parent, frame.source.id(), frame.source.revision(),
+                        frame.resume.block.0, frame.resume.instruction, frame.environment,
+                        frame.values, frame.locals, frame.pending).unwrap();
+                }
+            }
         }
         for (id, state) in self.states.iter().enumerate() {
             writeln!(
@@ -2130,6 +2533,7 @@ impl Function {
                 if ins
                     .result
                     .is_some_and(|r| self.registers[r.0] == Type::Boxed)
+                    && !self.is_scoped_instruction(ins)
                 {
                     for &input in self.observation_inputs.get(ins.origin.0).ok_or_else(fail)? {
                         check(input, id, index + 1)?;
@@ -2156,6 +2560,9 @@ impl Function {
                 };
                 if let Some(state) = snapshot {
                     for (_, register) in &self.states[state.0].values {
+                        check(*register, id, index + 1)?;
+                    }
+                    for register in self.inline_roots(state) {
                         check(*register, id, index + 1)?;
                     }
                 }
@@ -2194,7 +2601,17 @@ impl Helper {
             ..readonly
         };
         match self {
-            Self::Subtract | Self::Less | Self::Len | Self::LoadName(_) => readonly,
+            Self::Scoped(helper) => helper.effects(),
+            Self::LeafGuard(_)
+            | Self::LeafReceiver
+            | Self::LeafEnvironment
+            | Self::CurrentEnvironment
+            | Self::LeafReturn(_)
+            | Self::TupleReturn(_)
+            | Self::Subtract
+            | Self::Less
+            | Self::Len
+            | Self::LoadName(_) => readonly,
             Self::SetItem | Self::StoreName(_) | Self::SetAttr(_) => writing,
             Self::GetAttr(_) | Self::ScalarCall(_) | Self::InlineCall { .. } => {
                 Effects::CONSERVATIVE
@@ -2234,6 +2651,19 @@ impl Helper {
     }
     fn accepts(&self, count: usize) -> bool {
         match self {
+            Self::Scoped(helper) => {
+                count > 0
+                    && !matches!(helper.as_ref(), Self::Scoped(_))
+                    && helper.accepts(count - 1)
+            }
+            Self::LeafGuard(plan) => {
+                count == plan.source.parameter_names.len() + 1 - usize::from(plan.bound)
+            }
+            Self::LeafReceiver
+            | Self::LeafEnvironment
+            | Self::LeafReturn(_)
+            | Self::TupleReturn(_) => count == 1,
+            Self::CurrentEnvironment => count == 0,
             Self::InlineCall { names, .. } => count == names.len() + 1,
             Self::StringConstant(_) | Self::LoadName(_) => count == 0,
             Self::StoreName(_) | Self::GetAttr(_) => count == 1,
@@ -2276,14 +2706,27 @@ impl Helper {
     }
 }
 
-fn unpack_bundle(hir: &hir::Function, block: usize, index: usize, count: usize) -> bool {
+pub(crate) fn unpack_bundle(hir: &hir::Function, block: usize, index: usize, count: usize) -> bool {
     let body = &hir.blocks[block];
     let result = body.instructions[index].result;
     let Some(end) = (index + 1).checked_add(count) else {
         return false;
     };
-    if body.instructions.get(index+1..end).is_none_or(|items|
-        !items.iter().enumerate().all(|(index,item)|matches!(&item.op,hir::Op::Runtime(CoreOp::UnpackItem(i),inputs) if *i==index && inputs==&[result]))) {return false;}
+    let Some(items) = body.instructions.get(index + 1..end) else {
+        return false;
+    };
+    if !items.iter().enumerate().all(|(index, item)| {
+        matches!(&item.op, hir::Op::Runtime(CoreOp::UnpackItem(i), inputs)
+            if *i == index && inputs == &[result])
+    }) {
+        return false;
+    }
+
+    temporary_uses(hir, result) == Some(count)
+}
+
+/// A compiler temporary cannot expose tuple identity through a named local or closure.
+pub(crate) fn temporary_uses(hir: &hir::Function, result: ValueId) -> Option<usize> {
     let uses = hir
         .blocks
         .iter()
@@ -2312,13 +2755,13 @@ fn unpack_bundle(hir: &hir::Function, block: usize, index: usize, count: usize) 
             uses
         })
         .sum::<usize>();
-    uses == count
-        && !hir
-            .local_states
-            .iter()
-            .flatten()
-            .flatten()
-            .any(|v| *v == Some(result))
+    (!hir
+        .local_states
+        .iter()
+        .flatten()
+        .flatten()
+        .any(|v| *v == Some(result)))
+    .then_some(uses)
 }
 
 impl Function {

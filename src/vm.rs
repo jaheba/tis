@@ -49,6 +49,12 @@ pub struct Vm {
     pub numeric: crate::NumericMode,
     pub capture_native_code: bool,
     pub disable_native_nests: bool,
+    /// Experimental multi-block incorporation; set before collecting feedback or compiling.
+    pub cfg_inlining: bool,
+    /// Experimental closed native recursion; set before compilation.
+    pub readonly_regions: bool,
+    /// Experimental ordered-write regions; set before compilation.
+    pub mutation_regions: bool,
     pub(crate) copy_artifacts: std::collections::BTreeMap<
         (crate::profile::FunctionId, u64),
         Rc<crate::copy_patch::CopyCode>,
@@ -188,6 +194,7 @@ impl Vm {
             },
             0,
             None,
+            None,
         )
     }
 
@@ -200,12 +207,14 @@ impl Vm {
         input: FrameInput<'_>,
         ip: usize,
         block: Option<usize>,
+        pending: Option<crate::inline_frames::PendingResume>,
     ) -> Result<Value> {
         if self.depth >= 256 {
             return Err(Error::Runtime(
                 "RecursionError: maximum recursion depth exceeded".into(),
             ));
         }
+        let fresh = matches!(input, FrameInput::Fresh { .. });
         let base = self.stack.len();
         let local_start = self.local_slots.len();
         let (register_len, local_len) = match &input {
@@ -261,7 +270,15 @@ impl Vm {
         // Runtime calls currently recurse through Rust; grow before entering another frame
         // so the language recursion limit is reached before exhausting the native stack.
         let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            if ip == 0
+            if let Some(pending) = pending {
+                let value = self.resume_inline_frames(pending.frames)?;
+                self.stack[base + pending.continuation.destination.0] = Some(value);
+                for slot in pending.continuation.local_destinations {
+                    self.local_slots[local_start + slot] = Some(value);
+                }
+            }
+            if fresh
+                && ip == 0
                 && let Some(lir) = self.artifact(code.function, code.revision)
             {
                 let outcome = self.execute_tier(
@@ -313,6 +330,55 @@ impl Vm {
     ) -> Result<Value> {
         match outcome {
             crate::tier::Outcome::Return(value) => Ok(value),
+            crate::tier::Outcome::InlineDeopt(mut stack) => {
+                stack.validate(&self.heap)?;
+                let outer = &stack.frames[0].state;
+                if outer.function != code.function
+                    || outer.revision != code.revision
+                    || outer.slots.len() != frame_end - base
+                {
+                    return Err(Error::InvalidIr("inline exit physical caller"));
+                }
+                let roots = self.transient_roots.len();
+                self.transient_roots.extend(stack.roots());
+                let result = (|| {
+                    let outer = stack.frames.remove(0);
+                    self.stack[base..frame_end].copy_from_slice(&outer.state.slots);
+                    *self
+                        .environments
+                        .last_mut()
+                        .ok_or(Error::InvalidIr("inline exit environment"))? =
+                        outer.state.environment;
+                    let locals = self
+                        .local_frames
+                        .last()
+                        .ok_or(Error::InvalidIr("local frame"))?;
+                    let start = locals.start;
+                    if locals.len != outer.state.locals.len() {
+                        return Err(Error::InvalidIr("inline exit physical locals"));
+                    }
+                    self.local_slots[start..start + locals.len]
+                        .copy_from_slice(&outer.state.locals);
+                    if let Some(pending) = outer.pending {
+                        let value = self.resume_inline_frames(stack.frames)?;
+                        self.stack[base + pending.destination.0] = Some(value);
+                        for slot in pending.local_destinations {
+                            self.local_slots[start + slot] = Some(value);
+                        }
+                    }
+                    let ip = code.resume_in(self.bytecode, outer.state.resume)?;
+                    self.execute(
+                        function,
+                        code,
+                        base,
+                        frame_end,
+                        ip,
+                        Some(outer.state.resume.block.0),
+                    )
+                })();
+                self.transient_roots.truncate(roots);
+                result
+            }
             crate::tier::Outcome::Deopt(frame) => {
                 let ip = code.resume_in(self.bytecode, frame.resume)?;
                 self.stack[base..frame_end].copy_from_slice(&frame.slots);
@@ -385,9 +451,57 @@ impl Vm {
             },
             ip,
             Some(frame.resume.block.0),
+            None,
         );
         *function = handle.borrow().clone();
         result
+    }
+
+    /// Resume the innermost logical frame, then install each result in its suspended caller.
+    /// All snapshots are rooted before any resumed frame can collect.
+    pub fn resume_inline_stack(
+        &mut self,
+        stack: crate::inline_frames::DeoptStack,
+    ) -> Result<Value> {
+        stack.validate(&self.heap)?;
+        let roots = self.transient_roots.len();
+        self.transient_roots.extend(stack.roots());
+        let result = self.resume_inline_frames(stack.frames);
+        self.transient_roots.truncate(roots);
+        result
+    }
+
+    fn resume_inline_frames(
+        &mut self,
+        mut frames: Vec<crate::inline_frames::ResumeFrame>,
+    ) -> Result<Value> {
+        if frames.is_empty() {
+            return Err(Error::InvalidIr("empty inline resume"));
+        }
+        let root = frames.remove(0);
+        let mut source = (*root.source).clone();
+        let code = source.shared_bytecode()?;
+        let ip = code.resume_in(self.bytecode, root.state.resume)?;
+        let pending = match root.pending {
+            Some(continuation) => Some(crate::inline_frames::PendingResume {
+                continuation,
+                frames,
+            }),
+            None if frames.is_empty() => None,
+            None => return Err(Error::InvalidIr("missing inline continuation")),
+        };
+        self.execute_window(
+            Rc::new(RefCell::new(source)),
+            code,
+            root.state.environment,
+            FrameInput::Resume {
+                slots: root.state.slots,
+                locals: root.state.locals,
+            },
+            ip,
+            Some(root.state.resume.block.0),
+            pending,
+        )
     }
 
     pub fn collect_garbage(&mut self, external_roots: &[Value]) -> Result<usize> {
@@ -483,7 +597,12 @@ impl Vm {
                 .retired_versions
                 .contains(&(function.id(), function.revision()))
         {
-            match function.lower_lir(crate::lir::LoweringMode::Profiled) {
+            match crate::lir::Function::lower_with_inline(
+                &function,
+                crate::lir::LoweringMode::Profiled,
+                self.profiling.mode == crate::profile::ProfileMode::Staged,
+                self.cfg_inlining,
+            ) {
                 Ok(lir) => {
                     self.artifacts
                         .insert((function.id(), function.revision()), Rc::new(lir));
@@ -976,6 +1095,18 @@ impl Vm {
         } else {
             None
         };
+        // Recursive targets share this profile. Capture their semantic body before borrowing
+        // the caller's feedback mutably, or the plan's profile snapshot cannot be read.
+        let leaf_body =
+            if target.is_some() && self.profiling.mode == crate::profile::ProfileMode::Staged {
+                crate::leaf_inline::Plan::observe(
+                    &self.heap,
+                    read(metadata.inputs[0])?,
+                    self.cfg_inlining,
+                )
+            } else {
+                None
+            };
         let function = function.borrow();
         let mut profile = function.profile.borrow_mut();
         let site = &mut profile.sites[value.0];
@@ -985,6 +1116,9 @@ impl Vm {
             operand.observe(crate::profile::ValueKind::of(&self.heap, read(input)?));
         }
         if let Some(target) = target {
+            if self.profiling.mode == crate::profile::ProfileMode::Staged {
+                site.leaf_body = leaf_body;
+            }
             if site.inline_body.is_none() {
                 site.inline_body =
                     crate::body_inline::Plan::observe(&self.heap, read(metadata.inputs[0])?);
@@ -1117,5 +1251,228 @@ mod tuple_budget_tests {
         vm.heap.allocate(Object::Tuple(vec![]));
         vm.next_collection = usize::MAX;
         assert!(!vm.allocation_fits_without_collection(usize::MAX));
+    }
+}
+
+#[cfg(test)]
+mod leaf_inline_tests {
+    use super::*;
+
+    #[test]
+    fn scalarized_tuple_components_survive_collection_after_return() {
+        for tier in [
+            crate::Tiering::Lir,
+            crate::Tiering::Native,
+            crate::Tiering::CopyPatch,
+        ] {
+            let mut vm = Vm::new();
+            vm.tiering = tier;
+            vm.cfg_inlining = true;
+            vm.thresholds.function_entries = 16;
+            vm.next_collection = usize::MAX;
+            vm.run_program(&mut crate::compile("class Box:\n    def __init__(self):\n        self.a=None\n        self.b=None\ndef pair(holder):\n    first=holder.a\n    second=holder.b\n    holder.a=None\n    holder.b=None\n    return first,second\ndef caller(holder):\n    a,b=pair(holder)\n    garbage=[0]\n    return a,b,garbage\nholder=Box()\nfor i in range(500):\n    holder.a=[i]\n    holder.b=[i]\n    caller(holder)\n").unwrap()).unwrap();
+            let caller = vm.get_global("caller").unwrap();
+            let holder = vm.get_global("holder").unwrap();
+            // Force collection at the caller allocation after the eliminated tuple.
+            for _ in 0..5000 {
+                vm.heap.allocate(Object::Tuple(vec![]));
+            }
+            let a = vm.heap.allocate(Object::List(vec![Value::Int(123)].into()));
+            let b = vm.heap.allocate(Object::List(vec![Value::Int(456)].into()));
+            vm.set_attribute(holder, &"a".to_owned().into(), a).unwrap();
+            vm.set_attribute(holder, &"b".to_owned().into(), b).unwrap();
+            vm.next_collection = vm.heap.allocation_count() + 1;
+            let epoch = vm.heap.collection_epoch();
+            let hits = vm.tier_stats.virtual_tuple_returns;
+            let result = vm.call(caller, &[holder]).unwrap();
+            assert_eq!(vm.tier_stats.virtual_tuple_returns, hits + 1);
+            assert!(vm.heap.collection_epoch() > epoch);
+            assert_eq!(vm.heap.get_item(result, Value::Int(0)).unwrap(), a);
+            assert_eq!(vm.heap.get_item(result, Value::Int(1)).unwrap(), b);
+            assert_eq!(vm.heap.get_item(a, Value::Int(0)).unwrap(), Value::Int(123));
+            assert_eq!(vm.heap.get_item(b, Value::Int(0)).unwrap(), Value::Int(456));
+            assert!(
+                vm.stack.is_empty()
+                    && vm.local_frames.is_empty()
+                    && vm.local_slots.is_empty()
+                    && vm.transient_roots.is_empty()
+            );
+            vm.collect_garbage(&[]).unwrap();
+            assert!(vm.heap.get(a).is_err() && vm.heap.get(b).is_err());
+        }
+    }
+
+    #[test]
+    fn copied_leaves_preserve_the_language_recursion_limit() {
+        for tier in [
+            crate::Tiering::Lir,
+            crate::Tiering::Native,
+            crate::Tiering::CopyPatch,
+        ] {
+            let mut vm = Vm::new();
+            vm.tiering = tier;
+            vm.thresholds.function_entries = 16;
+            vm.run_program(&mut crate::compile("class Box:\n    def __init__(self):\n        self.x=0\n    def leaf(self):\n        self.x+=1\ndef caller(b):\n    return b.leaf()\nb=Box()\nfor i in range(500):\n    caller(b)\n").unwrap()).unwrap();
+            let caller = vm.get_global("caller").unwrap();
+            let b = vm.get_global("b").unwrap();
+            assert!(vm.tier_stats.leaf_body_inlines > 0);
+            vm.depth = 255;
+            assert!(vm.call(caller, &[b]).is_err());
+            assert_eq!(vm.depth, 255);
+            vm.depth = 0;
+            vm.run_program(&mut crate::compile("assert b.x==500\n").unwrap())
+                .unwrap();
+            assert!(vm.stack.is_empty());
+            assert!(vm.local_frames.is_empty());
+            assert!(vm.local_slots.is_empty());
+            assert!(vm.transient_roots.is_empty());
+        }
+    }
+
+    #[test]
+    fn copied_allocations_root_a_value_after_its_last_owner_is_cleared() {
+        for tier in [
+            crate::Tiering::Lir,
+            crate::Tiering::Native,
+            crate::Tiering::CopyPatch,
+        ] {
+            let mut vm = Vm::new();
+            vm.tiering = tier;
+            vm.thresholds.function_entries = 16;
+            vm.next_collection = usize::MAX;
+            vm.run_program(&mut crate::compile("class Box:\n    def __init__(self):\n        self.child=None\ndef leaf(b,x,y):\n    keep=b.child\n    number=x*y\n    b.child=None\n    garbage=[0]\n    return keep,number,garbage\ndef caller(b):\n    return leaf(b,2.0,3.0)\nb=Box()\nfor i in range(500):\n    b.child=[i]\n    caller(b)\n").unwrap()).unwrap();
+            let caller = vm.get_global("caller").unwrap();
+            let b = vm.get_global("b").unwrap();
+            // Cross the collection floor, then collect at the first copied list allocation.
+            for _ in 0..5000 {
+                vm.heap.allocate(Object::Tuple(vec![]));
+            }
+            let child = vm.heap.allocate(Object::List(vec![Value::Int(123)].into()));
+            vm.set_attribute(b, &"child".to_owned().into(), child)
+                .unwrap();
+            vm.next_collection = vm.heap.allocation_count() + 1;
+            let epoch = vm.heap.collection_epoch();
+            let hits = vm.tier_stats.leaf_body_inlines;
+            let result = vm.call(caller, &[b]).unwrap();
+            assert!(vm.tier_stats.leaf_body_inlines > hits);
+            assert!(vm.heap.collection_epoch() > epoch);
+            assert_eq!(vm.heap.get_item(result, Value::Int(0)).unwrap(), child);
+            assert_eq!(
+                vm.heap.get_item(child, Value::Int(0)).unwrap(),
+                Value::Int(123)
+            );
+            assert_eq!(
+                vm.heap.get_item(result, Value::Int(1)).unwrap(),
+                Value::Float(6.0)
+            );
+            assert!(vm.stack.is_empty());
+            assert!(vm.local_frames.is_empty());
+            assert!(vm.local_slots.is_empty());
+            assert!(vm.transient_roots.is_empty());
+            vm.collect_garbage(&[]).unwrap();
+            assert!(vm.heap.get(child).is_err());
+        }
+    }
+    #[test]
+    fn copied_float_phis_and_detached_references_survive_a_callee_collection() {
+        for tier in [
+            crate::Tiering::Lir,
+            crate::Tiering::Native,
+            crate::Tiering::CopyPatch,
+        ] {
+            let mut vm = Vm::new();
+            vm.tiering = tier;
+            vm.cfg_inlining = true;
+            vm.thresholds.function_entries = 16;
+            vm.next_collection = usize::MAX;
+            vm.run_program(&mut crate::compile("class Box:\n    def __init__(self):\n        self.child=None\ndef leaf(b,flag,x):\n    keep=b.child\n    if flag:\n        v=x*2.0\n    else:\n        v=x/2.0\n    b.child=None\n    temporary=[v]\n    return keep,v,temporary\ndef caller(b,flag):\n    return leaf(b,flag,4.0)\nb=Box()\nfor i in range(500):\n    b.child=[i]\n    caller(b,i%2==0)\n").unwrap()).unwrap();
+            let caller = vm.get_global("caller").unwrap();
+            let b = vm.get_global("b").unwrap();
+            for flag in [false, true] {
+                for _ in 0..5000 {
+                    vm.heap.allocate(Object::Tuple(vec![]));
+                }
+                let child = vm.heap.allocate(Object::List(vec![Value::Int(123)].into()));
+                vm.set_attribute(b, &"child".to_owned().into(), child)
+                    .unwrap();
+                vm.next_collection = vm.heap.allocation_count() + 1;
+                let epoch = vm.heap.collection_epoch();
+                let hits = vm.tier_stats.leaf_body_inlines;
+                let result = vm.call(caller, &[b, Value::Bool(flag)]).unwrap();
+                assert!(vm.tier_stats.leaf_body_inlines > hits);
+                assert!(vm.heap.collection_epoch() > epoch, "{tier:?}");
+                assert_eq!(vm.heap.get_item(result, Value::Int(0)).unwrap(), child);
+                assert_eq!(
+                    vm.heap.get_item(child, Value::Int(0)).unwrap(),
+                    Value::Int(123)
+                );
+                let expected = Value::Float(if flag { 8.0 } else { 2.0 });
+                assert_eq!(vm.heap.get_item(result, Value::Int(1)).unwrap(), expected);
+                let temporary = vm.heap.get_item(result, Value::Int(2)).unwrap();
+                assert_eq!(
+                    vm.heap.get_item(temporary, Value::Int(0)).unwrap(),
+                    expected
+                );
+                assert!(vm.stack.is_empty());
+                assert!(vm.local_frames.is_empty());
+                assert!(vm.local_slots.is_empty());
+                assert!(vm.transient_roots.is_empty());
+                vm.collect_garbage(&[]).unwrap();
+                assert!(vm.heap.get(child).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mutation_region_tests {
+    use super::*;
+
+    #[test]
+    fn a_detached_receiver_survives_collection_after_a_committed_prefix() {
+        for bytecode in [crate::BytecodeMode::Stack, crate::BytecodeMode::Register] {
+            let mut vm = Vm::new();
+            vm.tiering = crate::Tiering::Native;
+            vm.mutation_regions = true;
+            vm.bytecode = bytecode;
+            vm.thresholds.function_entries = 16;
+            vm.next_collection = usize::MAX;
+            vm.run_program(&mut crate::compile("class Inner:\n    def __init__(self):\n        self.append=1.0\nclass Box:\n    def __init__(self):\n        self.child=Inner()\n        self.result=0.0\n        self.count=0.0\n    def step(self):\n        saved=self.child\n        self.count+=1.0\n        self.child=0\n        self.result=saved.append\nbox=Box()\nbound=box.step\nfor i in range(500):\n    box.child=Inner()\n    bound()\n").unwrap()).unwrap();
+            assert!(vm.tier_stats.mutation_entries > 0);
+            let boxed = vm.get_global("box").unwrap();
+            let bound = vm.get_global("bound").unwrap();
+            for _ in 0..5000 {
+                vm.heap.allocate(Object::Tuple(vec![]));
+            }
+            let child = vm.heap.allocate(Object::List(vec![Value::Int(123)].into()));
+            vm.set_attribute(boxed, &"child".to_owned().into(), child)
+                .unwrap();
+            // Entry stays below the threshold. The failing list-method read allocates a bound
+            // method and collects after the native prefix detached the only heap owner.
+            vm.next_collection = vm.heap.allocation_count() + 1;
+            let exits = vm.tier_stats.mutation_guard_exits;
+            let epoch = vm.heap.collection_epoch();
+            vm.call(bound, &[]).unwrap();
+            assert_eq!(vm.tier_stats.mutation_guard_exits, exits + 1);
+            assert!(vm.heap.collection_epoch() > epoch);
+            vm.run_program(
+                &mut crate::compile(
+                    "assert box.count==501.0\nassert box.child==0\nbox.result(9)\n",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(vm.heap.len(child).unwrap(), 2);
+            assert!(
+                vm.stack.is_empty()
+                    && vm.local_frames.is_empty()
+                    && vm.local_slots.is_empty()
+                    && vm.transient_roots.is_empty()
+            );
+            vm.run_program(&mut crate::compile("box.result=0\n").unwrap())
+                .unwrap();
+            vm.collect_garbage(&[]).unwrap();
+            assert!(vm.heap.get(child).is_err());
+        }
     }
 }

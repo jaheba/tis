@@ -52,24 +52,26 @@ def main():
     parser.add_argument('--python', type=Path, default=Path(sys.executable))
     parser.add_argument('--pypy', type=Path)
     parser.add_argument('--output', type=Path)
-    parser.add_argument('--samples', type=int, default=10)
-    parser.add_argument('--warmups', type=int, default=2)
+    parser.add_argument('--samples', type=int, default=3)
+    parser.add_argument('--warmups', type=int, default=1)
     parser.add_argument('--benchmarks', nargs='+', choices=FIXTURES, default=list(FIXTURES))
     parser.add_argument('--tiers', nargs='+', choices=['bytecode', 'lir', 'native', 'copy-patch'],
                         default=['bytecode', 'native'])
+    parser.add_argument('--mutation-regions', action='store_true')
+    parser.add_argument('--readonly-regions', action='store_true')
     parser.add_argument('--python-worker', choices=FIXTURES)
     args = parser.parse_args()
     if args.python_worker:
         python_worker(args.python_worker, args.warmups)
         return
-    if not args.worker or not args.output or args.samples < 10 or args.warmups < 2:
-        parser.error('provide --worker and --output, at least ten samples and two warmups')
+    if not args.worker or not args.output or args.samples < 1 or args.warmups < 1:
+        parser.error('provide --worker and --output, at least one sample and one warmup')
     args.output.mkdir(parents=True, exist_ok=False)
     binaries = {'tis': args.worker.resolve(), 'cpython': args.python.resolve()}
     if args.pypy:
         binaries['pypy'] = args.pypy.resolve()
     results = dict(timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                   platform=platform.platform(), samples=args.samples, warmups=args.warmups,
+                   platform=platform.platform(), samples=args.samples, warmups=args.warmups, readonly_regions=args.readonly_regions, mutation_regions=args.mutation_regions,
                    binaries={k: dict(path=str(v), sha256=digest(v)) for k, v in binaries.items()},
                    seed=20261028,
                    runner_sha256=digest(Path(__file__).resolve()),
@@ -90,6 +92,10 @@ def main():
                 if mode in args.tiers:
                     command = [str(binaries['tis']), benchmark, '--tier', mode,
                                '--warmups', str(args.warmups)]
+                    if args.mutation_regions:
+                        command += ['--mutation-regions']
+                    if args.readonly_regions:
+                        command += ['--readonly-regions']
                 else:
                     command = [str(binaries[mode]), str(Path(__file__).resolve()),
                                '--python-worker', benchmark, '--warmups', str(args.warmups)]

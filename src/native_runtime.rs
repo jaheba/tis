@@ -126,7 +126,7 @@ pub(crate) fn execute(
         let mut entry_failure = None;
         if let Some(exit) = lir.scalar_entries.get(&crate::hir::BlockId(start)) {
             let state = &lir.states[lir.exits[exit.0].state.0];
-            for (raw, source) in &lir.scalar_sources {
+            for (raw, source) in lir.scalar_imports() {
                 if !state.values.iter().any(|(_, r)| r == source) {
                     continue;
                 }
@@ -196,6 +196,11 @@ pub(crate) fn execute(
                     None => usize::try_from(status.wrapping_sub(1)).map_err(error)?,
                 })
                 .ok_or(Error::InvalidIr("native exit status"))?;
+            if let Some(snapshot) = &exit.inline {
+                let stack = snapshot.reconstruct(&lir.registers, |r| registers[r.0].value())?;
+                vm.mark_inline_deoptimization(function, &stack, exit.reason);
+                return Ok(Outcome::InlineDeopt(stack));
+            }
             let environment = *vm
                 .environments
                 .last()
@@ -324,7 +329,24 @@ pub(crate) extern "C" fn field_callback(
     }
 }
 
+pub(crate) extern "C" fn callback_no_inline(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    event: i32,
+    location: i32,
+) -> i32 {
+    callback_impl::<false>(raw, registers, event, location)
+}
 pub(crate) extern "C" fn callback(
+    raw: *mut c_void,
+    registers: *mut Slot,
+    event: i32,
+    location: i32,
+) -> i32 {
+    callback_impl::<true>(raw, registers, event, location)
+}
+#[inline(always)]
+fn callback_impl<const SCOPED: bool>(
     raw: *mut c_void,
     registers: *mut Slot,
     event: i32,
@@ -353,7 +375,7 @@ pub(crate) extern "C" fn callback(
     );
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         context.flush_region()?;
-        context.step(registers, event, location)
+        context.step::<SCOPED>(registers, event, location)
     }));
     match result {
         Ok(Ok(())) => i32::from(context.side_exit.is_some()),
@@ -479,9 +501,15 @@ pub(crate) extern "C" fn guarded_helper_callback(
             unsafe { std::slice::from_raw_parts_mut(registers, context.lir.registers.len() + 1) };
         // SAFETY: only this gateway temporarily reborrows the suspended caller's exclusive VM.
         let vm = unsafe { &mut *context.vm };
-        let value = match (event, helper) {
+        let (probe_helper, probe_arguments) = match helper {
+            lir::Helper::Scoped(inner) if matches!(inner.as_ref(), lir::Helper::ScalarCall(_)) => {
+                (inner.as_ref(), &arguments[1..])
+            }
+            _ => (helper, arguments.as_slice()),
+        };
+        let value = match (event, probe_helper) {
             (SCALAR_CALL, lir::Helper::ScalarCall(builtin)) => {
-                let [callee, argument] = arguments.as_slice() else {
+                let [callee, argument] = probe_arguments else {
                     return Err(Error::InvalidIr("scalar call operands"));
                 };
                 let Some(value) = vm.try_scalar_call(
@@ -523,6 +551,15 @@ pub(crate) extern "C" fn guarded_helper_callback(
     match result {
         Ok(Ok(hit)) => i32::from(!hit),
         Ok(Err(error)) => {
+            if let Some(&(block, index)) = context.locations.get(location as usize)
+                && let Operation::Call { state, .. } =
+                    context.lir.blocks[block].instructions[index].operation
+            {
+                // SAFETY: generated code is suspended and the failed closed probe released its VM borrow.
+                unsafe {
+                    (&*context.vm).record_inline_error(context.lir, state);
+                }
+            }
             context.error = Some(error);
             -1
         }
@@ -862,9 +899,78 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn step(&mut self, registers: *mut Slot, event: i32, location: i32) -> Result<()> {
+    fn step<const SCOPED: bool>(
+        &mut self,
+        registers: *mut Slot,
+        event: i32,
+        location: i32,
+    ) -> Result<()> {
         if registers != self.registers {
             return Err(Error::InvalidIr("native register buffer changed"));
+        }
+        if event == LEAF_ENTER {
+            let &(block, index) = self
+                .locations
+                .get(location as usize)
+                .ok_or(Error::InvalidIr("native leaf location"))?;
+            let body = &self.lir.blocks[block].instructions;
+            let end = crate::leaf_inline::bootstrap_end(body, index)
+                .ok_or(Error::InvalidIr("native leaf bootstrap"))?;
+            let guard = body[index]
+                .result
+                .ok_or(Error::InvalidIr("native leaf guard"))?;
+            // Quiet setup cannot allocate, collect, or invoke Python. It shares the ordinary
+            // helper semantics but publishes all results in one suspended native invocation.
+            if !self.collecting {
+                // SAFETY: Entry owns this fixed image and exclusively suspends its VM borrow.
+                let slots = unsafe {
+                    std::slice::from_raw_parts_mut(registers, self.lir.registers.len() + 1)
+                };
+                let vm = unsafe { &mut *self.vm };
+                vm.tier_stats.native_leaf_entry_batches += 1;
+                if !self.views.descriptors.is_empty() {
+                    self.views.floats_dirty = true;
+                }
+                for offset in std::iter::once(0).chain(2..=end - index) {
+                    let instruction = &body[index + offset];
+                    let Operation::Call {
+                        helper, arguments, ..
+                    } = &instruction.operation
+                    else {
+                        return Err(Error::InvalidIr("native leaf setup"));
+                    };
+                    self.helper_arguments.clear();
+                    for argument in arguments {
+                        self.helper_arguments.push(slots[argument.0].value()?);
+                    }
+                    let value = vm.lir_helper(helper, &self.helper_arguments)?;
+                    let result = instruction
+                        .result
+                        .ok_or(Error::InvalidIr("native leaf setup result"))?;
+                    slots[result.0] = Slot::boxed(value);
+                    if vm.stack[self.base + result.0].is_none() {
+                        self.rooted.push(result.0);
+                    }
+                    vm.stack[self.base + result.0] = Some(value);
+                    if offset == 0 && !matches!(value, Value::Int(_)) {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+            self.step::<SCOPED>(registers, HELPER, location)?;
+            // SAFETY: Entry supplied this fixed register image and the completed helper has
+            // released its borrow. Read only the verified guard destination before continuing.
+            let passed = unsafe { (*registers.add(guard.0)).value()? };
+            if matches!(passed, Value::Int(_)) {
+                for offset in 2..=end - index {
+                    let next = location
+                        .checked_add(i32::try_from(offset).map_err(error)?)
+                        .ok_or(Error::IntegerOverflow)?;
+                    self.step::<SCOPED>(registers, HELPER, next)?;
+                }
+            }
+            return Ok(());
         }
         if event == SEQUENCE || event == UNPACK_BATCH {
             self.views.floats_dirty = true;
@@ -884,7 +990,7 @@ impl Context<'_> {
                 let location = location
                     .checked_add(i32::try_from(offset).map_err(error)?)
                     .ok_or(Error::IntegerOverflow)?;
-                self.step(registers, SEQUENCE, location)?;
+                self.step::<SCOPED>(registers, SEQUENCE, location)?;
                 if self.side_exit.is_some() {
                     break;
                 }
@@ -911,18 +1017,20 @@ impl Context<'_> {
                     vm.stack[self.base + parameter.0] = Some(value);
                 }
             }
-            if self.skip_probe {
-                self.skip_probe = false;
-            } else {
-                vm.record_block(
-                    self.function,
-                    self.code,
-                    location as usize,
-                    (self.previous != usize::MAX).then_some(self.previous),
-                )?;
+            if let Some(origin) = self.lir.block_origins[location as usize] {
+                if self.skip_probe {
+                    self.skip_probe = false;
+                } else {
+                    vm.record_block(
+                        self.function,
+                        self.code,
+                        origin.0,
+                        (self.previous != usize::MAX).then_some(self.previous),
+                    )?;
+                }
+                self.collecting = vm.collecting(self.function);
+                self.previous = origin.0;
             }
-            self.collecting = vm.collecting(self.function);
-            self.previous = location as usize;
             return Ok(());
         }
         let &(block, index) = self
@@ -930,6 +1038,7 @@ impl Context<'_> {
             .get(location as usize)
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
+        let scoped = || SCOPED && self.lir.is_scoped_instruction(instruction);
         if event == HELPER
             && let Operation::NumberCompare {
                 value,
@@ -961,7 +1070,7 @@ impl Context<'_> {
                 overflow,
             } = instruction.operation
         {
-            let observed = self.collecting && {
+            let observed = self.collecting && !scoped() && {
                 vm.tier_stats.native_feedback_probes += 1;
                 vm.observe_site_with(self.function, self.code, instruction.origin, |r| {
                     registers[r.0].value()
@@ -1054,7 +1163,7 @@ impl Context<'_> {
                 self.side_exit = Some(failure);
                 return Ok(());
             };
-            let observed = self.collecting && {
+            let observed = self.collecting && !scoped() && {
                 vm.tier_stats.native_feedback_probes += 1;
                 vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                     registers[v.0].value()
@@ -1119,7 +1228,7 @@ impl Context<'_> {
             checkpoint = effects.needs_safepoint();
             if checkpoint {
                 vm.tier_stats.native_root_syncs += 1;
-                vm.sync_lir_roots(
+                vm.sync_lir_roots::<SCOPED>(
                     &self.root_states.unwrap_or(&self.lir.states)[state.0],
                     roots,
                     self.base,
@@ -1135,7 +1244,7 @@ impl Context<'_> {
                     for r in arguments {
                         self.helper_arguments.push(registers[r.0].value()?);
                     }
-                    observed = self.collecting && {
+                    observed = self.collecting && !scoped() && {
                         vm.tier_stats.native_feedback_probes += 1;
                         vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                             registers[v.0].value()
@@ -1146,6 +1255,9 @@ impl Context<'_> {
                         vm.transient_roots.extend_from_slice(&self.helper_arguments);
                     }
                     let result = vm.lir_helper(helper, &self.helper_arguments);
+                    if SCOPED && result.is_err() {
+                        vm.record_inline_error(self.lir, state);
+                    }
                     vm.transient_roots.truncate(roots);
                     // A recursive call can reopen this function's observation window.
                     if effects.may_call {
@@ -1169,7 +1281,7 @@ impl Context<'_> {
         if let Some(result) = instruction.result
             && self.lir.registers[result.0] == lir::Type::Boxed
         {
-            if event == FINISH && self.collecting {
+            if event == FINISH && self.collecting && !scoped() {
                 vm.tier_stats.native_feedback_probes += 1;
                 observed =
                     vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
@@ -1185,7 +1297,7 @@ impl Context<'_> {
                 instruction.operation,
                 Operation::BoxInt(_) | Operation::BoxFloat(_) | Operation::BoxBool(_)
             );
-            if observed || scalar {
+            if (observed || scalar) && !scoped() {
                 let function = self.function.borrow();
                 let mut profile = function.profile.borrow_mut();
                 let site = &mut profile.sites[instruction.origin.0];

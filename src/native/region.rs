@@ -22,7 +22,10 @@ impl Emitter<'_, '_> {
         self.scalars.materialize(
             self.b,
             self.registers,
-            state_values(&self.lir.states[self.lir.exits[exit.0].state.0]),
+            state_values(
+                &self.lir.states[self.lir.exits[exit.0].state.0],
+                self.lir.inline_roots(self.lir.exits[exit.0].state),
+            ),
         )?;
         let status = self.b.ins().iconst(types::I64, exit.0 as i64 + 1);
         self.b.ins().return_(&[status]);

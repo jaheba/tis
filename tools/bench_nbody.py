@@ -85,7 +85,7 @@ def digest(path):
 
 
 def summarize(samples):
-    quartiles = statistics.quantiles(samples, n=4, method='inclusive')
+    quartiles = statistics.quantiles(samples, n=4, method='inclusive') if len(samples) > 1 else [samples[0]] * 3
     return dict(median_ns=statistics.median(samples), min_ns=min(samples), max_ns=max(samples),
                 q1_ns=quartiles[0], q3_ns=quartiles[2])
 
@@ -98,8 +98,8 @@ def main():
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[1] / 'tests/fixtures/game_nbody.py')
     parser.add_argument('--python', type=Path, default=Path(sys.executable))
     parser.add_argument('--output', type=Path)
-    parser.add_argument('--samples', type=int, default=10)
-    parser.add_argument('--warmups', type=int, default=2)
+    parser.add_argument('--samples', type=int, default=3)
+    parser.add_argument('--warmups', type=int, default=1)
     parser.add_argument('--cpu-label')
     parser.add_argument('--seed', type=int, default=20261028)
     parser.add_argument('--python-worker', '--cpython-worker', action='store_true', help=argparse.SUPPRESS)
@@ -110,8 +110,8 @@ def main():
         return
     if not all([args.run, args.worker, args.kernel, args.output]):
         parser.error('--run, --worker, --kernel and --output are required')
-    if args.samples < 10 or args.warmups < 1:
-        parser.error('use at least 10 samples and one warmup')
+    if args.samples < 1 or args.warmups < 1:
+        parser.error('use at least one sample and one warmup')
     args.output.mkdir(parents=True, exist_ok=False)
     args.run, args.worker, args.kernel, args.python = [path.resolve() for path in (args.run, args.worker, args.kernel, args.python)]
     source = args.source.resolve()

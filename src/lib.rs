@@ -2,12 +2,15 @@
 
 mod bindings;
 mod body_inline;
+pub mod inline_frames;
+mod leaf_inline;
 mod shape;
 pub use bindings::Name;
 pub use shape::{Attribute, Attributes, Shape};
 pub mod bytecode;
 mod dict;
 mod error;
+mod json;
 pub use dict::Dict;
 mod execution;
 pub mod frontend;

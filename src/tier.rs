@@ -19,6 +19,15 @@ pub enum Tiering {
 }
 #[derive(Debug, Clone, Default)]
 pub struct TierStats {
+    pub mutation_entries: u64,
+    pub mutation_writes: u64,
+    pub mutation_guard_exits: u64,
+    pub mutation_cold_misses: u64,
+    pub readonly_entries: u64,
+    pub readonly_misses: u64,
+    pub leaf_body_inlines: u64,
+    pub virtual_tuple_returns: u64,
+    pub native_leaf_entry_batches: u64,
     pub numeric_specializations: u64,
     pub numeric_fast_paths: u64,
     pub numeric_type_misses: u64,
@@ -106,12 +115,18 @@ impl Datum {
 pub(crate) enum Outcome {
     Return(Value),
     Deopt(lir::DeoptFrame),
+    InlineDeopt(crate::inline_frames::DeoptStack),
 }
 
 impl Vm {
     /// Explicit compilation also permits recompilation after an artifact was retired by a guard failure.
     pub fn compile_lir(&mut self, function: &Function) -> Result<()> {
-        let lir = function.lower_lir(lir::LoweringMode::Profiled)?;
+        let lir = lir::Function::lower_with_inline(
+            function,
+            lir::LoweringMode::Profiled,
+            self.profiling.mode == crate::profile::ProfileMode::Staged,
+            self.cfg_inlining,
+        )?;
         self.install_lir(function, lir)
     }
     pub fn install_lir(&mut self, function: &Function, lir: lir::Function) -> Result<()> {
@@ -133,6 +148,7 @@ impl Vm {
             for instruction in &block.instructions {
                 if let Some(result) = instruction.result
                     && lir.registers[result.0] == lir::Type::Boxed
+                    && !lir.scoped_results.contains(&result)
                     && (result.0 >= function.value_count || result.0 != instruction.origin.0)
                 {
                     return Err(Error::InvalidIr("invalid boxed LIR result"));
@@ -181,7 +197,7 @@ impl Vm {
         }
         if let Some(exit) = lir.scalar_entries.get(&start) {
             let state = &lir.states[lir.exits[exit.0].state.0];
-            for (raw, source) in &lir.scalar_sources {
+            for (raw, source) in lir.scalar_imports() {
                 if !state.values.iter().any(|(_, r)| r == source) {
                     continue;
                 }
@@ -206,16 +222,19 @@ impl Vm {
         let mut block = start;
         let mut first = true;
         loop {
-            if !first || !skip_first_probe {
-                self.record_block(function, code, block.0, previous)?;
+            if let Some(origin) = lir.block_origins[block.0] {
+                if !first || !skip_first_probe {
+                    self.record_block(function, code, origin.0, previous)?;
+                }
+                previous = Some(origin.0);
             }
             first = false;
-            previous = Some(block.0);
             let body = lir
                 .blocks
                 .get(block.0)
                 .ok_or(Error::InvalidIr("invalid LIR block"))?;
             for instruction in &body.instructions {
+                let scoped = lir.is_scoped_instruction(instruction);
                 let mut observed = false;
                 let mut checkpoint = false;
                 let result = match &instruction.operation {
@@ -477,14 +496,17 @@ impl Vm {
                             .iter()
                             .map(|&r| read(&registers, r)?.boxed())
                             .collect::<Result<Vec<_>>>()?;
-                        observed =
-                            self.observe_site_with(function, code, instruction.origin, |v| {
+                        observed = !scoped
+                            && self.observe_site_with(function, code, instruction.origin, |v| {
                                 read(&registers, Register(v.0))?.boxed()
                             })?;
                         // Boxed operands remain rooted throughout nested calls; helpers return before the next collection.
                         let roots = self.transient_roots.len();
                         self.transient_roots.extend_from_slice(&args);
                         let result = self.lir_helper(helper, &args);
+                        if result.is_err() {
+                            self.record_inline_error(lir, *state);
+                        }
                         self.transient_roots.truncate(roots);
                         Some(Datum::Boxed(result?))
                     }
@@ -497,7 +519,7 @@ impl Vm {
                         .get_mut(destination.0)
                         .ok_or(Error::InvalidIr("invalid LIR register"))? = Some(result);
                     if let Datum::Boxed(value) = result {
-                        if !matches!(instruction.operation, Operation::Call { .. }) {
+                        if !scoped && !matches!(instruction.operation, Operation::Call { .. }) {
                             observed =
                                 self.observe_site_with(function, code, instruction.origin, |v| {
                                     read(&registers, Register(v.0))?.boxed()
@@ -514,10 +536,14 @@ impl Vm {
                             site.result
                                 .observe(crate::profile::ValueKind::of(&self.heap, value));
                         }
-                        if matches!(
-                            instruction.operation,
-                            Operation::BoxInt(_) | Operation::BoxFloat(_) | Operation::BoxBool(_)
-                        ) {
+                        if !scoped
+                            && matches!(
+                                instruction.operation,
+                                Operation::BoxInt(_)
+                                    | Operation::BoxFloat(_)
+                                    | Operation::BoxBool(_)
+                            )
+                        {
                             site.fast_paths = site.fast_paths.saturating_add(1);
                         }
                     }
@@ -571,13 +597,13 @@ impl Vm {
             .states
             .get(state.0)
             .ok_or(Error::InvalidIr("invalid LIR safepoint"))?;
-        self.sync_lir_roots(state, roots, base, rooted, |register| {
+        self.sync_lir_roots::<true>(state, roots, base, rooted, |register| {
             registers[register.0]
                 .ok_or(Error::InvalidIr("missing safepoint value"))?
                 .boxed()
         })
     }
-    pub(crate) fn sync_lir_roots(
+    pub(crate) fn sync_lir_roots<const SCOPED: bool>(
         &mut self,
         state: &lir::FrameState,
         roots: &[Register],
@@ -603,6 +629,18 @@ impl Vm {
                 self.stack[base + value.0] = Some(root);
             }
         }
+        if SCOPED {
+            for register in state.inline_gc_roots() {
+                let root = read(*register)?;
+                if matches!(root, Value::Ref(_)) {
+                    let slot = base + register.0;
+                    if self.stack[slot].is_none() {
+                        rooted.push(register.0);
+                    }
+                    self.stack[slot] = Some(root);
+                }
+            }
+        }
         Ok(())
     }
     fn lir_exit(
@@ -613,6 +651,15 @@ impl Vm {
         registers: &[Option<Datum>],
     ) -> Result<Outcome> {
         let exit = &lir.exits[exit.0];
+        if let Some(snapshot) = &exit.inline {
+            let stack = snapshot.reconstruct(&lir.registers, |r| {
+                registers[r.0]
+                    .ok_or(Error::InvalidIr("missing inline exit value"))?
+                    .boxed()
+            })?;
+            self.mark_inline_deoptimization(function, &stack, exit.reason);
+            return Ok(Outcome::InlineDeopt(stack));
+        }
         let environment = *self
             .environments
             .last()
@@ -624,6 +671,51 @@ impl Vm {
         })?;
         self.mark_deoptimization(function, &frame, exit.reason);
         Ok(Outcome::Deopt(frame))
+    }
+    pub(crate) fn mark_inline_deoptimization(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        stack: &crate::inline_frames::DeoptStack,
+        reason: lir::ExitReason,
+    ) {
+        let outer = &stack.frames[0];
+        let mut caller = outer.state.clone();
+        // The caller is suspended after its call. Attribute the retired artifact to
+        // that call site, rather than the unrelated operation following its return.
+        if let Some(pending) = &outer.pending {
+            caller.resume.instruction = pending.resume.instruction - 1;
+        }
+        self.mark_deoptimization(function, &caller, reason);
+        if stack.frames.len() > 1 {
+            let inner = stack.frames.last().unwrap();
+            let point = inner.state.resume;
+            if let Some(instruction) = inner.source.blocks[point.block.0]
+                .instructions
+                .get(point.instruction)
+            {
+                let mut profile = inner.source.profile.borrow_mut();
+                profile
+                    .sites
+                    .resize_with(inner.source.value_count, Default::default);
+                profile.deoptimizations = profile.deoptimizations.saturating_add(1);
+                if self.profiling.mode == crate::profile::ProfileMode::Staged {
+                    profile.start_window(self.profiling);
+                }
+                let site = &mut profile.sites[instruction.result.0];
+                site.executions = site.executions.saturating_add(1);
+                let inputs = instruction.op.inputs();
+                site.operands.resize_with(inputs.len(), Default::default);
+                for (operand, input) in site.operands.iter_mut().zip(inputs) {
+                    if let Some(Some(value)) = inner.state.slots.get(input.0) {
+                        operand.observe(crate::profile::ValueKind::of(&self.heap, *value));
+                    }
+                }
+                site.deoptimizations = site.deoptimizations.saturating_add(1);
+                site.guard_failures = site.guard_failures.saturating_add(1);
+                let count = site.exit_reasons.entry(reason).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
     }
     pub(crate) fn mark_deoptimization(
         &mut self,
@@ -668,8 +760,71 @@ impl Vm {
             }
         }
     }
+    pub(crate) fn record_inline_error(&self, lir: &lir::Function, id: lir::StateId) {
+        if let Some(state) = lir.states[id.0].inline() {
+            let inner = state.snapshot.frames.last().unwrap();
+            let mut profile = inner.source.profile.borrow_mut();
+            profile.errors = profile.errors.saturating_add(1);
+            profile.advance(self.profiling);
+        }
+    }
+
     pub(crate) fn lir_helper(&mut self, helper: &Helper, args: &[Value]) -> Result<Value> {
         Ok(match helper {
+            Helper::Scoped(helper) => {
+                if self.depth >= 256 {
+                    return Err(Error::Runtime(
+                        "RecursionError: maximum recursion depth exceeded".into(),
+                    ));
+                }
+                self.environments.push(args[0]);
+                self.depth += 1;
+                let result = self.lir_helper(helper, &args[1..]);
+                self.depth -= 1;
+                self.environments.pop();
+                result?
+            }
+            Helper::LeafGuard(plan) => {
+                if self.depth < 256 && plan.matches(&self.heap, args) {
+                    self.tier_stats.leaf_body_inlines += 1;
+                    if let Some(profile) = plan.live_profile.upgrade() {
+                        let mut profile = profile.borrow_mut();
+                        profile.entries = profile.entries.saturating_add(1);
+                    }
+                    Value::Int(0)
+                } else {
+                    Value::None
+                }
+            }
+            Helper::LeafReceiver => match self.heap.get(args[0])? {
+                Object::Method(_, receiver) => *receiver,
+                _ => return Err(Error::InvalidIr("inline bound receiver")),
+            },
+            Helper::LeafEnvironment => {
+                let target = match self.heap.get(args[0])? {
+                    Object::Method(function, _) => *function,
+                    _ => args[0],
+                };
+                match self.heap.get(target)? {
+                    Object::Function(closure) => closure.environment,
+                    _ => return Err(Error::InvalidIr("inline closure environment")),
+                }
+            }
+            Helper::CurrentEnvironment => *self
+                .environments
+                .last()
+                .ok_or(Error::InvalidIr("inline caller environment"))?,
+            Helper::LeafReturn(plan) | Helper::TupleReturn(plan) => {
+                if matches!(helper, Helper::TupleReturn(_)) {
+                    self.tier_stats.virtual_tuple_returns += 1;
+                }
+                if let Some(profile) = plan.live_profile.upgrade() {
+                    let mut profile = profile.borrow_mut();
+                    profile.returns = profile.returns.saturating_add(1);
+                    profile.advance(self.profiling);
+                }
+                args[0]
+            }
             Helper::InlineCall { .. } => self.call_from_registers(args[0], &args[1..])?,
             Helper::GetAttr(attribute) => self.get_attribute(args[0], attribute)?,
             Helper::SetAttr(attribute) => self.set_attribute(args[0], attribute, args[1])?,
@@ -714,8 +869,32 @@ impl Vm {
 }
 
 impl Vm {
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_tier(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        lir: Rc<lir::Function>,
+        base: usize,
+        frame_end: usize,
+        start: BlockId,
+        osr: bool,
+    ) -> Result<Outcome> {
+        if lir.shadow_slots == 0 {
+            return self.execute_tier_inner(function, code, lir, base, frame_end, start, osr);
+        }
+        let length = self.stack.len();
+        if lir.shadow_slots > frame_end - base {
+            self.stack.resize(base + lir.shadow_slots, None);
+        }
+        let result = self.execute_tier_inner(function, code, lir, base, frame_end, start, osr);
+        self.stack.truncate(length);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_tier_inner(
         &mut self,
         function: &Rc<RefCell<Function>>,
         code: &Code,
@@ -798,6 +977,16 @@ impl Vm {
                     self.capture_native_code,
                     want_nest,
                 );
+                let result = result.and_then(|mut native| {
+                    if (self.readonly_regions || self.mutation_regions) && !feedback {
+                        native.compile_regions(
+                            &function.borrow(),
+                            self.readonly_regions,
+                            self.mutation_regions,
+                        )?;
+                    }
+                    Ok(native)
+                });
                 self.tier_stats.native_compile_ns = self
                     .tier_stats
                     .native_compile_ns

@@ -14,6 +14,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut numeric = NumericMode::default();
     let mut path = None;
     let mut stats = false;
+    let mut cfg_inlining = false;
+    let mut readonly_regions = false;
+    let mut mutation_regions = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--numeric" => {
@@ -40,17 +43,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--stats" => stats = true,
+            "--cfg-inlining" => cfg_inlining = true,
+            "--readonly-regions" => readonly_regions = true,
+            "--mutation-regions" => mutation_regions = true,
             _ if path.is_none() => path = Some(argument),
             _ => return Err("unexpected argument".into()),
         }
     }
     let path = path.ok_or(
-        "usage: cargo run --example run -- [--tier bytecode|lir|native|copy-patch] [--bytecode stack|register] [--numeric adaptive|disabled] [--stats] FILE.py",
+        "usage: cargo run --example run -- [--tier bytecode|lir|native|copy-patch] [--bytecode stack|register] [--numeric adaptive|disabled] [--stats] [--cfg-inlining] [--readonly-regions] [--mutation-regions] FILE.py",
     )?;
     let source = fs::read_to_string(path)?;
     let mut program = compile(&source)?;
     let mut vm = Vm::new();
     vm.tiering = tier;
+    vm.cfg_inlining = cfg_inlining;
+    vm.readonly_regions = readonly_regions;
+    vm.mutation_regions = mutation_regions;
     vm.bytecode = bytecode;
     vm.numeric = numeric;
     let result = vm.run_program(&mut program);

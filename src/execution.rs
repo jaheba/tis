@@ -94,6 +94,8 @@ fn builtin_method_name(name: &str) -> Result<&'static str> {
         "discard" => "discard",
         "join" => "join",
         "split" => "split",
+        "splitlines" => "splitlines",
+        "rjust" => "rjust",
         "upper" => "upper",
         "lower" => "lower",
         "strip" => "strip",
@@ -182,6 +184,8 @@ impl Vm {
             "iter",
             "next",
             "isinstance",
+            "ord",
+            "chr",
             "object",
             "sorted",
             "reversed",
@@ -864,14 +868,26 @@ impl Vm {
             CoreOp::Format(spec, repr) => {
                 let text = if spec.is_empty() {
                     self.repr(values[0], *repr)?
-                } else if spec.starts_with('.') && spec.ends_with('f') {
+                } else if spec.starts_with('.') && (spec.ends_with('f') || spec.ends_with('e')) {
                     let precision: usize = spec[1..spec.len() - 1]
                         .parse()
                         .map_err(|_| error("invalid format spec"))?;
                     if precision > 1000 {
                         return Err(error("format precision too large"));
                     }
-                    format!("{:.*}", precision, number(values[0])?)
+                    if spec.ends_with('e') {
+                        let raw = format!("{:.*e}", precision, number(values[0])?);
+                        // Python requires an explicit sign and at least two exponent digits.
+                        if let Some((mantissa, exponent)) = raw.split_once('e') {
+                            let exponent: i32 =
+                                exponent.parse().map_err(|_| error("invalid exponent"))?;
+                            format!("{mantissa}e{exponent:+03}")
+                        } else {
+                            raw
+                        }
+                    } else {
+                        format!("{:.*}", precision, number(values[0])?)
+                    }
                 } else {
                     return Err(Error::Unsupported("format specification"));
                 };
@@ -894,13 +910,13 @@ impl Vm {
                 Value::None
             }
             CoreOp::Import(name) => {
-                if name != "math" {
+                if name != "math" && name != "json" {
                     return Err(Error::Unsupported("builtin module"));
                 }
                 if let Some(&module) = self.modules.get(name) {
                     module
                 } else {
-                    let module = self.heap.allocate(Object::Native("math".into()));
+                    let module = self.heap.allocate(Object::Native(name.clone().into()));
                     self.modules.insert(name.clone(), module);
                     module
                 }
@@ -913,7 +929,7 @@ impl Vm {
         matches!(value, Value::Ref(_)) && matches!(self.heap.get(value), Ok(Object::Done))
     }
 
-    fn class_attribute(&self, class: Value, name: &str) -> Result<Option<Value>> {
+    pub(crate) fn class_attribute(&self, class: Value, name: &str) -> Result<Option<Value>> {
         let Object::Class {
             namespace, bases, ..
         } = self.heap.get(class)?
@@ -984,6 +1000,8 @@ impl Vm {
                 if [
                     "join",
                     "split",
+                    "splitlines",
+                    "rjust",
                     "upper",
                     "lower",
                     "strip",
@@ -1062,6 +1080,19 @@ impl Vm {
         cached: Option<&crate::Attribute>,
     ) -> Result<Value> {
         match self.heap.get(object)? {
+            Object::Native(module) if module == "json" => {
+                let key = match name {
+                    "loads" => "json.loads",
+                    "dumps" => "json.dumps",
+                    _ => return Err(error(format!("AttributeError: json.{name}"))),
+                };
+                if let Some(&function) = self.modules.get(key) {
+                    return Ok(function);
+                }
+                let function = self.heap.allocate(Object::Native(key.into()));
+                self.modules.insert(key.into(), function);
+                return Ok(function);
+            }
             Object::Native(module) if module == "math" => {
                 return match name {
                     "pi" => Ok(Value::Float(std::f64::consts::PI)),
@@ -1289,6 +1320,34 @@ impl Vm {
                 self.output.push_str(&parts.join(&sep));
                 self.output.push_str(&end);
                 Value::None
+            }
+            "json.loads" | "json.dumps" => {
+                arity(args, 1, 1)?;
+                if name == "json.loads" {
+                    crate::json::loads(&self.heap, args[0])?
+                } else {
+                    crate::json::dumps(&self.heap, args[0])?
+                }
+            }
+            "chr" => {
+                arity(args, 1, 1)?;
+                let code = u32::try_from(integer(args[0])?).ok();
+                let character = code
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| error("ValueError: invalid Unicode scalar"))?;
+                self.heap.allocate(Object::String(character.to_string()))
+            }
+            "ord" => {
+                arity(args, 1, 1)?;
+                let Object::String(text) = self.heap.get(args[0])? else {
+                    return Err(Error::Type("ord requires a string"));
+                };
+                let mut chars = text.chars();
+                let character = chars
+                    .next()
+                    .filter(|_| chars.next().is_none())
+                    .ok_or(Error::Type("ord requires one character"))?;
+                Value::Int(i64::from(u32::from(character)))
             }
             "len" => ScalarBuiltin::Len.evaluate(&self.heap, args)?,
             "range" => {
@@ -1898,11 +1957,25 @@ impl Vm {
                         text_heap(&self.heap, parts.join(&text))
                     }
                     "split" => {
-                        arity(args, 0, 1)?;
+                        arity(args, 0, 2)?;
+                        let limit = args
+                            .get(1)
+                            .map(|&value| integer(value))
+                            .transpose()?
+                            .unwrap_or(-1);
                         let parts = if args.is_empty() || args[0] == Value::None {
-                            text.split_whitespace()
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>()
+                            let mut rest = text.trim_start();
+                            let mut parts = vec![];
+                            while !rest.is_empty() {
+                                if limit >= 0 && parts.len() == limit as usize {
+                                    parts.push(rest.to_owned());
+                                    break;
+                                }
+                                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                                parts.push(rest[..end].to_owned());
+                                rest = rest[end..].trim_start();
+                            }
+                            parts
                         } else {
                             let Object::String(sep) = self.heap.get(args[0])? else {
                                 return Err(Error::Type("separator must be string"));
@@ -1910,7 +1983,13 @@ impl Vm {
                             if sep.is_empty() {
                                 return Err(error("ValueError: empty separator"));
                             }
-                            text.split(sep).map(str::to_owned).collect()
+                            if limit < 0 {
+                                text.split(sep).map(str::to_owned).collect()
+                            } else {
+                                text.splitn(limit as usize + 1, sep)
+                                    .map(str::to_owned)
+                                    .collect()
+                            }
                         };
                         self.heap.allocate(Object::List(
                             parts
@@ -1919,6 +1998,71 @@ impl Vm {
                                 .collect::<Vec<_>>()
                                 .into(),
                         ))
+                    }
+                    "splitlines" => {
+                        arity(args, 0, 1)?;
+                        let keep = args
+                            .first()
+                            .map(|&value| runtime::truth(&self.heap, value))
+                            .transpose()?
+                            .unwrap_or(false);
+                        let mut parts = vec![];
+                        let mut start = 0;
+                        let mut chars = text.char_indices().peekable();
+                        // str::lines omits Python's additional Unicode line boundaries.
+                        while let Some((index, ch)) = chars.next() {
+                            if matches!(
+                                ch,
+                                '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{001c}'
+                                    ..='\u{001e}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+                            ) {
+                                let mut end = index + ch.len_utf8();
+                                if ch == '\r' && chars.peek().is_some_and(|&(_, next)| next == '\n')
+                                {
+                                    end = chars.next().unwrap().0 + 1;
+                                }
+                                parts.push(text_heap(
+                                    &self.heap,
+                                    text[start..if keep { end } else { index }].into(),
+                                ));
+                                start = end;
+                            }
+                        }
+                        if start < text.len() {
+                            parts.push(text_heap(&self.heap, text[start..].into()));
+                        }
+                        self.heap.allocate(Object::List(parts.into()))
+                    }
+                    "rjust" => {
+                        arity(args, 1, 2)?;
+                        let width = integer(args[0])?;
+                        let fill = if let Some(&value) = args.get(1) {
+                            let Object::String(fill) = self.heap.get(value)? else {
+                                return Err(Error::Type("fill character must be a string"));
+                            };
+                            if fill.chars().count() != 1 {
+                                return Err(Error::Type(
+                                    "fill character must be exactly one character",
+                                ));
+                            }
+                            fill.chars().next().unwrap()
+                        } else {
+                            ' '
+                        };
+                        let padding =
+                            width.saturating_sub(text.chars().count() as i64).max(0) as usize;
+                        let mut result = String::new();
+                        result
+                            .try_reserve(
+                                padding
+                                    .checked_mul(fill.len_utf8())
+                                    .and_then(|n| n.checked_add(text.len()))
+                                    .ok_or(Error::IntegerOverflow)?,
+                            )
+                            .map_err(|_| error("MemoryError: string too large"))?;
+                        result.extend(std::iter::repeat_n(fill, padding));
+                        result.push_str(&text);
+                        text_heap(&self.heap, result)
                     }
                     "upper" | "lower" | "strip" => {
                         arity(args, 0, 0)?;

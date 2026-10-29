@@ -652,3 +652,118 @@ or JIT artifact from the previous request. Session reset, fixture file loading a
 outside repeated timing. The tis adapter preloads source; Monty's worker transports it per request.
 All sources are identical and outputs are validated. Monty CLI summaries, when present, are checked
 using Flying Circus's legacy-output normalization and retained in raw results.
+
+## Logical inline frames
+
+LIR side exits can carry `inline_frames::Snapshot`: an ordered stack of logical
+scopes, each with its own HIR identity/revision, environment, live-value map and
+local recipes. A suspended caller records a pending return destination and resumes
+after its original call. This lets deoptimization continue inside a callee after
+completed effects without replaying the call.
+
+The reference LIR, Cranelift and copy-and-patch bridges reconstruct these stacks.
+The existing physical caller is reused; child frames resume in bytecode, return
+into their callers and unwind normally on errors. All snapshot values are rooted
+through reconstruction and execution. LIR dumps show the scope chain and pending
+returns. Verification checks ancestry, revisions, live values, register types,
+continuations and coverage by the existing physical root map.
+
+Profiled positional calls to closed, single-block leaf functions can be copied
+into the caller's LIR. These bodies may read/write attributes, allocate containers
+and perform arithmetic. Parameters become explicit caller-register bindings.
+Compilation refreshes callee feedback after call-site sampling ends. Each scope
+retains its source HIR identity/revision and value origins; additional boxed
+registers have separate shadow root slots. Safepoints retain caller and
+callee snapshots. Numeric addition and floating arithmetic use profiled guards;
+a miss after a write resumes the callee at that arithmetic operation.
+
+A callable guard checks the captured function, revision, actual bound receiver,
+argument count, defaults and recursion limit before effects. Methods retain the
+callable captured before argument evaluation. The default leaf pass excludes Python calls and lexical reads, so its helpers share the caller's execution context.
+The original call handles guard misses. Live callee profiles count logical calls,
+returns, errors and guard misses; eager feedback keeps physical callee execution.
+LIR dumps include scope ranges and register-to-HIR origin mappings.
+Artifacts without copied bodies bypass shadow-frame setup and select a runtime
+callback that omits inline root handling.
+
+The default leaf pass accepts one to four positional parameters including the receiver,
+96 HIR instructions per callee and 192 copied instructions per caller artifact.
+It excludes defaults, keyword/star arguments, lexical access, nested Python calls,
+branches and loops. The readonly scalar expression inliner remains preferred for
+its supported bodies.
+
+Measured results and current limits: [effectful leaf inlining](benchmarks/results/2026-10-29-leaf-inline/README.md).
+
+Native backends fuse the leaf guard and environment/receiver reads into one callback.
+Reopened profiling windows retain ordinary helper observation.
+[Entry-fusion measurements](benchmarks/results/2026-10-29-inline-entry-batch/README.md) show 60,000 fewer callbacks per
+Barnes–Hut invocation, with effectively unchanged warmed execution time.
+
+Experimental CFG inlining is available through `Vm::cfg_inlining = true` before feedback collection,
+or `--cfg-inlining` in the `bench` and `run` examples.
+It supports acyclic multi-block bodies, phi arguments, multiple returns, lexical reads and nested or recursive calls.
+Each copied call charges a logical recursion level and uses the actual callee environment.
+Branches and safepoints retain caller/callee reconstruction state; synthetic blocks do not create physical HIR observations.
+The pass accepts up to 48 blocks and 384 HIR instructions per callee, with 768 copied instructions per artifact.
+Defaults, captured local writes, keyword/star arguments at the inline boundary, and loops retain ordinary calls.
+Loop-region/nest discovery is currently skipped in artifacts whose CFG was expanded.
+`lir::Function::lower_with_cfg` exposes this lowering for inspection.
+
+This option defaults to false because the current runtime-helper and root-map costs exceed its frame savings.
+See the [CFG-inlining experiment](benchmarks/results/2026-10-29-cfg-inline/README.md) for validation and measurements.
+
+Benchmark tools default to three samples and one warmup for quick iteration, and accept `--samples 1`.
+Increase `--samples` and `--warmups` explicitly when confirming a gain.
+
+Copied bodies use ordinary profiled HIR → LIR lowering, followed by register/state/exit remapping.
+This retains comparison, sequence and scalar specialization, including typed float phi arguments.
+After entry, root publication uses the suspended caller continuation and logical callee state;
+entry-guard misses keep the original pre-call reconstruction point.
+[Shared-lowering results](benchmarks/results/2026-10-29-shared-inline-lowering/README.md) show fewer callbacks and root
+synchronizations, but CFG inlining still defaults to false because it remains slower than default execution.
+
+Caller OSR imports exclude float caches owned by copied inline scopes; those caches retain their local guards.
+[Scalar-import fix and quick results](benchmarks/results/2026-10-29-inline-scalar-imports/README.md) cover the
+`advance_system` validation failure and restored inlining coverage.
+Benchmark JSON includes cumulative compilation-error counts alongside validated output.
+
+### Closed recursive native regions
+
+Set `Vm::readonly_regions = true` before compilation, or pass `--readonly-regions` to the `run` or `bench` example.
+This opt-in Cranelift experiment lowers generic LIR into a separate recursive native function.
+It supports bounded acyclic method bodies, numeric arithmetic, instance fields, list/tuple reads, `len`, `math.sqrt`,
+and direct self-recursion returning one to four numeric tuple components.
+Internal calls use native stack frames and pass tuple components without allocating Python objects.
+
+The region cannot call Python, mutate the heap, allocate, or collect.
+Guards check heap identity, generation, bounds, field shapes, recursive method identity and current global bindings.
+A failed guard restarts the whole method through the ordinary VM; only read-only work can be repeated.
+Only the final result tuple is materialized.
+Native recursion is capped at 32 frames per attempt and also respects the remaining VM recursion allowance.
+Unsupported bodies, eager feedback, OSR entries and guard failures use the existing backend.
+The generated region is available as `NativeDiagnostics::readonly_clif` when code capture is enabled.
+Measurements and implementation details are in the
+[recursive-region report](benchmarks/results/2026-10-29-readonly-regions/README.md).
+
+### Buffered native mutation regions
+
+Set `Vm::mutation_regions = true` before compilation, or pass `--mutation-regions` to the `run` or `bench` example.
+Combine it with `--readonly-regions` to enable both experiments.
+Acyclic read/modify/write methods returning `None` can execute numeric field updates without VM callbacks.
+`Particle.update`, `apply_force`, and `update_mass_distribution` fit this subset.
+Allocation, arbitrary calls, recursive mutation, non-numeric stores and unpromoted locals use the existing backend.
+Write-only initialization is excluded because it generally needs new field layouts.
+
+Native code records ordered writes in a private buffer and forwards later reads through that buffer, including aliases.
+Successful execution commits the buffer through ordinary mutable heap guards.
+A failed guard commits only the completed prefix, materializes its live HIR values and locals, and resumes bytecode at
+that operation; it does not repeat the committed writes.
+These resumable exits retain the generic region and record failure reasons and operand types.
+A cold guard before any write can safely use the ordinary entry path while its weak field cache learns.
+
+The backing heap stays immutable during native execution.
+Heap reads carry Cranelift's `readonly` flag, and register spills and cache-miss details are emitted only on cold exit paths.
+Scratch storage contains weak bits and is reused only after the non-reentrant native invocation finishes.
+`NativeDiagnostics::mutation_clif` exposes the generated code when capture is enabled.
+Measurements, profiling and validation are in the
+[buffered-mutation report](benchmarks/results/2026-10-29-buffered-mutation/README.md).

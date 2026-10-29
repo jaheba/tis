@@ -31,6 +31,7 @@ struct Node {
     alternate: Target,
 }
 struct Plan {
+    gateway: usize,
     nodes: Vec<Node>,
     blocks: Vec<usize>,
     locations: Vec<(usize, usize)>,
@@ -52,7 +53,7 @@ impl Plan {
         self.push(
             "callback",
             Patch {
-                callback: native_runtime::callback as *const u8 as usize,
+                callback: self.gateway,
                 event,
                 location: i32::try_from(location).map_err(|_| Error::IntegerOverflow)?,
                 ..Patch::default()
@@ -100,6 +101,11 @@ impl Plan {
             .max()
             .unwrap_or(0);
         let mut plan = Self {
+            gateway: if lir.inline_scopes.is_empty() {
+                native_runtime::callback_no_inline as *const u8 as usize
+            } else {
+                native_runtime::callback as *const u8 as usize
+            },
             nodes: vec![],
             blocks: vec![],
             locations: vec![],
@@ -109,12 +115,20 @@ impl Plan {
         for (block, body) in lir.blocks.iter().enumerate() {
             plan.blocks.push(plan.nodes.len());
             plan.callback(ENTER, block)?;
+            let bootstrap_reads = if !feedback {
+                crate::leaf_inline::bootstrap_reads(&body.instructions)
+            } else {
+                Default::default()
+            };
             let mut unpack_reads = 0;
             for (index, instruction) in body.instructions.iter().enumerate() {
                 let location = plan.locations.len();
                 plan.locations.push((block, index));
                 if unpack_reads > 0 {
                     unpack_reads -= 1;
+                    continue;
+                }
+                if bootstrap_reads.contains(&index) {
                     continue;
                 }
                 let dst = instruction.result.map(slot).transpose()?.unwrap_or(0);
@@ -132,7 +146,7 @@ impl Plan {
                     Operation::FloatListUnpack { value, view } => {
                         p.left = slot(*value)?;
                         p.right = slot(*view)?;
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = plan.gateway;
                         p.event = FINISH;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         p.tag = (!feedback) as u64;
@@ -152,7 +166,7 @@ impl Plan {
                         p.left = slot(*view)?;
                         p.a = *index as u64;
                         p.status = failure.0 as u64 + 1;
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = plan.gateway;
                         p.event = FINISH;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         p.tag = (!feedback) as u64;
@@ -165,13 +179,13 @@ impl Plan {
                     }
                     Operation::SequenceUnpack { count, .. } if !feedback => {
                         unpack_reads = *count;
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = plan.gateway;
                         p.event = UNPACK_BATCH;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "callback"
                     }
                     Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => {
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = plan.gateway;
                         p.event = SEQUENCE;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "callback"
@@ -269,15 +283,27 @@ impl Plan {
                     }
                     Operation::Truth { value, .. } => {
                         p.left = slot(*value)?;
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = plan.gateway;
                         p.event = HELPER;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "truth"
                     }
+                    Operation::Call {
+                        helper: lir::Helper::LeafGuard(_),
+                        ..
+                    } if !feedback
+                        && crate::leaf_inline::bootstrap_end(&body.instructions, index)
+                            .is_some() =>
+                    {
+                        p.callback = plan.gateway;
+                        p.event = LEAF_ENTER;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        "callback"
+                    }
                     Operation::NumberCompare { .. }
                     | Operation::NumericAdd { .. }
                     | Operation::Call { .. } => {
-                        p.callback = native_runtime::callback as *const u8 as usize;
+                        p.callback = plan.gateway;
                         p.event = HELPER;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "callback"
