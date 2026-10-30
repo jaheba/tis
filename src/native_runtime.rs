@@ -28,6 +28,13 @@ impl Slot {
                 tag: FLOAT,
                 a: v.to_bits(),
             },
+            Value::InlineString(text) => {
+                let (high, a) = text.words();
+                Self {
+                    tag: INLINE_STRING | ((high as u64) << 32),
+                    a,
+                }
+            }
             Value::Ref(id) => Self {
                 tag: REF | ((id.heap as u64) << 32),
                 a: id.index as u64 | ((id.generation as u64) << 32),
@@ -41,6 +48,10 @@ impl Slot {
             BOOL => Value::Bool(self.a != 0),
             INT => Value::Int(self.a as i64),
             FLOAT => Value::Float(f64::from_bits(self.a)),
+            INLINE_STRING => Value::InlineString(
+                crate::InlineString::from_words((self.tag >> 32) as u32, self.a)
+                    .ok_or(Error::InvalidIr("invalid inline UTF-8"))?,
+            ),
             REF => Value::Ref(ObjectId {
                 heap: (self.tag >> 32) as u32,
                 index: self.a as u32,
@@ -477,7 +488,10 @@ pub(crate) extern "C" fn guarded_helper_callback(
         (&mut *context.vm).tier_stats.native_runtime_calls += 1;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
-        if !matches!(event, SCALAR_CALL | TUPLE_ALLOC | NAME_LOAD) || registers != context.registers
+        if !matches!(
+            event,
+            SCALAR_CALL | TUPLE_ALLOC | NAME_LOAD | NAME_STORE | STRING_NEXT
+        ) || registers != context.registers
         {
             return Err(Error::InvalidIr("guarded helper gateway"));
         }
@@ -509,13 +523,20 @@ pub(crate) extern "C" fn guarded_helper_callback(
         };
         let value = match (event, probe_helper) {
             (SCALAR_CALL, lir::Helper::ScalarCall(builtin)) => {
-                let [callee, argument] = probe_arguments else {
-                    return Err(Error::InvalidIr("scalar call operands"));
-                };
+                let (callee, arguments) = probe_arguments
+                    .split_first()
+                    .ok_or(Error::InvalidIr("scalar call operands"))?;
+                if arguments.len() > 4 {
+                    return Err(Error::InvalidIr("scalar call arity"));
+                }
+                let mut values = [Value::None; 4];
+                for (dst, register) in values.iter_mut().zip(arguments) {
+                    *dst = slots[register.0].value()?;
+                }
                 let Some(value) = vm.try_scalar_call(
                     *builtin,
                     slots[callee.0].value()?,
-                    slots[argument.0].value()?,
+                    &values[..arguments.len()],
                 ) else {
                     return Ok(false);
                 };
@@ -523,10 +544,28 @@ pub(crate) extern "C" fn guarded_helper_callback(
                 debug_assert!(matches!(value, Value::Int(_) | Value::Float(_)));
                 value
             }
+            (STRING_NEXT, lir::Helper::StringNext) => {
+                let [iterator] = arguments.as_slice() else {
+                    return Err(Error::InvalidIr("string next operands"));
+                };
+                let Some(value) = vm.try_string_next(slots[iterator.0].value()?)? else {
+                    return Ok(false);
+                };
+                value
+            }
             (NAME_LOAD, lir::Helper::LoadName(name)) => {
                 // The authoritative cache/scope lookup only reads environments and updates metadata.
                 // It cannot allocate VM objects, collect, or enter Python; Ref results stay in the image.
                 vm.load_name_slot(&name.text, &name.cache)?
+            }
+            (NAME_STORE, lir::Helper::StoreName(name)) => {
+                let [argument] = arguments.as_slice() else {
+                    return Err(Error::InvalidIr("name store operands"));
+                };
+                if !vm.try_store_name_slot(slots[argument.0].value()?, &name.cache)? {
+                    return Ok(false);
+                }
+                Value::None
             }
             (TUPLE_ALLOC, lir::Helper::Tuple) => {
                 // Tuple literals allocate exactly one arena entry. Neither operand decoding nor
@@ -1345,10 +1384,7 @@ mod compact_value_tests {
         }));
         vm.collect_garbage(&[]).unwrap();
         let value = vm.call(repeat, &[Value::Int(2)]).unwrap();
-        assert_eq!(
-            vm.heap.get(value).unwrap(),
-            &crate::Object::String("abcabc".into())
-        );
+        assert_eq!(vm.heap.as_str(&value).unwrap(), "abcabc");
         assert_eq!(vm.stack_len(), 0);
     }
 
@@ -1362,6 +1398,8 @@ mod compact_value_tests {
             Value::Bool(true),
             Value::Int(i64::MIN),
             Value::Int(i64::MAX),
+            Value::InlineString(crate::InlineString::new("").unwrap()),
+            Value::InlineString(crate::InlineString::new("é😀abcde").unwrap()),
             Value::Ref(ObjectId {
                 heap: u32::MAX,
                 index: u32::MAX,
@@ -1370,6 +1408,22 @@ mod compact_value_tests {
         ] {
             assert_eq!(Slot::boxed(value).value().unwrap(), value);
         }
+        assert!(
+            Slot {
+                tag: INLINE_STRING,
+                a: u64::MAX
+            }
+            .value()
+            .is_err()
+        );
+        assert!(
+            Slot {
+                tag: INLINE_STRING | (0xff << 32),
+                a: 1 << 56
+            }
+            .value()
+            .is_err()
+        );
         for bits in [
             0,
             1u64 << 63,

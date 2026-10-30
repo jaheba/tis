@@ -40,9 +40,9 @@ fn source_collections_and_type_fallback() {
     let a = vm.heap.allocate(Object::String("a".into()));
     let b = vm.heap.allocate(Object::String("b".into()));
     let result = vm.run(add, &[a, b]).unwrap();
-    assert_eq!(vm.heap.get(result).unwrap(), &Object::String("ab".into()));
+    assert_eq!(vm.heap.as_str(&(result)).unwrap(), "ab");
     assert!(vm.collect_garbage(&[result]).unwrap() > 0);
-    assert!(vm.heap.get(result).is_ok());
+    assert_eq!(vm.heap.as_str(&result), Some("ab"));
     assert!(vm.heap.get(a).is_err());
 }
 

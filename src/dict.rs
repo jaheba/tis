@@ -2,14 +2,34 @@
 use crate::{Key, Value};
 use std::{
     collections::{HashMap, hash_map::RandomState},
-    hash::{BuildHasher, Hash, Hasher},
+    hash::{BuildHasher, BuildHasherDefault, Hash, Hasher},
     ops::{Deref, Index},
 };
+// Only the index uses identity hashing; Python keys still receive the keyed RandomState hash.
+// Rehashing that u64 with SipHash again adds work without improving the collision chains.
+#[derive(Debug, Default)]
+struct Prehashed(u64);
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = bytes
+            .iter()
+            .take(8)
+            .enumerate()
+            .fold(0, |value, (i, byte)| value | (u64::from(*byte) << (i * 8)));
+    }
+}
+
 const END: usize = usize::MAX;
 #[derive(Debug, Clone, Default)]
 pub struct Dict {
     entries: Vec<(Key, Value)>,
-    heads: HashMap<u64, usize>,
+    heads: HashMap<u64, usize, BuildHasherDefault<Prehashed>>,
     next: Vec<usize>,
     hasher: RandomState,
 }
@@ -34,7 +54,7 @@ impl Dict {
         key.hash(&mut state);
         let mut index = self.heads.get(&state.finish()).copied().unwrap_or(END);
         while index != END {
-            if matches!(&self.entries[index].0,Key::String(candidate) if candidate==key) {
+            if matches!(&self.entries[index].0,Key::String(candidate) if candidate.as_str()==key) {
                 return Some(&self.entries[index].1);
             }
             index = self.next[index];
@@ -138,5 +158,83 @@ impl Hash for Key {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn growth_replacement_deletion_and_borrowed_strings_preserve_order() {
+        let mut dict = Dict::default();
+        for i in 0..2000 {
+            dict.insert(Key::String(format!("key{i}").into()), Value::Int(i));
+        }
+        for i in 0..2000 {
+            assert_eq!(dict.get_str(&format!("key{i}")), Some(&Value::Int(i)));
+        }
+        assert_eq!(
+            dict.insert(Key::String("key5".into()), Value::Int(9000)),
+            Some(Value::Int(5))
+        );
+        for i in (0..2000).step_by(17) {
+            assert_eq!(
+                dict.remove(&Key::String(format!("key{i}").into())),
+                Some(Value::Int(i))
+            );
+        }
+        assert_eq!(dict[0].0, Key::String("key1".into()));
+        assert_eq!(dict.get_str("key5"), Some(&Value::Int(9000)));
+        assert_eq!(dict.get_str("key0"), None);
+        let cloned = dict.clone();
+        assert_eq!(cloned.get_str("key5"), Some(&Value::Int(9000)));
+        dict.clear();
+        dict.insert(Key::String("new".into()), Value::None);
+        assert_eq!(dict.len(), 1);
+    }
+
+    #[test]
+    fn compact_keys_keep_borrowed_hashes_across_storage_boundaries() {
+        let mut dict = Dict::default();
+        let keys = [
+            "",
+            "id",
+            "é\0😀",
+            "abcdefghijklmnopqrstuvw",
+            "abcdefghijklmnopqrstuvwx",
+            "abcdefghijklmnopqrstuvwxy",
+            "long key with enough bytes to require an allocation",
+        ];
+        for (index, text) in keys.iter().enumerate() {
+            dict.insert(Key::String((*text).into()), Value::Int(index as i64));
+        }
+        let cloned = dict.clone();
+        for (index, text) in keys.iter().enumerate() {
+            assert_eq!(cloned.get_str(text), Some(&Value::Int(index as i64)));
+            assert_eq!(
+                dict.remove(&Key::String((*text).into())),
+                Some(Value::Int(index as i64))
+            );
+        }
+        assert!(dict.is_empty());
+    }
+
+    #[test]
+    fn colliding_hashes_still_compare_keys() {
+        let mut dict = Dict {
+            entries: vec![
+                (Key::Int(1), Value::Int(10)),
+                (Key::Int(2), Value::Int(20)),
+                (Key::Int(3), Value::Int(30)),
+            ],
+            next: vec![END, 0, 1],
+            ..Dict::default()
+        };
+        dict.heads.insert(123, 2);
+        for i in 1..=3 {
+            assert_eq!(dict.position(&Key::Int(i), 123), Some((i - 1) as usize));
+        }
+        assert_eq!(dict.position(&Key::Int(4), 123), None);
     }
 }

@@ -1,4 +1,5 @@
 mod analysis;
+mod builtins;
 mod promote;
 mod view;
 pub use analysis::Analysis;
@@ -30,6 +31,22 @@ pub enum Constant {
     Int(i64),
     Float(f64),
     String(String),
+}
+
+impl Constant {
+    // These values contain no heap identity and can be embedded by every execution backend.
+    #[inline]
+    pub(crate) fn immediate(&self) -> Option<crate::Value> {
+        use crate::Value;
+        Some(match self {
+            Self::Unbound => Value::Unbound,
+            Self::None => Value::None,
+            Self::Bool(v) => Value::Bool(*v),
+            Self::Int(v) => Value::Int(*v),
+            Self::Float(v) => Value::Float(*v),
+            Self::String(s) => Value::InlineString(crate::InlineString::new(s)?),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +146,12 @@ pub enum CoreOp {
     Class(String, Box<Function>),
     GetAttr(String),
     SetAttr(String),
+    TryCall(Box<Function>),
+    ExceptionMatch,
+    EnterExcept,
+    ExitExcept,
+    ListAppend,
+    Generator(usize, Option<String>),
     Iter,
     Next,
     IsDone,
@@ -139,6 +162,7 @@ pub enum CoreOp {
     Format(String, bool),
     Join,
     Assert,
+    Raise,
     Namespace,
 }
 
@@ -232,7 +256,10 @@ impl Function {
                     Op::Runtime(CoreOp::LoadName(name) | CoreOp::StoreName(name), _) => {
                         names.insert(name.clone());
                     }
-                    Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) => {
+                    Op::Runtime(
+                        CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                        _,
+                    ) => {
                         references(body, names);
                     }
                     _ => {}
@@ -241,7 +268,10 @@ impl Function {
         }
         let mut captured = std::collections::BTreeSet::new();
         for instruction in self.blocks.iter().flat_map(|b| &b.instructions) {
-            if let Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) = &instruction.op
+            if let Op::Runtime(
+                CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                _,
+            ) = &instruction.op
             {
                 references(body, &mut captured);
             }
@@ -260,7 +290,7 @@ impl Function {
         for instruction in self.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
             if let Op::Runtime(operation, _) = &mut instruction.op {
                 match operation {
-                    CoreOp::Function(body) => body.index_locals(false),
+                    CoreOp::Function(body) | CoreOp::TryCall(body) => body.index_locals(false),
                     CoreOp::Class(_, body) => body.index_locals(true),
                     CoreOp::LoadName(name) | CoreOp::StoreName(name) => {
                         if let Ok(slot) = self.local_slots.binary_search(name) {
@@ -359,6 +389,10 @@ impl Function {
     pub fn analyze(&self) -> Result<Analysis> {
         analysis::analyze(self)
     }
+    pub(crate) fn validated_backedges(&self) -> Result<std::collections::BTreeSet<(usize, usize)>> {
+        analysis::validated_backedges(self)
+    }
+
     pub fn lower_lir(&self, mode: crate::lir::LoweringMode) -> Result<crate::lir::Function> {
         crate::lir::Function::lower(self, mode)
     }
@@ -368,8 +402,10 @@ impl Function {
         snapshot.code = None;
         for block in &mut snapshot.blocks {
             for instruction in &mut block.instructions {
-                if let Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) =
-                    &mut instruction.op
+                if let Op::Runtime(
+                    CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                    _,
+                ) = &mut instruction.op
                 {
                     **body = body.snapshot();
                 }
@@ -492,6 +528,7 @@ impl fmt::Display for Op {
             Self::Runtime(operation, values) => {
                 match operation {
                     CoreOp::Function(_) => write!(f, "function")?,
+                    CoreOp::TryCall(_) => write!(f, "try expression")?,
                     CoreOp::Class(name, _) => write!(f, "class {name}")?,
                     other => write!(f, "{other:?}")?,
                 }

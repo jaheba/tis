@@ -21,12 +21,16 @@ pub(crate) enum Opcode {
     GetItem,
     SetItem,
     Len,
+    Iter,
+    Next,
+    IsDone,
     Runtime,
     CallPositional,
     PrepareMethod,
     GetAttr,
     SetAttr,
     Numeric,
+    StringEqual,
     LoadLocal,
     LoadName,
     StoreName,
@@ -72,6 +76,19 @@ impl RegisterCode {
     pub fn lower(function: &Function, code: &Code) -> Result<Self> {
         let mut output = Self::default();
         let mut uses = vec![0usize; code.sites.len()];
+        let short_literals: std::collections::HashSet<_> = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match &instruction.op {
+                Op::Constant(crate::hir::Constant::String(text))
+                    if text.len() <= crate::InlineString::CAPACITY =>
+                {
+                    Some(instruction.result)
+                }
+                _ => None,
+            })
+            .collect();
         for block in &function.blocks {
             for instruction in &block.instructions {
                 for input in instruction.op.inputs() {
@@ -164,6 +181,9 @@ impl RegisterCode {
                             cache,
                         )
                     }
+                    Op::Runtime(CoreOp::Iter, inputs) => (Opcode::Iter, inputs[0].0, 0, 0),
+                    Op::Runtime(CoreOp::Next, inputs) => (Opcode::Next, inputs[0].0, 0, 0),
+                    Op::Runtime(CoreOp::IsDone, inputs) => (Opcode::IsDone, inputs[0].0, 0, 0),
                     Op::Runtime(CoreOp::LoadLocal(slot), _) => (Opcode::LoadLocal, *slot, 0, 0),
                     Op::Runtime(CoreOp::StoreLocal(slot), inputs) => {
                         (Opcode::StoreLocal, *slot, inputs[0].0, 0)
@@ -189,6 +209,18 @@ impl RegisterCode {
                     }
                     Op::Runtime(CoreOp::Call(names), _) if names.iter().all(Option::is_none) => {
                         (Opcode::CallPositional, 0, 0, 0)
+                    }
+                    Op::Runtime(CoreOp::Compare(operator), inputs)
+                        if matches!(operator.as_str(), "==" | "!=")
+                            && inputs.len() == 2
+                            && inputs.iter().any(|input| short_literals.contains(input)) =>
+                    {
+                        (
+                            Opcode::StringEqual,
+                            inputs[0].0,
+                            inputs[1].0,
+                            usize::from(operator == "!="),
+                        )
                     }
                     Op::Runtime(_, inputs) if Operator::from_hir(&instruction.op).is_some() => {
                         (Opcode::Numeric, inputs[0].0, inputs[1].0, 0)

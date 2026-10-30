@@ -36,7 +36,7 @@ pub enum Key {
     None,
     Bool(bool),
     Int(i64),
-    String(String),
+    String(compact_str::CompactString),
     Float(u64),
     Tuple(Vec<Key>),
 }
@@ -47,7 +47,7 @@ pub enum Object {
     List(crate::List),
     Tuple(Vec<Value>),
     Dict(crate::Dict),
-    Set(Vec<Value>),
+    Set(crate::Dict),
     Environment(crate::execution::Environment),
     Function(crate::execution::Closure),
     Native(std::borrow::Cow<'static, str>),
@@ -71,6 +71,7 @@ pub enum Object {
     },
     Iterator {
         source: Value,
+        // UTF-8 byte offset for strings; element index for other sequences.
         index: usize,
         size: usize,
         exhausted: bool,
@@ -79,6 +80,12 @@ pub enum Object {
         start: Value,
         stop: Value,
         step: Value,
+    },
+    Generator {
+        parts: std::rc::Rc<[Value]>,
+        binding: Option<std::rc::Rc<(Value, String)>>,
+        running: bool,
+        done: bool,
     },
     Done,
     Enumerate {
@@ -93,13 +100,17 @@ pub enum Object {
         source: Value,
         kind: String,
     },
+    Exception {
+        kind: String,
+        arguments: Vec<Value>,
+    },
 }
 
 impl Object {
     pub(crate) fn values(&self) -> Option<&[Value]> {
         match self {
             Self::List(v) => Some(v),
-            Self::Tuple(v) | Self::Set(v) => Some(v),
+            Self::Tuple(v) => Some(v),
             _ => None,
         }
     }
@@ -242,6 +253,32 @@ impl Heap {
         })
     }
 
+    /// Returns inline UTF-8 when it fits; longer strings retain a heap identity.
+    pub fn string(&self, text: &str) -> Value {
+        match crate::InlineString::new(text) {
+            Some(text) => Value::InlineString(text),
+            None => self.allocate(Object::String(text.into())),
+        }
+    }
+
+    pub fn string_owned(&self, text: String) -> Value {
+        match crate::InlineString::new(&text) {
+            Some(text) => Value::InlineString(text),
+            None => self.allocate(Object::String(text)),
+        }
+    }
+
+    pub fn as_str<'a>(&'a self, value: &'a Value) -> Option<&'a str> {
+        match value {
+            Value::InlineString(text) => Some(text.as_str()),
+            Value::Ref(_) => match self.get(*value).ok()? {
+                Object::String(text) => Some(text),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn get(&self, value: Value) -> Result<&Object> {
         let id = self.checked_id(value)?;
         Ok(&self.entries.get(id).object)
@@ -311,11 +348,12 @@ impl Heap {
         }
         match value {
             Value::Unbound => Err(Error::InvalidIr("unbound dictionary key")),
+            Value::InlineString(text) => Ok(Key::String(text.as_str().into())),
             Value::None => Ok(Key::None),
             Value::Bool(value) => Ok(Key::Bool(value)),
             Value::Int(value) => Ok(Key::Int(value)),
             Value::Ref(_) => match self.get(value)? {
-                Object::String(value) => Ok(Key::String(value.clone())),
+                Object::String(value) => Ok(Key::String(value.as_str().into())),
                 Object::Tuple(values) => values
                     .iter()
                     .map(|&value| self.key_at(value, depth + 1))
@@ -333,6 +371,9 @@ impl Heap {
     }
 
     pub fn len(&self, value: Value) -> Result<usize> {
+        if let Value::InlineString(text) = value {
+            return Ok(text.as_str().chars().count());
+        }
         Ok(match self.get(value)? {
             Object::String(value) => value.chars().count(),
             Object::List(value) => value.len(),
@@ -351,22 +392,27 @@ impl Heap {
         if matches!(key, Value::Ref(_)) && matches!(self.get(key)?, Object::Slice { .. }) {
             return crate::execution::slice(self, object, key);
         }
+        if let Value::InlineString(text) = object {
+            return self.string_item(text.as_str(), key);
+        }
         match self.get(object)? {
             Object::List(items) => items.value(index(key, items.len())?).ok_or(Error::Index),
             Object::Tuple(items) => Ok(items[index(key, items.len())?]),
-            Object::String(text) => {
-                let position = index(key, text.chars().count())?;
-                let character = text.chars().nth(position).ok_or(Error::Index)?;
-                Ok(self.allocate(Object::String(character.to_string())))
-            }
+            Object::String(text) => self.string_item(text, key),
             Object::Dict(items) => self.dict_get(items, key)?.ok_or(Error::MissingKey),
             _ => Err(Error::Type("object is not subscriptable")),
         }
     }
 
+    fn string_item(&self, text: &str, key: Value) -> Result<Value> {
+        let position = index(key, text.chars().count())?;
+        let character = text.chars().nth(position).ok_or(Error::Index)?;
+        Ok(self.string(character.encode_utf8(&mut [0; 4])))
+    }
+
     pub(crate) fn dict_get(&self, items: &crate::Dict, key: Value) -> Result<Option<Value>> {
         // Borrow existing string storage for reads; no temporary owned Key is needed.
-        if let Ok(Object::String(text)) = self.get(key) {
+        if let Some(text) = self.as_str(&key) {
             return Ok(items.get_str(text).copied());
         }
         Ok(items.get(&self.key(key)?).copied())

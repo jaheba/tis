@@ -73,6 +73,7 @@ impl ValueKind {
             Value::Bool(_) => Self::Bool,
             Value::Int(_) => Self::Int,
             Value::Float(_) => Self::Float,
+            Value::InlineString(_) => Self::String,
             Value::Ref(_) => match heap.get(value) {
                 Ok(Object::String(_)) => Self::String,
                 Ok(Object::List(_)) => Self::List,
@@ -86,7 +87,8 @@ impl ValueKind {
                 Ok(Object::Instance { .. }) => Self::Instance,
                 Ok(Object::Range { .. }) => Self::Range,
                 Ok(
-                    Object::Iterator { .. }
+                    Object::Generator { .. }
+                    | Object::Iterator { .. }
                     | Object::Enumerate { .. }
                     | Object::Zip { .. }
                     | Object::View { .. },

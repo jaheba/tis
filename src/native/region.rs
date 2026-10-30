@@ -260,6 +260,12 @@ impl Emitter<'_, '_> {
                 let tag = self.b.ins().bor_imm_s(length, FLOAT_VIEW_TAG as i64);
                 store_word_cached(self.b, self.scalars, self.registers, dst, 0, tag)?;
             }
+            Operation::Copy(value) => copy_slots(
+                self.b,
+                self.scalars,
+                self.registers,
+                &[(*value, dst.unwrap())],
+            )?,
             Operation::SequenceUnpack {
                 value,
                 kind,

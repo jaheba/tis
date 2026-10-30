@@ -9,19 +9,38 @@ Runtime profiles feed HIR → typed LIR → reference execution, Cranelift, or c
 There is no stdlib or sandbox infrastructure.
 
 ```sh
-cargo run --example run -- tests/fixtures/game_nbody.py
+cargo run --release -- tests/fixtures/game_nbody.py
 # -0.169075164
 # -0.169089263
-cargo run --example run -- tests/fixtures/language.py
+cargo run --release -- tests/fixtures/language.py
 # language core ok
 
 # Hot loops switch into native code; --stats reports tier entries, exits and emitted bytes.
-cargo run --example run -- --tier native --stats tests/fixtures/game_nbody.py
-cargo run --example run -- --tier copy-patch --stats tests/fixtures/game_nbody.py
+cargo run --release -- --tier native --stats tests/fixtures/game_nbody.py
+cargo run --release -- --tier copy-patch --stats tests/fixtures/game_nbody.py
+```
+
+Build the CLI with `cargo build --release`, or install it with `cargo install --path .`.
+
+```sh
+tis script.py
+tis -c 'print(1 + 2)'
+printf 'print(42)\n' | tis -
+tis --tier native --readonly-regions --mutation-regions script.py
+tis --help
 ```
 
 `game_nbody.py` is the unchanged Flying Circus workload, including its full 20,000 iterations.
 The acceptance test checks its output against CPython and checks that collection bounds heap growth.
+
+## String values
+
+UTF-8 strings of up to 11 bytes are stored directly in the 16-byte `Value`; longer strings use the heap.
+The capacity is measured in bytes, so two emoji fit inline and three need a heap object.
+The current four-byte tag and native field layout leave less inline space than Monty PR #994's 15-byte encoding.
+Equal inline strings share identity under `is`, including independently constructed strings.
+`Heap::string` and `Heap::string_owned` select the representation; `Heap::as_str` reads either form.
+`Heap::allocate(Object::String(...))` explicitly creates a heap string, including for short text.
 
 ## Language core
 
@@ -352,7 +371,7 @@ Native execution is currently tested on macOS ARM64; the bytecode and reference 
 ## Copy-and-patch experiment
 
 ```sh
-cargo run --example run -- --tier copy-patch --stats tests/fixtures/game_nbody.py
+cargo run --release -- --tier copy-patch --stats tests/fixtures/game_nbody.py
 cargo run --release --example backend_compare
 ```
 

@@ -38,7 +38,7 @@ fn type_and_overflow_exits_do_not_repeat_effects() {
     let a = vm.heap.allocate(Object::String("a".into()));
     let b = vm.heap.allocate(Object::String("b".into()));
     let value = vm.call(add, &[a, b]).unwrap();
-    assert_eq!(vm.heap.get(value).unwrap(), &Object::String("ab".into()));
+    assert_eq!(vm.heap.as_str(&(value)).unwrap(), "ab");
     let calls = vm.get_global("calls").unwrap();
     assert_eq!(
         vm.heap.get_item(calls, Value::Int(0)).unwrap(),
@@ -173,10 +173,7 @@ fn helper_panics_stay_inside_the_shared_gateway() {
     assert_eq!(vm.stack_len(), 0);
     vm.collect_garbage(&[]).unwrap();
     let value = vm.call(f, &[Value::Int(2)]).unwrap();
-    assert_eq!(
-        vm.heap.get(value).unwrap(),
-        &Object::String("abcabc".into())
-    );
+    assert_eq!(vm.heap.as_str(&(value)).unwrap(), "abcabc");
 }
 #[test]
 fn copy_patch_nbody_acceptance() {

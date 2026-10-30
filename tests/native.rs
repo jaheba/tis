@@ -31,10 +31,7 @@ fn native_integer_code_executes_and_deoptimizes() {
             ],
         )
         .unwrap();
-    assert_eq!(
-        vm.heap.get(value).unwrap(),
-        &Object::String("hello tis".into())
-    );
+    assert_eq!(vm.heap.as_str(&(value)).unwrap(), "hello tis");
     assert!(vm.tier_stats.deoptimizations > 0);
     let calls = vm.get_global("calls").unwrap();
     assert_eq!(
@@ -129,8 +126,5 @@ fn helper_panics_do_not_unwind_across_native_frames() {
     assert_eq!(vm.stack_len(), 0);
     vm.collect_garbage(&[]).unwrap();
     let value = vm.call(f, &[Value::Int(2)]).unwrap();
-    assert_eq!(
-        vm.heap.get(value).unwrap(),
-        &Object::String("abcabc".into())
-    );
+    assert_eq!(vm.heap.as_str(&(value)).unwrap(), "abcabc");
 }

@@ -23,11 +23,11 @@ pub struct Code {
     pub(crate) body: Vec<u8>,
     pub function: crate::profile::FunctionId,
     pub revision: u64,
-    pub(crate) backedges: std::collections::BTreeSet<(usize, usize)>,
+    pub(crate) backedge_sources: Vec<Vec<usize>>,
     pub(crate) sites: Vec<Option<Site>>,
     offsets: Vec<Vec<usize>>,
     block_offsets: Vec<usize>,
-    pub(crate) constants: Vec<Constant>,
+    pub(crate) constants: Vec<EncodedConstant>,
     pub(crate) literal_cache: Vec<std::cell::Cell<Option<crate::Value>>>,
     pub(crate) slots: usize,
     pub(crate) entry_parameters: Vec<ValueId>,
@@ -123,7 +123,11 @@ impl Opcode {
 
 impl Code {
     pub fn lower(function: &Function) -> Result<Self> {
-        let analysis = function.analyze()?;
+        // Bytecode roots its register window; liveness snapshots are needed only by LIR.
+        let mut backedge_sources = vec![Vec::new(); function.blocks.len()];
+        for (from, to) in function.validated_backedges()? {
+            backedge_sources[to].push(from);
+        }
         let mut sites = vec![None; function.value_count];
         for block in &function.blocks {
             for instruction in &block.instructions {
@@ -141,7 +145,7 @@ impl Code {
                 body: Vec::new(),
                 function: function.id(),
                 revision: function.revision(),
-                backedges: analysis.backedges,
+                backedge_sources,
                 sites,
                 offsets: Vec::new(),
                 block_offsets: Vec::new(),
@@ -314,6 +318,25 @@ impl Code {
     }
 }
 
+// Immediates contain no heap handles, so compiled code can share them across VMs.
+#[derive(Debug, Clone)]
+pub(crate) enum EncodedConstant {
+    Immediate(crate::Value),
+    String(String),
+}
+impl EncodedConstant {
+    fn new(value: &Constant) -> Self {
+        if let Some(value) = value.immediate() {
+            Self::Immediate(value)
+        } else {
+            let Constant::String(text) = value else {
+                unreachable!()
+            };
+            Self::String(text.clone())
+        }
+    }
+}
+
 struct Builder {
     code: Code,
     patches: Vec<(usize, BlockId)>,
@@ -323,7 +346,7 @@ impl Builder {
     fn operation(&mut self, op: &Op, result: ValueId) -> Result<()> {
         if let Op::Constant(value) = op {
             let id = self.code.constants.len();
-            self.code.constants.push(value.clone());
+            self.code.constants.push(EncodedConstant::new(value));
             self.code.sites[result.0].as_mut().unwrap().constant = Some(id);
             self.operand(Opcode::Constant, id)?;
             return Ok(());

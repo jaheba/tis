@@ -665,15 +665,16 @@ impl NativeCode {
                                 failed,
                             )
                         }
+                        Operation::Copy(value) => copy_slots(
+                            &mut b,
+                            &scalars,
+                            registers,
+                            &[(*value, destination.unwrap())],
+                        )?,
                         Operation::Constant(value) => {
-                            let value = match value {
-                                crate::hir::Constant::Unbound => Value::Unbound,
-                                crate::hir::Constant::None => Value::None,
-                                crate::hir::Constant::Bool(v) => Value::Bool(*v),
-                                crate::hir::Constant::Int(v) => Value::Int(*v),
-                                crate::hir::Constant::Float(v) => Value::Float(*v),
-                                _ => return Err(error("allocating constant")),
-                            };
+                            let value = value
+                                .immediate()
+                                .ok_or_else(|| error("allocating constant"))?;
                             store_constant_cached(
                                 &mut b,
                                 &scalars,
@@ -1201,6 +1202,143 @@ impl NativeCode {
                             b.ins().jump(done, &[]);
                             b.switch_to_block(done);
                         }
+                        Operation::Call {
+                            helper: lir::Helper::Python(crate::hir::CoreOp::IsDone),
+                            arguments,
+                            ..
+                        } if !feedback
+                            && !in_nest
+                            && region_index.is_none()
+                            && arguments.len() == 1 =>
+                        {
+                            let tag = load_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                arguments[0],
+                                0,
+                                types::I64,
+                            )?;
+                            let kind = b.ins().band_imm_s(tag, KIND_MASK as i64);
+                            let reference = b.ins().icmp_imm_s(IntCC::Equal, kind, REF as i64);
+                            let fast = b.create_block();
+                            let slow = b.create_block();
+                            let done = b.create_block();
+                            b.ins().brif(reference, slow, &[], fast, &[]);
+                            b.switch_to_block(fast);
+                            // Exhaustion is a heap sentinel; immediate values cannot represent it.
+                            let no = b.ins().iconst(types::I64, 0);
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                BOOL,
+                                no,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(slow);
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::Python(crate::hir::CoreOp::Compare(operator)),
+                            arguments,
+                            ..
+                        } if !feedback
+                            && !in_nest
+                            && region_index.is_none()
+                            && arguments.len() == 2
+                            && matches!(operator.as_str(), "==" | "!=") =>
+                        {
+                            let left = load_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                arguments[0],
+                                0,
+                                types::I64,
+                            )?;
+                            let right = load_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                arguments[1],
+                                0,
+                                types::I64,
+                            )?;
+                            let left_kind = b.ins().band_imm_s(left, KIND_MASK as i64);
+                            let right_kind = b.ins().band_imm_s(right, KIND_MASK as i64);
+                            let left_inline =
+                                b.ins()
+                                    .icmp_imm_s(IntCC::Equal, left_kind, INLINE_STRING as i64);
+                            let right_inline =
+                                b.ins()
+                                    .icmp_imm_s(IntCC::Equal, right_kind, INLINE_STRING as i64);
+                            let both = b.ins().band(left_inline, right_inline);
+                            let fast = b.create_block();
+                            let slow = b.create_block();
+                            let done = b.create_block();
+                            b.ins().brif(both, fast, &[], slow, &[]);
+                            b.switch_to_block(fast);
+                            // Both canonical words include length and every byte, including embedded NULs.
+                            let left_bits = load_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                arguments[0],
+                                8,
+                                types::I64,
+                            )?;
+                            let right_bits = load_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                arguments[1],
+                                8,
+                                types::I64,
+                            )?;
+                            let tags_equal = b.ins().icmp(IntCC::Equal, left, right);
+                            let bits_equal = b.ins().icmp(IntCC::Equal, left_bits, right_bits);
+                            let equal = b.ins().band(tags_equal, bits_equal);
+                            let value = if operator == "!=" {
+                                b.ins().icmp_imm_s(IntCC::Equal, equal, 0)
+                            } else {
+                                equal
+                            };
+                            let value = b.ins().uextend(types::I64, value);
+                            store_scalar_cached(
+                                &mut b,
+                                &scalars,
+                                registers,
+                                destination.unwrap(),
+                                BOOL,
+                                value,
+                            )?;
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(slow);
+                            // Retain the original helper and state for heap strings and every other type.
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
                         Operation::Call { helper, .. }
                             if !feedback
                                 && !in_nest
@@ -1210,13 +1348,17 @@ impl NativeCode {
                                     lir::Helper::ScalarCall(_)
                                         | lir::Helper::Tuple
                                         | lir::Helper::LoadName(_)
+                                        | lir::Helper::StoreName(_)
+                                        | lir::Helper::StringNext
                                 ) || matches!(helper, lir::Helper::Scoped(inner) if matches!(inner.as_ref(), lir::Helper::ScalarCall(_)))) =>
                         {
-                            // The closed probe reads only operands. Its scalar contract or one-object
-                            // budget prevents collection; a miss materializes the full original state.
+                            // Closed probes cannot collect or call Python; stores only replace an existing
+                            // binding. Tuple allocation has a budget. Misses publish the original state.
                             let probe_event = match helper {
                                 lir::Helper::Tuple => TUPLE_ALLOC,
                                 lir::Helper::LoadName(_) => NAME_LOAD,
+                                lir::Helper::StoreName(_) => NAME_STORE,
+                                lir::Helper::StringNext => STRING_NEXT,
                                 _ => SCALAR_CALL,
                             };
                             scalars.materialize(
@@ -1691,10 +1833,46 @@ struct ScalarVars(
     Vec<Option<(Variable, ir::Type)>>,
     Vec<Option<Variable>>,
     Vec<Option<[Variable; 2]>>,
+    std::collections::BTreeSet<usize>,
 );
 impl ScalarVars {
     fn new(b: &mut FunctionBuilder<'_>, lir: &lir::Function, defer: bool) -> Self {
         let recipes = lir.native_boxing_recipes();
+        let copies = lir
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| {
+                if let Operation::Copy(source) = i.operation {
+                    Some((i.result.unwrap().0, source.0))
+                } else {
+                    None
+                }
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut variables = std::collections::BTreeMap::new();
+        let boxed = lir
+            .registers
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                if !defer
+                    || lir.regions.is_empty()
+                    || !matches!(ty, lir::Type::Boxed | lir::Type::FloatView)
+                {
+                    return None;
+                }
+                let mut source = index;
+                while let Some(&next) = copies.get(&source) {
+                    source = next;
+                }
+                Some(
+                    *variables
+                        .entry(source)
+                        .or_insert_with(|| std::array::from_fn(|_| b.declare_var(types::I64))),
+                )
+            })
+            .collect();
         Self(
             lir.registers
                 .iter()
@@ -1712,15 +1890,8 @@ impl ScalarVars {
                         .then(|| b.declare_var(types::F64))
                 })
                 .collect(),
-            lir.registers
-                .iter()
-                .map(|ty| {
-                    (defer
-                        && !lir.regions.is_empty()
-                        && matches!(ty, lir::Type::Boxed | lir::Type::FloatView))
-                    .then(|| std::array::from_fn(|_| b.declare_var(types::I64)))
-                })
-                .collect(),
+            boxed,
+            copies.keys().copied().collect(),
         )
     }
     fn materialize(
@@ -1769,6 +1940,7 @@ impl ScalarVars {
                 | SCALAR_CALL
                 | TUPLE_ALLOC
                 | NAME_LOAD
+                | NAME_STORE
                 | LEAF_ENTER
         ) {
             return Ok(());
@@ -1819,6 +1991,9 @@ impl ScalarVars {
             b.def_var(var, zero);
         }
         for (index, vars) in self.2.iter().enumerate() {
+            if self.3.contains(&index) {
+                continue;
+            }
             if let Some(vars) = vars {
                 for (field, var) in [0, 8].into_iter().zip(vars) {
                     let value = load(b, registers, Register(index), field, types::I64)?;

@@ -83,8 +83,9 @@ impl Vm {
             match op {
                 Opcode::EnterBlock => {
                     self.materialize_methods(base, methods)?;
-                    let backedge = self.record_block(function, code, a, previous)?;
-                    collecting = self.collecting(function);
+                    let (backedge, phase) =
+                        self.record_block_and_phase(function, code, a, previous)?;
+                    collecting = phase;
                     previous = Some(a);
                     if backedge
                         && let Some(lir) = self.artifact(code.function, code.revision)
@@ -179,12 +180,8 @@ impl Vm {
                         .get(a)
                         .ok_or(Error::InvalidIr("register constant"))?
                     {
-                        crate::hir::Constant::Unbound => Value::Unbound,
-                        crate::hir::Constant::None => Value::None,
-                        crate::hir::Constant::Bool(value) => Value::Bool(*value),
-                        crate::hir::Constant::Int(value) => Value::Int(*value),
-                        crate::hir::Constant::Float(value) => Value::Float(*value),
-                        crate::hir::Constant::String(value) => {
+                        crate::bytecode::EncodedConstant::Immediate(value) => *value,
+                        crate::bytecode::EncodedConstant::String(value) => {
                             self.intern_literal(value, &code.literal_cache[a])
                         }
                     },
@@ -204,6 +201,24 @@ impl Vm {
                     )?,
                     Opcode::Less => {
                         runtime::less(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?
+                    }
+                    Opcode::StringEqual => {
+                        let left = self.read(base, ValueId(a))?;
+                        let right = self.read(base, ValueId(b))?;
+                        let equal = if let (Value::InlineString(left), Value::InlineString(right)) =
+                            (left, right)
+                        {
+                            (left == right) != (c != 0)
+                        } else {
+                            // Heap strings and other Python values retain the general comparison rules.
+                            crate::execution::compare(
+                                &self.heap,
+                                if c == 0 { "==" } else { "!=" },
+                                left,
+                                right,
+                            )?
+                        };
+                        Value::Bool(equal)
                     }
                     Opcode::GetItem => self
                         .heap
@@ -237,6 +252,9 @@ impl Vm {
                         )?;
                         Value::None
                     }
+                    Opcode::Iter => self.iter(self.read(base, ValueId(a))?)?,
+                    Opcode::Next => self.next(self.read(base, ValueId(a))?)?,
+                    Opcode::IsDone => Value::Bool(self.is_done(self.read(base, ValueId(a))?)),
                     Opcode::LoadLocal => self.load_local(a)?,
                     Opcode::StoreLocal => {
                         self.store_local(a, self.read(base, ValueId(b))?)?;

@@ -68,6 +68,7 @@ pub fn compile_with_options(source: &str, options: CompileOptions) -> Result<Pro
     if options.promote_locals {
         builder.function.promote_locals()?;
     }
+    builder.function.specialize_lists()?;
     let mut functions = BTreeMap::new();
     for block in &builder.function.blocks {
         for instruction in &block.instructions {
@@ -88,7 +89,8 @@ pub fn compile_with_options(source: &str, options: CompileOptions) -> Result<Pro
 
 struct Builder {
     function: Function,
-    loops: Vec<(BlockId, BlockId)>,
+    loops: Vec<(BlockId, BlockId, usize)>,
+    except_depth: usize,
 }
 impl Builder {
     fn new(body: &[Stmt], module: bool) -> Result<Self> {
@@ -111,6 +113,7 @@ impl Builder {
         Ok(Self {
             function,
             loops: vec![],
+            except_depth: 0,
         })
     }
     fn runtime(&mut self, block: BlockId, op: CoreOp, values: Vec<ValueId>) -> ValueId {
@@ -141,7 +144,7 @@ impl Builder {
             let value = self.none(block);
             self.function.terminate(block, Terminator::Return(value));
         }
-        self.function.bytecode()?;
+        // Lower bytecode only after lexical indexing and HIR transformations, when requested.
         Ok(())
     }
     fn statements(&mut self, body: &[Stmt], mut block: Option<BlockId>) -> Result<Option<BlockId>> {
@@ -226,8 +229,10 @@ impl Builder {
         match statement {
             Stmt::Import(stmt) => {
                 for alias in &stmt.names {
-                    if !matches!(alias.name.as_str(), "math" | "json") {
-                        return Err(Error::Unsupported("only builtin math and json imports"));
+                    if !matches!(alias.name.as_str(), "math" | "json" | "bisect") {
+                        return Err(Error::Unsupported(
+                            "only builtin math, json and bisect imports",
+                        ));
                     }
                     let value = self.runtime(block, CoreOp::Import(alias.name.to_string()), vec![]);
                     let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
@@ -236,8 +241,10 @@ impl Builder {
             }
             Stmt::ImportFrom(stmt) => {
                 let module = stmt.module.as_ref().map(|name| name.as_str());
-                if stmt.level != 0 || !matches!(module, Some("math" | "json")) {
-                    return Err(Error::Unsupported("only builtin math and json imports"));
+                if stmt.level != 0 || !matches!(module, Some("math" | "json" | "bisect")) {
+                    return Err(Error::Unsupported(
+                        "only builtin math, json and bisect imports",
+                    ));
                 }
                 let module = self.runtime(block, CoreOp::Import(module.unwrap().into()), vec![]);
                 for alias in &stmt.names {
@@ -262,6 +269,7 @@ impl Builder {
                 } else {
                     self.none(block)
                 };
+                self.close_except(block, 0);
                 self.function.terminate(block, Terminator::Return(value));
                 return Ok(None);
             }
@@ -341,9 +349,8 @@ impl Builder {
                 let exhausted = self.function.block(0);
                 let exit = self.function.block(0);
                 self.jump(block, head);
-                let (test, condition) = self.expression(&stmt.test, head)?;
-                self.branch(test, condition, body, exhausted);
-                self.loops.push((head, exit));
+                self.condition(&stmt.test, head, body, exhausted)?;
+                self.loops.push((head, exit, self.except_depth));
                 let end = self.statements(&stmt.body, Some(body))?;
                 self.loops.pop();
                 if let Some(end) = end {
@@ -369,7 +376,7 @@ impl Builder {
                 let done = self.runtime(head, CoreOp::IsDone, vec![value]);
                 self.branch(head, done, exhausted, body);
                 let body = self.assign(&stmt.target, value, body)?;
-                self.loops.push((head, exit));
+                self.loops.push((head, exit, self.except_depth));
                 let end = self.statements(&stmt.body, Some(body))?;
                 self.loops.pop();
                 if let Some(end) = end {
@@ -381,19 +388,38 @@ impl Builder {
                 block = exit;
             }
             Stmt::Break(_) => {
-                let &(_, exit) = self
+                let &(_, exit, depth) = self
                     .loops
                     .last()
                     .ok_or_else(|| Error::Syntax("break outside loop".into()))?;
+                self.close_except(block, depth);
                 self.jump(block, exit);
                 return Ok(None);
             }
             Stmt::Continue(_) => {
-                let &(head, _) = self
+                let &(head, _, depth) = self
                     .loops
                     .last()
                     .ok_or_else(|| Error::Syntax("continue outside loop".into()))?;
+                self.close_except(block, depth);
                 self.jump(block, head);
+                return Ok(None);
+            }
+            Stmt::Try(stmt) => return self.try_statement(stmt, block),
+            Stmt::Raise(stmt) => {
+                if stmt.cause.is_some() {
+                    return Err(Error::Unsupported("raise from"));
+                }
+                let values = if let Some(exception) = &stmt.exc {
+                    let (next, value) = self.expression(exception, block)?;
+                    block = next;
+                    vec![value]
+                } else {
+                    vec![]
+                };
+                self.runtime(block, CoreOp::Raise, values);
+                let value = self.none(block);
+                self.function.terminate(block, Terminator::Return(value));
                 return Ok(None);
             }
             Stmt::Assert(stmt) => {
@@ -412,29 +438,77 @@ impl Builder {
         rest: &[ast::ElifElseClause],
         block: BlockId,
     ) -> Result<Option<BlockId>> {
-        let (block, condition) = self.expression(test, block)?;
-        let yes = self.function.block(0);
-        let no = self.function.block(0);
-        self.branch(block, condition, yes, no);
-        let yes = self.statements(body, Some(yes))?;
-        let no = if let Some((clause, rest)) = rest.split_first() {
-            if let Some(test) = &clause.test {
-                self.conditional(test, &clause.body, rest, no)?
+        // All arms of one if/elif chain share a continuation, rather than a ladder of joins.
+        let arms = std::iter::once((Some(test), body)).chain(
+            rest.iter()
+                .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
+        );
+        let mut pending = Some(block);
+        let mut exits = Vec::new();
+        for (test, body) in arms {
+            let Some(current) = pending.take() else { break };
+            let arm = if let Some(test) = test {
+                let yes = self.function.block(0);
+                let no = self.function.block(0);
+                self.condition(test, current, yes, no)?;
+                pending = Some(no);
+                yes
             } else {
-                self.statements(&clause.body, Some(no))?
+                current
+            };
+            if let Some(end) = self.statements(body, Some(arm))? {
+                exits.push(end);
             }
-        } else {
-            Some(no)
-        };
-        match (yes, no) {
-            (None, other) | (other, None) => Ok(other),
-            (Some(yes), Some(no)) => {
+        }
+        if let Some(no_else) = pending {
+            exits.push(no_else);
+        }
+        match exits.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(*only)),
+            _ => {
                 let join = self.function.block(0);
-                self.jump(yes, join);
-                self.jump(no, join);
+                for end in exits {
+                    self.jump(end, join);
+                }
                 Ok(Some(join))
             }
         }
+    }
+
+    fn condition(
+        &mut self,
+        expr: &Expr,
+        mut block: BlockId,
+        yes: BlockId,
+        no: BlockId,
+    ) -> Result<()> {
+        // Conditions need control flow, not the operand-valued merge required by an and/or expression.
+        match expr {
+            Expr::BoolOp(expr) => {
+                for (index, operand) in expr.values.iter().enumerate() {
+                    if index + 1 == expr.values.len() {
+                        self.condition(operand, block, yes, no)?;
+                    } else {
+                        let next = self.function.block(0);
+                        if expr.op == ast::BoolOp::And {
+                            self.condition(operand, block, next, no)?;
+                        } else {
+                            self.condition(operand, block, yes, next)?;
+                        }
+                        block = next;
+                    }
+                }
+            }
+            Expr::UnaryOp(expr) if expr.op == ast::UnaryOp::Not => {
+                self.condition(&expr.operand, block, no, yes)?;
+            }
+            _ => {
+                let (block, value) = self.expression(expr, block)?;
+                self.branch(block, value, yes, no);
+            }
+        }
+        Ok(())
     }
 
     fn expression(&mut self, expr: &Expr, mut block: BlockId) -> Result<(BlockId, ValueId)> {
@@ -519,35 +593,48 @@ impl Builder {
             Expr::Compare(expr) => {
                 let (next, mut left) = self.expression(&expr.operands[0], block)?;
                 block = next;
-                let join = self.function.block(1);
-                let result = self.function.parameters(join)[0];
-                for (index, op) in expr.ops.iter().enumerate() {
-                    let (next, right) = self.expression(&expr.operands[index + 1], block)?;
+                if expr.ops.len() == 1 {
+                    // A single comparison has no short-circuit join or value merge.
+                    let (next, right) = self.expression(&expr.operands[1], block)?;
                     block = next;
-                    let condition = self.runtime(
+                    self.runtime(
                         block,
-                        CoreOp::Compare(compare_name(*op).into()),
+                        CoreOp::Compare(compare_name(expr.ops[0]).into()),
                         vec![left, right],
-                    );
-                    left = right;
-                    if index + 1 == expr.ops.len() {
-                        self.function
-                            .terminate(block, Terminator::Jump(Edge::new(join, vec![condition])));
-                    } else {
-                        let next = self.function.block(0);
-                        self.function.terminate(
-                            block,
-                            Terminator::Branch {
-                                condition,
-                                yes: Edge::new(next, vec![]),
-                                no: Edge::new(join, vec![condition]),
-                            },
-                        );
+                    )
+                } else {
+                    let join = self.function.block(1);
+                    let result = self.function.parameters(join)[0];
+                    for (index, op) in expr.ops.iter().enumerate() {
+                        let (next, right) = self.expression(&expr.operands[index + 1], block)?;
                         block = next;
+                        let condition = self.runtime(
+                            block,
+                            CoreOp::Compare(compare_name(*op).into()),
+                            vec![left, right],
+                        );
+                        left = right;
+                        if index + 1 == expr.ops.len() {
+                            self.function.terminate(
+                                block,
+                                Terminator::Jump(Edge::new(join, vec![condition])),
+                            );
+                        } else {
+                            let next = self.function.block(0);
+                            self.function.terminate(
+                                block,
+                                Terminator::Branch {
+                                    condition,
+                                    yes: Edge::new(next, vec![]),
+                                    no: Edge::new(join, vec![condition]),
+                                },
+                            );
+                            block = next;
+                        }
                     }
+                    block = join;
+                    result
                 }
-                block = join;
-                result
             }
             Expr::If(expr) => {
                 let (next, condition) = self.expression(&expr.test, block)?;
@@ -666,7 +753,6 @@ impl Builder {
                 }
                 let (end, value) = body.expression(&expr.body, body.function.entry())?;
                 body.function.terminate(end, Terminator::Return(value));
-                body.function.bytecode()?;
                 let (next, defaults) = if let Some(parameters) = &expr.parameters {
                     self.defaults(parameters, block)?
                 } else {
@@ -675,6 +761,7 @@ impl Builder {
                 block = next;
                 self.runtime(block, CoreOp::Function(Box::new(body.function)), defaults)
             }
+            Expr::Generator(expr) => return self.generator(&expr.generators, &expr.elt, block),
             Expr::ListComp(expr) => {
                 let (next, value) =
                     self.comprehension(&expr.generators, &expr.elt, None, "list", block)?;
@@ -907,6 +994,172 @@ impl Builder {
         Ok(block)
     }
 
+    fn close_except(&mut self, block: BlockId, depth: usize) {
+        for _ in depth..self.except_depth {
+            self.runtime(block, CoreOp::ExitExcept, vec![]);
+        }
+    }
+
+    fn try_statement(&mut self, stmt: &ast::StmtTry, block: BlockId) -> Result<Option<BlockId>> {
+        if stmt.is_star || !stmt.finalbody.is_empty() || stmt.handlers.is_empty() {
+            return Err(Error::Unsupported("try finally or except star"));
+        }
+        for handler in &stmt.handlers {
+            let ast::ExceptHandler::ExceptHandler(handler) = handler;
+            if handler.name.is_some() {
+                return Err(Error::Unsupported("except as binding"));
+            }
+        }
+        let [statement] = stmt.body.as_slice() else {
+            return Err(Error::Unsupported("multi-statement try body"));
+        };
+        let expression = match statement {
+            Stmt::Assign(assign)
+                if assign
+                    .targets
+                    .iter()
+                    .all(|target| matches!(target, Expr::Name(_))) =>
+            {
+                &assign.value
+            }
+            Stmt::Expr(expr) => &expr.value,
+            _ => {
+                return Err(Error::Unsupported(
+                    "try body requires expression or name assignment",
+                ));
+            }
+        };
+        let mut callback = Self::new(&[], false)?;
+        let entry = callback.function.entry();
+        let (end, value) = callback.expression(expression, entry)?;
+        callback.function.terminate(end, Terminator::Return(value));
+        let outcome = self.runtime(block, CoreOp::TryCall(Box::new(callback.function)), vec![]);
+        let zero = self.constant(block, Constant::Int(0));
+        let success = self.function.append(block, Op::GetItem(outcome, zero));
+        let one = self.constant(block, Constant::Int(1));
+        let value = self.function.append(block, Op::GetItem(outcome, one));
+        let ok = self.function.block(0);
+        let failed = self.function.block(0);
+        let join = self.function.block(0);
+        self.branch(block, success, ok, failed);
+        let mut ok = ok;
+        if let Stmt::Assign(assign) = statement {
+            for target in &assign.targets {
+                ok = self.assign(target, value, ok)?;
+            }
+        }
+        let mut continues = false;
+        if let Some(end) = self.statements(&stmt.orelse, Some(ok))? {
+            self.jump(end, join);
+            continues = true;
+        }
+        self.runtime(failed, CoreOp::EnterExcept, vec![value]);
+        self.except_depth += 1;
+        let mut next = Some(failed);
+        for handler in &stmt.handlers {
+            let Some(block) = next else {
+                return Err(Error::Syntax("bare except must be last".into()));
+            };
+            let ast::ExceptHandler::ExceptHandler(handler) = handler;
+            let body = if let Some(class) = &handler.type_ {
+                let (block, class) = self.expression(class, block)?;
+                let matches = self.runtime(block, CoreOp::ExceptionMatch, vec![value, class]);
+                let body = self.function.block(0);
+                let no = self.function.block(0);
+                self.branch(block, matches, body, no);
+                next = Some(no);
+                body
+            } else {
+                next = None;
+                block
+            };
+            if let Some(end) = self.statements(&handler.body, Some(body))? {
+                self.runtime(end, CoreOp::ExitExcept, vec![]);
+                self.jump(end, join);
+                continues = true;
+            }
+        }
+        self.except_depth -= 1;
+        if let Some(block) = next {
+            self.runtime(block, CoreOp::ExitExcept, vec![]);
+            self.runtime(block, CoreOp::Raise, vec![value]);
+            let none = self.none(block);
+            self.function.terminate(block, Terminator::Return(none));
+        }
+        if continues {
+            Ok(Some(join))
+        } else {
+            let none = self.none(join);
+            self.function.terminate(join, Terminator::Return(none));
+            Ok(None)
+        }
+    }
+
+    fn generator(
+        &mut self,
+        generators: &[ast::Comprehension],
+        element: &Expr,
+        block: BlockId,
+    ) -> Result<(BlockId, ValueId)> {
+        let [generator] = generators else {
+            return Err(Error::Unsupported("nested generator clauses"));
+        };
+        if generator.is_async {
+            return Err(Error::Unsupported("async generator"));
+        }
+        let (block, source) = self.expression(&generator.iter, block)?;
+        let iterator = self.runtime(block, CoreOp::Iter, vec![source]);
+        // A normal factory frame supplies one shared scope, retained by all lazy callbacks.
+        let mut factory = Self::new(&[], false)?;
+        factory.function.parameter_names = vec![".iter".into()];
+        let mut names = BTreeSet::new();
+        target_names(&generator.target, &mut names);
+        factory.function.local_names = std::iter::once(".iter".into())
+            .chain(names.iter().cloned())
+            .collect();
+        let entry = factory.function.entry();
+        let iter = factory.runtime(entry, CoreOp::LoadName(".iter".into()), vec![]);
+        let mut assign = Self::new(&[], false)?;
+        assign.function.parameter_names = vec![".value".into()];
+        assign.function.local_names = vec![".value".into()];
+        assign.function.nonlocal_names = names.into_iter().collect();
+        let start = assign.function.entry();
+        let value = assign.runtime(start, CoreOp::LoadName(".value".into()), vec![]);
+        let end = assign.assign(&generator.target, value, start)?;
+        let none = assign.none(end);
+        assign.function.terminate(end, Terminator::Return(none));
+        let assign = factory.runtime(entry, CoreOp::Function(Box::new(assign.function)), vec![]);
+        let mut values = vec![iter, assign];
+        for expression in std::iter::once(element).chain(generator.ifs.iter()) {
+            let mut callback = Self::new(&[], false)?;
+            let start = callback.function.entry();
+            let (end, value) = callback.expression(expression, start)?;
+            callback.function.terminate(end, Terminator::Return(value));
+            values.push(factory.runtime(
+                entry,
+                CoreOp::Function(Box::new(callback.function)),
+                vec![],
+            ));
+        }
+        let result = factory.runtime(
+            entry,
+            CoreOp::Generator(
+                generator.ifs.len(),
+                match &generator.target {
+                    Expr::Name(name) => Some(name.id.to_string()),
+                    _ => None,
+                },
+            ),
+            values,
+        );
+        factory
+            .function
+            .terminate(entry, Terminator::Return(result));
+        let factory = self.runtime(block, CoreOp::Function(Box::new(factory.function)), vec![]);
+        let result = self.runtime(block, CoreOp::Call(vec![None]), vec![factory, iterator]);
+        Ok((block, result))
+    }
+
     fn comprehension(
         &mut self,
         generators: &[ast::Comprehension],
@@ -936,7 +1189,6 @@ impl Builder {
         };
         let end = body.comp_loop(generators, 0, element, value, kind, result, entry)?;
         body.function.terminate(end, Terminator::Return(result));
-        body.function.bytecode()?;
         let function = self.runtime(block, CoreOp::Function(Box::new(body.function)), vec![]);
         let value = self.runtime(block, CoreOp::Call(vec![None]), vec![function, source]);
         Ok((block, value))
@@ -1090,6 +1342,15 @@ fn bindings(
                     bindings(&clause.body, locals, globals, nonlocals);
                 }
             }
+            Stmt::Try(stmt) => {
+                bindings(&stmt.body, locals, globals, nonlocals);
+                bindings(&stmt.orelse, locals, globals, nonlocals);
+                bindings(&stmt.finalbody, locals, globals, nonlocals);
+                for handler in &stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    bindings(&handler.body, locals, globals, nonlocals);
+                }
+            }
             Stmt::Global(stmt) => globals.extend(stmt.names.iter().map(ToString::to_string)),
             Stmt::Nonlocal(stmt) => nonlocals.extend(stmt.names.iter().map(ToString::to_string)),
             _ => {}
@@ -1179,6 +1440,14 @@ fn validate_scope(
             Stmt::While(stmt) => {
                 validate_scope(&stmt.body, parents, in_function, true)?;
                 validate_scope(&stmt.orelse, parents, in_function, in_loop)?;
+            }
+            Stmt::Try(stmt) => {
+                validate_scope(&stmt.body, parents, in_function, in_loop)?;
+                validate_scope(&stmt.orelse, parents, in_function, in_loop)?;
+                for handler in &stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    validate_scope(&handler.body, parents, in_function, in_loop)?;
+                }
             }
             Stmt::If(stmt) => {
                 validate_scope(&stmt.body, parents, in_function, in_loop)?;

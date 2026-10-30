@@ -10,6 +10,7 @@ pub(crate) const RAW_BOOL: u64 = 7;
 pub(crate) const EMPTY: u64 = 8;
 pub(crate) const UNBOUND: u64 = 9;
 pub(crate) const FLOAT_VIEW_TAG: u64 = 10;
+pub(crate) const INLINE_STRING: u64 = 11;
 pub(crate) const ENTER: i32 = 1;
 pub(crate) const HELPER: i32 = 2;
 pub(crate) const FINISH: i32 = 3;
@@ -22,6 +23,7 @@ pub(crate) const SCALAR_CALL: i32 = 9;
 pub(crate) const TUPLE_ALLOC: i32 = 10;
 pub(crate) const NAME_LOAD: i32 = 11;
 pub(crate) const LEAF_ENTER: i32 = 12;
+pub(crate) const NAME_STORE: i32 = 13;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Slot {
@@ -40,3 +42,5 @@ pub(crate) const KIND_MASK: u64 = 0xff;
 pub(crate) const VIEW_LENGTH_SHIFT: u32 = 9;
 pub(crate) const VIEW_FEEDBACK: u64 = 1 << 8;
 const _: () = assert!(std::mem::size_of::<Slot>() == 16);
+
+pub(crate) const STRING_NEXT: i32 = 14;

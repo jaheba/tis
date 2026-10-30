@@ -2,7 +2,7 @@
 //! Runtime linking performs no instruction selection or optimizing compilation.
 mod patch;
 use crate::{
-    Error, Result, Value, Vm,
+    Error, Result, Vm,
     bytecode::Code,
     hir::Function,
     lir::{self, FloatOperator, Operation, Register, Terminator},
@@ -190,15 +190,16 @@ impl Plan {
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "callback"
                     }
+                    Operation::Copy(value) => {
+                        p.left = slot(*value)?;
+                        "copy"
+                    }
                     Operation::Constant(value) => {
-                        let value = Slot::boxed(match value {
-                            crate::hir::Constant::Unbound => Value::Unbound,
-                            crate::hir::Constant::None => Value::None,
-                            crate::hir::Constant::Bool(v) => Value::Bool(*v),
-                            crate::hir::Constant::Int(v) => Value::Int(*v),
-                            crate::hir::Constant::Float(v) => Value::Float(*v),
-                            _ => return Err(Error::InvalidIr("allocating stencil constant")),
-                        });
+                        let value = Slot::boxed(
+                            value
+                                .immediate()
+                                .ok_or(Error::InvalidIr("allocating stencil constant"))?,
+                        );
                         p.tag = value.tag;
                         p.a = value.a;
                         "constant"

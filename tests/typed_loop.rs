@@ -238,14 +238,8 @@ fn boxed_read_snapshots_refresh_after_native_float_writes() {
         let Object::Tuple(values) = vm.heap.get(result).unwrap() else {
             panic!()
         };
-        assert_eq!(
-            vm.heap.get(values[0]).unwrap(),
-            &Object::String("[1.0]".into())
-        );
-        assert_eq!(
-            vm.heap.get(values[1]).unwrap(),
-            &Object::String("[2.0]".into())
-        );
+        assert_eq!(vm.heap.as_str(&(values[0])).unwrap(), "[1.0]");
+        assert_eq!(vm.heap.as_str(&(values[1])).unwrap(), "[2.0]");
     }
 }
 

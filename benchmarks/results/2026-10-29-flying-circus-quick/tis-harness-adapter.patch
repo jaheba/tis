@@ -1,0 +1,145 @@
+--- a/src/flying_circus/runtimes.py
++++ b/src/flying_circus/runtimes.py
+@@ -29,7 +29,9 @@
+     arguments = list(arguments or [])
+     response = subprocess.run([str(binary), '--version'], capture_output=True, text=True, timeout=timeout, check=True)
+     version = (response.stdout + response.stderr).strip()
+-    if 'monty' in version.lower():
++    if version.lower().startswith('tis-bench '):
++        engine = 'tis'
++    elif 'monty' in version.lower():
+         engine = 'monty'
+     else:
+         response = subprocess.run([str(binary), *arguments, '-c', 'import sys; print(sys.implementation.name)'],
+--- a/src/flying_circus/workers.py
++++ b/src/flying_circus/workers.py
+@@ -177,3 +177,13 @@
+     def run(self, code, filename):
+         result = self.request({'kind': 'run', 'code': code, 'filename': filename})
+         return result['stdout'], result['stderr']
++
++
++class TisWorker(CPythonWorker):
++    """Use tis's benchmark-only JSON worker without a Python execution delegate."""
++    def __init__(self, binary, timeout, arguments=()):
++        Worker.__init__(self, [str(binary), *arguments, '--worker'], timeout, False)
++
++
++def worker_type(engine):
++    return {'monty': MontyWorker, 'tis': TisWorker}.get(engine, CPythonWorker)
+--- a/src/flying_circus/warm.py
++++ b/src/flying_circus/warm.py
+@@ -18,7 +18,7 @@
+ from .workload_source import split_source, prepare
+ from .machine import cpu_info
+ from .memory_collect import METHOD, collect, helper_hash
+-from .workers import CPythonWorker, MontyWorker, PROTOCOL_VERSION
++from .workers import CPythonWorker, MontyWorker, TisWorker, PROTOCOL_VERSION
+ 
+ 
+ def one_shot_worker(cls, binary, timeout, code, filename, setup=""):
+@@ -106,7 +106,7 @@
+ 
+     engine_types = {key: runtime['engine'] for key, runtime in runtimes.items()}
+     def worker_class(key):
+-        cls = MontyWorker if engine_types[key] == 'monty' else CPythonWorker
++        cls = MontyWorker if engine_types[key] == 'monty' else TisWorker if engine_types[key] == 'tis' else CPythonWorker
+         arguments = runtimes[key].get('arguments', [])
+         return partial(cls, arguments=arguments) if arguments else cls
+ 
+--- a/src/flying_circus/bench.py
++++ b/src/flying_circus/bench.py
+@@ -13,7 +13,7 @@
+ from pathlib import Path
+ 
+ from .compatibility import probe_workload, select_workloads
+-from .workers import CPythonWorker, MontyWorker
++from .workers import CPythonWorker, MontyWorker, TisWorker
+ 
+ ROOT = Path(__file__).resolve().parent
+ 
+@@ -46,7 +46,7 @@
+     parser.add_argument('--monty', '--binary', dest='monty', type=Path, required=True,
+                         help='Monty binary or CPython executable')
+     parser.add_argument('--revision', required=True)
+-    parser.add_argument('--engine', choices=('monty', 'cpython', 'pypy', 'rustpython'), default='monty')
++    parser.add_argument('--engine', choices=('monty', 'cpython', 'pypy', 'rustpython', 'tis'), default='monty')
+     parser.add_argument('--suite', choices=('applications', 'benchmark_game', 'pyperformance', 'rustpython', 'rustpython_micro', 'text', 'all'), default='applications')
+     parser.add_argument('--build-info', default='', help='Compiler, profile and build flags')
+     parser.add_argument('--samples', type=int, default=20)
+@@ -83,7 +83,7 @@
+     for name, record in records.items():
+         spec = manifest[name]
+         if spec.get('compatibility_probe'):
+-            cls = MontyWorker if args.engine == 'monty' else CPythonWorker
++            cls = MontyWorker if args.engine == 'monty' else TisWorker if args.engine == 'tis' else CPythonWorker
+             source = ROOT / 'workloads' / spec['file']
+             check = probe_workload(cls, binary, args.timeout, source.read_text(), spec['file'], spec['stdout'],
+                                    spec.get('known_missing', ()))
+--- a/src/flying_circus/worker_memory.py
++++ b/src/flying_circus/worker_memory.py
+@@ -2,14 +2,14 @@
+ import sys
+ 
+ from .workload_source import split_source, prepare
+-from .workers import CPythonWorker, MontyWorker
++from .workers import CPythonWorker, MontyWorker, TisWorker
+ 
+ 
+ def main():
+     import resource
+ 
+     request = json.load(sys.stdin)
+-    cls = MontyWorker if request['engine'] == 'monty' else CPythonWorker
++    cls = MontyWorker if request['engine'] == 'monty' else TisWorker if request['engine'] == 'tis' else CPythonWorker
+     with cls(request['binary'], request['timeout'], arguments=request.get('arguments', [])) as worker:
+         worker.ready()
+         worker.configure(request['filename'])
+--- a/src/flying_circus/formatting.py
++++ b/src/flying_circus/formatting.py
+@@ -50,14 +50,14 @@
+     import re
+ 
+     number = r'(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z][\w.-]*|[-+][\w.-]+)?)'
+-    prefix = {'monty': r'monty(?:-runtime)?', 'cpython': r'Python', 'pypy': r'PyPy', 'rustpython': r'RustPython'}.get(engine)
++    prefix = {'monty': r'monty(?:-runtime)?', 'cpython': r'Python', 'pypy': r'PyPy', 'rustpython': r'RustPython', 'tis': r'tis-bench'}.get(engine)
+     match = re.search(prefix + r'\s+v?' + number, output, re.IGNORECASE) if prefix else None
+     return match.group(1) if match else 'unknown'
+ 
+ 
+ def runtime_description(runtime, run):
+     engine = runtime.get('engine') or run.get('engine', 'unknown')
+-    name = {'monty': 'Monty', 'cpython': 'CPython', 'pypy': 'PyPy', 'rustpython': 'RustPython'}.get(engine, engine)
++    name = {'monty': 'Monty', 'cpython': 'CPython', 'pypy': 'PyPy', 'rustpython': 'RustPython', 'tis': 'tis'}.get(engine, engine)
+     output = runtime.get('version') or run.get('runtime_version') or runtime.get('revision', '')
+     version = runtime_version(engine, output)
+     label = runtime_label(runtime)
+--- /dev/null
++++ b/tests/test_tis_adapter.py
+@@ -0,0 +1,26 @@
++import os
++import unittest
++from pathlib import Path
++from flying_circus import runtimes
++from flying_circus.workers import TisWorker, WorkloadError, worker_type
++
++BINARY = os.environ.get('TIS_BENCH_BINARY')
++
++@unittest.skipUnless(BINARY, 'set TIS_BENCH_BINARY to test the tis adapter')
++class TisAdapterTests(unittest.TestCase):
++    def test_runtime_identity_and_worker_selection(self):
++        runtime = runtimes.resolve('tis=' + BINARY, arguments=['--tier', 'native'])
++        self.assertEqual(runtime['engine'], 'tis')
++        self.assertIs(worker_type('tis'), TisWorker)
++
++    def test_fixture_session_reset_and_unicode(self):
++        for tier in ['bytecode', 'native']:
++            with TisWorker(Path(BINARY), 10, ['--tier', tier, '--readonly-regions', '--mutation-regions']) as worker:
++                worker.ready()
++                worker.configure('fixture.py')
++                self.assertEqual(worker.run('data=[1,2,3]', 'fixture.py'), ('', ''))
++                self.assertEqual(worker.run("print('東京', len(data))", 'benchmark.py'), ('東京 3\n', ''))
++                worker.configure('fresh.py')
++                with self.assertRaises(WorkloadError):
++                    worker.run('print(data)', 'fresh.py')
++                self.assertEqual(worker.run('print(4)', 'fresh.py'), ('4\n', ''))

@@ -3,6 +3,7 @@
 
 mod prune;
 mod remap;
+mod unpack;
 
 use crate::{
     Error, Result,
@@ -167,6 +168,8 @@ pub enum Helper {
     Len,
     /// A guarded no-GC scalar probe with general positional-call fallback and full Call effects.
     ScalarCall(ScalarBuiltin),
+    /// Exact string iterator probe; exhaustion and other receivers use the original Next helper.
+    StringNext,
     Python(CoreOp),
 }
 pub use crate::execution::ScalarBuiltin;
@@ -213,6 +216,8 @@ pub enum Operation {
         failure: ExitId,
     },
     Constant(Constant),
+    /// Preserve a HIR result identity while reusing an already checked boxed value.
+    Copy(Register),
     Truth {
         value: Register,
         state: StateId,
@@ -1047,7 +1052,9 @@ impl Function {
                             overflow: output.exit(state, ExitReason::IntegerOverflow),
                         },
                     );
-                } else if let hir::Op::Constant(Constant::String(text)) = &instruction.op {
+                } else if let hir::Op::Constant(Constant::String(text)) = &instruction.op
+                    && text.len() > crate::InlineString::CAPACITY
+                {
                     views.clear();
                     let roots = output.states[state.0]
                         .values
@@ -1125,7 +1132,7 @@ impl Function {
                         }
                         hir::Op::Runtime(CoreOp::Call(names), _)
                             if mode == LoweringMode::Profiled
-                                && names.len() == 1
+                                && !names.is_empty()
                                 && names.iter().all(Option::is_none) =>
                         {
                             let leaf = profile
@@ -1149,8 +1156,27 @@ impl Function {
                                         None
                                     }
                                 });
-                            leaf.map(Helper::ScalarCall)
+                            leaf.filter(|builtin| builtin.accepts(names.len()))
+                                .map(Helper::ScalarCall)
                                 .unwrap_or_else(|| Helper::Python(CoreOp::Call(names.clone())))
+                        }
+                        hir::Op::Runtime(CoreOp::Next, inputs)
+                            if mode == LoweringMode::Profiled
+                                && inputs.len() == 1
+                                && hir.instruction(inputs[0]).is_some_and(|iterator| {
+                                    matches!(iterator.op, hir::Op::Runtime(CoreOp::Iter, _))
+                                        && (profile
+                                            .site(inputs[0])
+                                            .and_then(|site| site.operands.first())
+                                            .and_then(|operand| operand.monomorphic())
+                                            == Some(ValueKind::String)
+                                            || profile
+                                                .site(origin)
+                                                .and_then(|site| site.result.monomorphic())
+                                                == Some(ValueKind::String))
+                                }) =>
+                        {
+                            Helper::StringNext
                         }
                         hir::Op::Runtime(op, _) => Helper::Python(op.clone()),
                         hir::Op::Constant(_) => unreachable!(),
@@ -1376,6 +1402,9 @@ impl Function {
         }
         if mode == LoweringMode::Profiled && allow_inline {
             crate::leaf_inline::merge(hir, &mut output, allow_cfg)?;
+        }
+        if mode == LoweringMode::Profiled && allow_inline {
+            output.reuse_unpack_bundles();
         }
         if mode == LoweringMode::Profiled && output.blocks.len() == hir.blocks.len() {
             for (header, body, iterator, state) in crate::region::LoopRegion::candidates(&output) {
@@ -1704,7 +1733,11 @@ impl Function {
                         }
                         Some(Type::Boxed)
                     }
-                    Operation::Constant(Constant::String(_)) => return Err(fail()),
+                    Operation::Copy(value) => {
+                        kind(*value, Type::Boxed)?;
+                        Some(Type::Boxed)
+                    }
+                    Operation::Constant(value) if value.immediate().is_none() => return Err(fail()),
                     Operation::Constant(_) => Some(Type::Boxed),
                     Operation::Truth {
                         value,
@@ -2443,7 +2476,8 @@ impl Operation {
                 SequenceIndex::Value(index) => vec![*value, *index],
             },
             Self::Constant(_) => vec![],
-            Self::GuardInt { value, .. }
+            Self::Copy(value)
+            | Self::GuardInt { value, .. }
             | Self::GuardFloat { value, .. }
             | Self::UnboxFloat(value)
             | Self::IntToFloat(value)
@@ -2613,7 +2647,7 @@ impl Helper {
             | Self::Len
             | Self::LoadName(_) => readonly,
             Self::SetItem | Self::StoreName(_) | Self::SetAttr(_) => writing,
-            Self::GetAttr(_) | Self::ScalarCall(_) | Self::InlineCall { .. } => {
+            Self::GetAttr(_) | Self::ScalarCall(_) | Self::StringNext | Self::InlineCall { .. } => {
                 Effects::CONSERVATIVE
             }
             Self::StringConstant(_)
@@ -2631,7 +2665,10 @@ impl Helper {
                 | CoreOp::Unary(_) => readonly,
                 // Attribute setters only update instance/class maps; descriptors and Python setters
                 // are not supported, and these writes cannot trigger heap collection.
-                CoreOp::StoreLocal(_) | CoreOp::StoreName(_) | CoreOp::SetAttr(_) => writing,
+                CoreOp::StoreLocal(_)
+                | CoreOp::StoreName(_)
+                | CoreOp::SetAttr(_)
+                | CoreOp::ListAppend => writing,
                 CoreOp::Binary(op)
                     if matches!(op.as_str(), "/" | "//" | "%" | "**" | "&" | "|" | "^") =>
                 {
@@ -2668,11 +2705,10 @@ impl Helper {
             Self::StringConstant(_) | Self::LoadName(_) => count == 0,
             Self::StoreName(_) | Self::GetAttr(_) => count == 1,
             Self::SetAttr(_) => count == 2,
-            Self::Add | Self::Subtract | Self::Less | Self::GetItem | Self::ScalarCall(_) => {
-                count == 2
-            }
+            Self::ScalarCall(builtin) => count > 0 && builtin.accepts(count - 1),
+            Self::Add | Self::Subtract | Self::Less | Self::GetItem => count == 2,
             Self::SetItem => count == 3,
-            Self::Len => count == 1,
+            Self::Len | Self::StringNext => count == 1,
             Self::List | Self::Tuple => true,
             Self::Dict => count.is_multiple_of(2),
             Self::Python(op) => match op {
@@ -2694,6 +2730,12 @@ impl Helper {
                 | CoreOp::UnpackItem(_)
                 | CoreOp::Format(..)
                 | CoreOp::Assert => count == 1,
+                CoreOp::TryCall(_) => count == 0,
+                CoreOp::EnterExcept => count == 1,
+                CoreOp::ExceptionMatch | CoreOp::ListAppend => count == 2,
+                CoreOp::ExitExcept => count == 0,
+                CoreOp::Generator(filters, _) => count == filters + 3,
+                CoreOp::Raise => count <= 1,
                 CoreOp::Binary(_)
                 | CoreOp::Inplace(_)
                 | CoreOp::Compare(_)

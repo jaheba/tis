@@ -105,3 +105,98 @@ fn both_encoders_reject_cycles_nonfinite_and_nonstring_keys() {
         assert!(vm.call(encode, &[dict]).is_err());
     }
 }
+
+#[test]
+fn dumps_default_spacing_unicode_and_sorted_keys_match_python() {
+    let source = r#"
+import json
+assert json.dumps({'z': [1,True,None], 'a': 'é😀'}) == '{"z": [1, true, null], "a": "\\u00e9\\ud83d\\ude00"}'
+assert json.dumps({'z': 1, 'a': 2}, sort_keys=True) == '{"a": 2, "z": 1}'
+assert json.dumps('é😀', ensure_ascii=False) == '"é😀"'
+assert json.dumps('\n\r\t\b\f' + chr(0) + '"' + chr(92)) == '"\\n\\r\\t\\b\\f\\u0000\\"\\\\"'
+assert json.loads(json.dumps({'é': {'z': 1, 'a': 2}}, sort_keys=True)) == {'é': {'a': 2, 'z': 1}}
+"#;
+    for tier in [
+        Tiering::Bytecode,
+        Tiering::Lir,
+        Tiering::Native,
+        Tiering::CopyPatch,
+    ] {
+        run(tier, source);
+    }
+}
+
+#[test]
+fn streaming_parser_keeps_key_order_boundaries_and_releases_partial_results() {
+    let source = r#"
+import json
+assert json.loads('{"x":1,"y":2,"x":3}') == {'x':3,'y':2}
+assert list(json.loads('{"x":1,"y":2,"x":3}')) == ['x','y']
+assert json.loads('{"$serde_json::private::Number":"123"}') == {'$serde_json::private::Number':'123'}
+assert json.loads('"\\ud83d\\ude00"') == '😀'
+assert json.loads('-0') == 0
+assert json.loads('1e-999') == 0.0
+assert json.loads('[1e2,-1.5,0.0]') == [100.0,-1.5,0.0]
+"#;
+    let mut vm = run(Tiering::Bytecode, source);
+    vm.run_program(&mut compile("def parse(text):\n    return json.loads(text)").unwrap())
+        .unwrap();
+    let parse = vm.get_global("parse").unwrap();
+    vm.collect_garbage(&[]).unwrap();
+    let baseline = vm.heap.allocation_count();
+    for text in [
+        "[{}, {},",
+        "{\"x\": [1,2,",
+        "[1] trailing",
+        "[1,]",
+        "{\"x\":1,}",
+        "Infinity",
+        "-Infinity",
+        "18446744073709551615",
+    ] {
+        let value = vm.heap.string(text);
+        assert!(vm.call(parse, &[value]).is_err(), "{text}");
+        vm.collect_garbage(&[]).unwrap();
+        assert!(vm.stack_len() == 0);
+        assert_eq!(vm.heap.allocation_count(), baseline);
+    }
+    let nested = format!("{}0{}", "[".repeat(65), "]".repeat(65));
+    let value = vm.heap.string(&nested);
+    assert!(vm.call(parse, &[value]).is_err());
+}
+
+#[test]
+fn dictionary_keys_own_text_after_source_collection() {
+    for tier in [
+        Tiering::Bytecode,
+        Tiering::Lir,
+        Tiering::Native,
+        Tiering::CopyPatch,
+    ] {
+        let mut vm = run(
+            tier,
+            r#"
+import json
+keys = ['id', 'é\x00😀', 'abcdefghijklmnopqrstuvw', 'abcdefghijklmnopqrstuvwx', 'abcdefghijklmnopqrstuvwxy']
+result = {}
+for i in range(len(keys)):
+    result[keys[i]] = i
+assert json.loads(json.dumps(result)) == result
+def f(**kwargs):
+    return kwargs
+assert f(**{'é': 3}) == {'é': 3}
+keys = None
+"#,
+        );
+        let result = vm.get_global("result").unwrap();
+        vm.collect_garbage(&[result]).unwrap();
+        let Object::Dict(items) = vm.heap.get(result).unwrap() else {
+            panic!("dictionary");
+        };
+        assert_eq!(items.get_str("é\0😀"), Some(&Value::Int(1)));
+        assert_eq!(
+            items.get_str("abcdefghijklmnopqrstuvwxy"),
+            Some(&Value::Int(4))
+        );
+    }
+}

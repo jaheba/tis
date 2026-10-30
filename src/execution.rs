@@ -1,4 +1,5 @@
 //! Lexical environments and Python object operations shared by execution backends.
+pub(crate) mod expression;
 
 use crate::{
     Error, Heap, Key, Object, Result, Value, Vm,
@@ -17,27 +18,49 @@ use std::{
 pub enum ScalarBuiltin {
     Len,
     Sqrt,
+    BisectLeft,
+    BisectRight,
 }
 impl ScalarBuiltin {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Len => "len",
             Self::Sqrt => "math.sqrt",
+            Self::BisectLeft => "bisect.bisect_left",
+            Self::BisectRight => "bisect.bisect_right",
         }
     }
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "len" => Some(Self::Len),
             "math.sqrt" => Some(Self::Sqrt),
+            "bisect.bisect_left" => Some(Self::BisectLeft),
+            "bisect.bisect_right" => Some(Self::BisectRight),
             _ => None,
         }
     }
-    /// The closed implementation calls only heap length, primitive math and argument checks;
-    /// none allocate VM objects or collect. Heap has interior mutability, so this is an audited
-    /// body/callee contract, not a guarantee from &Heap alone. Rust error strings do not trigger GC.
+    pub(crate) fn accepts(self, count: usize) -> bool {
+        match self {
+            Self::BisectLeft | Self::BisectRight => (2..=4).contains(&count),
+            _ => count == 1,
+        }
+    }
+    /// No VM allocation, collection or Python calls. Heap interior mutability makes this
+    /// a body/callee contract; ordinary Rust error strings cannot trigger VM collection.
     fn evaluate(self, heap: &Heap, args: &[Value]) -> Result<Value> {
+        if matches!(self, Self::BisectLeft | Self::BisectRight) {
+            arity(args, 2, 4)?;
+            let lo = args.get(2).map(|&v| integer(v)).transpose()?.unwrap_or(0);
+            let hi = match args.get(3).copied().unwrap_or(Value::None) {
+                Value::None => -1,
+                v => integer(v)?,
+            };
+            return crate::bisect::search(heap, args[0], args[1], lo, hi, self == Self::BisectLeft)
+                .map(Value::Int);
+        }
         arity(args, 1, 1)?;
         Ok(match self {
+            Self::BisectLeft | Self::BisectRight => unreachable!(),
             Self::Len => Value::Int(heap.len(args[0])? as i64),
             Self::Sqrt => {
                 let value = number(args[0])?;
@@ -99,6 +122,7 @@ fn builtin_method_name(name: &str) -> Result<&'static str> {
         "upper" => "upper",
         "lower" => "lower",
         "strip" => "strip",
+        "isdigit" => "isdigit",
         "startswith" => "startswith",
         "endswith" => "endswith",
         "replace" => "replace",
@@ -114,12 +138,22 @@ pub(crate) fn visit_children(object: &Object, mut visit: impl FnMut(Value)) {
     };
     match object {
         Object::List(values) if !values.is_float() => values.iter().copied().for_each(edge),
-        Object::Tuple(values)
-        | Object::Set(values)
+        Object::Exception {
+            arguments: values, ..
+        }
+        | Object::Tuple(values)
         | Object::Zip {
             iterators: values, ..
         } => values.iter().copied().for_each(edge),
-        Object::Dict(values) => values.iter().map(|(_, value)| *value).for_each(edge),
+        Object::Generator { parts, binding, .. } => {
+            parts.iter().copied().for_each(&mut edge);
+            if let Some(binding) = binding {
+                edge(binding.0);
+            }
+        }
+        Object::Dict(values) | Object::Set(values) => {
+            values.iter().map(|(_, value)| *value).for_each(edge)
+        }
         Object::Environment(env) => env
             .values
             .values()
@@ -163,6 +197,17 @@ impl Vm {
         }
         let mut values = crate::bindings::Bindings::new();
         for name in [
+            "BaseException",
+            "Exception",
+            "ValueError",
+            "TypeError",
+            "RuntimeError",
+            "StopIteration",
+            "ZeroDivisionError",
+            "UnboundLocalError",
+            "OverflowError",
+            "KeyError",
+            "IndexError",
             "len",
             "range",
             "list",
@@ -306,28 +351,44 @@ impl Vm {
         }
     }
 
+    /// A cache hit only replaces an existing binding: no allocation, collection, or Python calls.
+    pub(crate) fn try_store_name_slot(
+        &mut self,
+        value: Value,
+        cache: &std::cell::Cell<Option<crate::bindings::NameSlot>>,
+    ) -> Result<bool> {
+        let environment = *self
+            .environments
+            .last()
+            .ok_or(Error::InvalidIr("frame environment"))?;
+        let Some(address) = cache
+            .get()
+            .filter(|address| address.environment == environment)
+        else {
+            return Ok(false);
+        };
+        let mut object = self.heap.get_mut(address.namespace)?;
+        let Object::Environment(namespace) = &mut *object else {
+            return Err(Error::InvalidIr("name namespace"));
+        };
+        namespace.values.set(address.slot, value);
+        self.tier_stats.name_cache_hits += 1;
+        Ok(true)
+    }
+
     pub(crate) fn store_name_slot(
         &mut self,
         name: &str,
         value: Value,
         cache: &std::cell::Cell<Option<crate::bindings::NameSlot>>,
     ) -> Result<()> {
+        if self.try_store_name_slot(value, cache)? {
+            return Ok(());
+        }
         let environment = *self
             .environments
             .last()
             .ok_or(Error::InvalidIr("frame environment"))?;
-        if let Some(address) = cache
-            .get()
-            .filter(|address| address.environment == environment)
-        {
-            let mut object = self.heap.get_mut(address.namespace)?;
-            let Object::Environment(namespace) = &mut *object else {
-                return Err(Error::InvalidIr("name namespace"));
-            };
-            namespace.values.set(address.slot, value);
-            self.tier_stats.name_cache_hits += 1;
-            return Ok(());
-        }
         let target = self.store_target(environment, name)?;
         self.store(environment, name, value)?;
         let slot = self
@@ -564,6 +625,9 @@ impl Vm {
     }
 
     pub fn call(&mut self, callable: Value, arguments: &[Value]) -> Result<Value> {
+        if self.depth == 0 {
+            self.pending_exception = None;
+        }
         let roots = self.transient_roots.len();
         self.transient_roots.push(callable);
         self.transient_roots.extend_from_slice(arguments);
@@ -578,7 +642,7 @@ impl Vm {
         &mut self,
         builtin: ScalarBuiltin,
         callable: Value,
-        argument: Value,
+        arguments: &[Value],
     ) -> Option<Result<Value>> {
         if !matches!(self.heap.get(callable), Ok(Object::Native(name)) if name.as_ref() == builtin.name())
         {
@@ -586,7 +650,7 @@ impl Vm {
         }
         self.tier_stats.bytecode_positional_calls += 1;
         self.tier_stats.bytecode_leaf_calls += 1;
-        Some(builtin.evaluate(&self.heap, &[argument]))
+        Some(builtin.evaluate(&self.heap, arguments))
     }
 
     /// Register operands remain rooted in their caller's window until the result is stored.
@@ -738,35 +802,109 @@ impl Vm {
                 _ => return Err(Error::Unsupported("unary operator")),
             },
             CoreOp::Call(names) => {
-                let mut positional = vec![];
-                let mut keywords = vec![];
-                for (name, &value) in names.iter().zip(&values[1..]) {
-                    match name.as_deref() {
-                        None => positional.push(value),
-                        Some("*") => positional.extend(self.collect_iter(value)?),
-                        Some("**") => {
-                            let Object::Dict(items) = self.heap.get(value)? else {
-                                return Err(Error::Type("** requires dictionary"));
-                            };
-                            for (key, value) in items {
-                                let Key::String(name) = key else {
-                                    return Err(Error::Type("keywords must be strings"));
+                let roots = self.transient_roots.len();
+                let result = (|| {
+                    let mut positional = vec![];
+                    let mut keywords: Vec<(String, Value)> = vec![];
+                    for (name, &value) in names.iter().zip(&values[1..]) {
+                        match name.as_deref() {
+                            None => positional.push(value),
+                            Some("*") => {
+                                let expanded = self.collect_iter(value)?;
+                                self.transient_roots.extend_from_slice(&expanded);
+                                positional.extend(expanded);
+                            }
+                            Some("**") => {
+                                let Object::Dict(items) = self.heap.get(value)? else {
+                                    return Err(Error::Type("** requires dictionary"));
                                 };
+                                for (key, value) in items {
+                                    let Key::String(name) = key else {
+                                        return Err(Error::Type("keywords must be strings"));
+                                    };
+                                    if keywords
+                                        .iter()
+                                        .any(|(candidate, _)| candidate.as_str() == name.as_str())
+                                    {
+                                        return Err(error("duplicate keyword"));
+                                    }
+                                    keywords.push((name.to_string(), *value));
+                                }
+                            }
+                            Some(name) => {
                                 if keywords.iter().any(|(candidate, _)| candidate == name) {
                                     return Err(error("duplicate keyword"));
                                 }
-                                keywords.push((name.clone(), *value));
+                                keywords.push((name.into(), value));
                             }
-                        }
-                        Some(name) => {
-                            if keywords.iter().any(|(candidate, _)| candidate == name) {
-                                return Err(error("duplicate keyword"));
-                            }
-                            keywords.push((name.into(), value));
                         }
                     }
+                    self.call_keywords(values[0], &positional, &keywords)
+                })();
+                self.transient_roots.truncate(roots);
+                result?
+            }
+            CoreOp::TryCall(body) => {
+                let key = (body.id(), body.revision());
+                let function = self
+                    .try_bodies
+                    .entry(key)
+                    .or_insert_with(|| Rc::new(RefCell::new((**body).clone())))
+                    .clone();
+                // Internal expressions have no Python function identity or private locals.
+                // Their enclosing environment remains rooted throughout this ordinary frame.
+                let result = self.execute_bound_frame(
+                    function,
+                    env,
+                    &[],
+                    Some(crate::vm::PositionalBindings {
+                        defaults: &[],
+                        count: 0,
+                    }),
+                );
+                let (success, value) = match result {
+                    Ok(value) => (true, value),
+                    Err(err) => {
+                        let value = if let Some(value) = self.pending_exception.take() {
+                            value
+                        } else {
+                            self.exception_from_error(err)?
+                        };
+                        (false, value)
+                    }
+                };
+                self.heap
+                    .allocate(Object::Tuple(vec![Value::Bool(success), value]))
+            }
+            CoreOp::ExceptionMatch => Value::Bool(self.exception_matches(values[0], values[1])?),
+            CoreOp::EnterExcept => {
+                self.active_exceptions.push(values[0]);
+                Value::None
+            }
+            CoreOp::ExitExcept => {
+                self.active_exceptions
+                    .pop()
+                    .ok_or(Error::InvalidIr("exception stack underflow"))?;
+                Value::None
+            }
+            CoreOp::ListAppend => {
+                let mut object = self.heap.get_mut(values[0])?;
+                let Object::List(items) = &mut *object else {
+                    return Err(Error::Type("append requires list"));
+                };
+                items.push(values[1]);
+                Value::None
+            }
+            CoreOp::Generator(filters, target) => {
+                if values.len() != filters + 3 {
+                    return Err(Error::InvalidIr("generator operands"));
                 }
-                self.call_keywords(values[0], &positional, &keywords)?
+                self.heap.allocate(Object::Generator {
+                    parts: values.to_vec().into(),
+                    binding: target.as_ref().map(|name| Rc::new((env, name.clone()))),
+                    running: false,
+                    done: false,
+                })
             }
             CoreOp::Function(function) => {
                 let capture = if self.env(env)?.class_scope {
@@ -843,7 +981,18 @@ impl Vm {
                         }
                         items.to_vec()
                     }
-                    _ => self.collect_iter(values[0])?,
+                    _ => self.with_iterator(values[0], |vm, iterator| {
+                        let mut items = Vec::new();
+                        for _ in 0..=*count {
+                            let value = vm.next(iterator)?;
+                            if vm.is_done(value) {
+                                break;
+                            }
+                            vm.transient_roots.push(value);
+                            items.push(value);
+                        }
+                        Ok(items)
+                    })?,
                 };
                 if items.len() != *count {
                     return Err(error("ValueError: unpacking length mismatch"));
@@ -859,7 +1008,7 @@ impl Vm {
                 step: values[2],
             }),
             CoreOp::Set => {
-                let set = self.heap.allocate(Object::Set(vec![]));
+                let set = self.heap.allocate(Object::Set(Default::default()));
                 for &value in values {
                     self.method(set, "add", &[value])?;
                 }
@@ -891,18 +1040,19 @@ impl Vm {
                 } else {
                     return Err(Error::Unsupported("format specification"));
                 };
-                self.heap.allocate(Object::String(text))
+                self.heap.string_owned(text)
             }
             CoreOp::Join => {
                 let mut text = String::new();
                 for &value in values {
-                    let Object::String(part) = self.heap.get(value)? else {
+                    let Some(part) = self.heap.as_str(&(value)) else {
                         return Err(Error::Type("join requires strings"));
                     };
                     text.push_str(part);
                 }
-                self.heap.allocate(Object::String(text))
+                self.heap.string_owned(text)
             }
+            CoreOp::Raise => return self.raise_exception(values),
             CoreOp::Assert => {
                 if !runtime::truth(&self.heap, values[0])? {
                     return Err(error("AssertionError"));
@@ -910,7 +1060,7 @@ impl Vm {
                 Value::None
             }
             CoreOp::Import(name) => {
-                if name != "math" && name != "json" {
+                if name != "math" && name != "json" && name != "bisect" {
                     return Err(Error::Unsupported("builtin module"));
                 }
                 if let Some(&module) = self.modules.get(name) {
@@ -925,7 +1075,7 @@ impl Vm {
         })
     }
 
-    fn is_done(&self, value: Value) -> bool {
+    pub(crate) fn is_done(&self, value: Value) -> bool {
         matches!(value, Value::Ref(_)) && matches!(self.heap.get(value), Ok(Object::Done))
     }
 
@@ -969,6 +1119,29 @@ impl Vm {
 
     /// Only builtin containers and strings bind through this path; instances retain normal lookup.
     pub(crate) fn builtin_method(&self, object: Value, name: &str) -> Result<Option<&'static str>> {
+        if matches!(object, Value::InlineString(_)) {
+            return Ok(
+                if [
+                    "join",
+                    "split",
+                    "splitlines",
+                    "rjust",
+                    "upper",
+                    "lower",
+                    "strip",
+                    "isdigit",
+                    "startswith",
+                    "endswith",
+                    "replace",
+                ]
+                .contains(&name)
+                {
+                    Some(builtin_method_name(name)?)
+                } else {
+                    None
+                },
+            );
+        }
         let supported = match self.heap.get(object)? {
             Object::List(_)
                 if [
@@ -1005,6 +1178,7 @@ impl Vm {
                     "upper",
                     "lower",
                     "strip",
+                    "isdigit",
                     "startswith",
                     "endswith",
                     "replace",
@@ -1079,7 +1253,28 @@ impl Vm {
         name: &str,
         cached: Option<&crate::Attribute>,
     ) -> Result<Value> {
+        if matches!(object, Value::InlineString(_)) {
+            return self
+                .builtin_method(object, name)?
+                .map(|name| self.heap.allocate(Object::Bound(object, name.into())))
+                .ok_or_else(|| error(format!("AttributeError: {name}")));
+        }
         match self.heap.get(object)? {
+            Object::Native(module) if module == "bisect" => {
+                let key = match name {
+                    "bisect_left" => "bisect.bisect_left",
+                    "bisect_right" | "bisect" => "bisect.bisect_right",
+                    "insort_left" => "bisect.insort_left",
+                    "insort_right" | "insort" => "bisect.insort_right",
+                    _ => return Err(error(format!("AttributeError: bisect.{name}"))),
+                };
+                if let Some(&function) = self.modules.get(key) {
+                    return Ok(function);
+                }
+                let function = self.heap.allocate(Object::Native(key.into()));
+                self.modules.insert(key.into(), function);
+                return Ok(function);
+            }
             Object::Native(module) if module == "json" => {
                 let key = match name {
                     "loads" => "json.loads",
@@ -1140,6 +1335,11 @@ impl Vm {
                 }
             }
             _ => {
+                if name == "args"
+                    && let Ok(Object::Exception { arguments, .. }) = self.heap.get(object)
+                {
+                    return Ok(self.heap.allocate(Object::Tuple(arguments.clone())));
+                }
                 if let Some(name) = self.builtin_method(object, name)? {
                     return Ok(self.heap.allocate(Object::Bound(object, name.into())));
                 }
@@ -1148,10 +1348,21 @@ impl Vm {
         Err(error(format!("AttributeError: {name}")))
     }
 
-    fn iter(&mut self, source: Value) -> Result<Value> {
+    pub(crate) fn iter(&mut self, source: Value) -> Result<Value> {
+        if let Value::InlineString(text) = source {
+            return Ok(self.heap.allocate(Object::Iterator {
+                source,
+                index: 0,
+                size: text.as_str().chars().count(),
+                exhausted: false,
+            }));
+        }
         if matches!(
             self.heap.get(source)?,
-            Object::Iterator { .. } | Object::Enumerate { .. } | Object::Zip { .. }
+            Object::Iterator { .. }
+                | Object::Enumerate { .. }
+                | Object::Zip { .. }
+                | Object::Generator { .. }
         ) {
             return Ok(source);
         }
@@ -1164,7 +1375,33 @@ impl Vm {
         }))
     }
 
-    fn next(&mut self, iterator: Value) -> Result<Value> {
+    /// Successful character production cannot allocate or enter Python. Miss before changing the cursor.
+    pub(crate) fn try_string_next(&mut self, iterator: Value) -> Result<Option<Value>> {
+        let Object::Iterator {
+            source,
+            index,
+            exhausted: false,
+            ..
+        } = self.heap.get(iterator)?
+        else {
+            return Ok(None);
+        };
+        let Some(text) = self.heap.as_str(source) else {
+            return Ok(None);
+        };
+        let Some(character) = text.get(*index..).and_then(|suffix| suffix.chars().next()) else {
+            return Ok(None);
+        };
+        let value = self.heap.string(character.encode_utf8(&mut [0; 4]));
+        let mut guard = self.heap.get_mut(iterator)?;
+        let Object::Iterator { index, .. } = &mut *guard else {
+            unreachable!()
+        };
+        *index += character.len_utf8();
+        Ok(Some(value))
+    }
+
+    pub(crate) fn next(&mut self, iterator: Value) -> Result<Value> {
         self.next_at(iterator, 0)
     }
 
@@ -1172,62 +1409,44 @@ impl Vm {
         if depth >= 256 {
             return Err(error("RecursionError: iterator nesting"));
         }
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            self.next_inner(iterator, depth)
-        })
-    }
-
-    fn next_inner(&mut self, iterator: Value, depth: usize) -> Result<Value> {
-        match self.heap.get(iterator)?.clone() {
-            Object::Enumerate {
-                iterator: inner,
+        // Builtin iterators cannot recurse; keep stack growth at combinator boundaries.
+        let state = match self.heap.get(iterator)? {
+            Object::Iterator {
+                source,
                 index,
-            } => {
-                let value = self.next_at(inner, depth + 1)?;
-                if self.is_done(value) {
-                    return Ok(value);
-                }
-                let next_index = index.checked_add(1).ok_or(Error::IntegerOverflow)?;
-                *self.heap.get_mut(iterator)? = Object::Enumerate {
-                    iterator: inner,
-                    index: next_index,
-                };
-                return Ok(self
-                    .heap
-                    .allocate(Object::Tuple(vec![Value::Int(index), value])));
-            }
-            Object::Zip { iterators, done } => {
-                if done || iterators.is_empty() {
-                    return Ok(self.heap.allocate(Object::Done));
-                }
-                let mut row = vec![];
-                for &inner in &iterators {
-                    let value = self.next_at(inner, depth + 1)?;
-                    if self.is_done(value) {
-                        *self.heap.get_mut(iterator)? = Object::Zip {
-                            iterators,
-                            done: true,
-                        };
-                        return Ok(value);
-                    }
-                    row.push(value);
-                }
-                return Ok(self.heap.allocate(Object::Tuple(row)));
-            }
-            _ => {}
-        }
-
-        let Object::Iterator {
-            source,
-            index,
-            size,
-            exhausted,
-        } = self.heap.get(iterator)?.clone()
-        else {
-            return Err(Error::Type("next requires iterator"));
+                size,
+                exhausted,
+            } => Some((*source, *index, *size, *exhausted)),
+            _ => None,
+        };
+        let Some((source, index, size, exhausted)) = state else {
+            return stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                self.next_complex(iterator, depth)
+            });
         };
         if exhausted {
             return Ok(self.heap.allocate(Object::Done));
+        }
+        // String cursors are UTF-8 byte offsets, so each character is decoded once.
+        if let Some(text) = self.heap.as_str(&source) {
+            let character = text.get(index..).and_then(|suffix| suffix.chars().next());
+            let value = match character {
+                Some(character) => self.heap.string(character.encode_utf8(&mut [0; 4])),
+                None => self.heap.allocate(Object::Done),
+            };
+            let mut guard = self.heap.get_mut(iterator)?;
+            let Object::Iterator {
+                index, exhausted, ..
+            } = &mut *guard
+            else {
+                unreachable!()
+            };
+            if let Some(character) = character {
+                *index += character.len_utf8();
+            } else {
+                *exhausted = true;
+            }
+            return Ok(value);
         }
         let len = self.heap.len(source)?;
         if matches!(
@@ -1254,7 +1473,7 @@ impl Vm {
                     .map_err(|_| Error::IntegerOverflow)?,
             ),
             Object::Dict(items) => key_value(&self.heap, &items[index].0),
-            Object::Set(items) => items[index],
+            Object::Set(items) => items[index].1,
             Object::View { source, kind } => {
                 let Object::Dict(items) = self.heap.get(*source)? else {
                     return Err(Error::Type("invalid dictionary view"));
@@ -1278,16 +1497,160 @@ impl Vm {
         Ok(value)
     }
 
+    fn next_complex(&mut self, iterator: Value, depth: usize) -> Result<Value> {
+        if matches!(self.heap.get(iterator)?, Object::Generator { .. }) {
+            return self.generator_next(iterator, depth);
+        }
+        match self.heap.get(iterator)? {
+            Object::Enumerate {
+                iterator: inner,
+                index,
+            } => {
+                let (inner, index) = (*inner, *index);
+                let value = self.next_at(inner, depth + 1)?;
+                if self.is_done(value) {
+                    return Ok(value);
+                }
+                let next_index = index.checked_add(1).ok_or(Error::IntegerOverflow)?;
+                *self.heap.get_mut(iterator)? = Object::Enumerate {
+                    iterator: inner,
+                    index: next_index,
+                };
+                Ok(self
+                    .heap
+                    .allocate(Object::Tuple(vec![Value::Int(index), value])))
+            }
+            Object::Zip { iterators, done } => {
+                let (iterators, done) = (iterators.clone(), *done);
+                if done || iterators.is_empty() {
+                    return Ok(self.heap.allocate(Object::Done));
+                }
+                let roots = self.transient_roots.len();
+                self.transient_roots.push(iterator);
+                let result = (|| {
+                    let mut row = vec![];
+                    for &inner in &iterators {
+                        let value = self.next_at(inner, depth + 1)?;
+                        if self.is_done(value) {
+                            *self.heap.get_mut(iterator)? = Object::Zip {
+                                iterators,
+                                done: true,
+                            };
+                            return Ok(value);
+                        }
+                        self.transient_roots.push(value);
+                        row.push(value);
+                    }
+                    Ok(self.heap.allocate(Object::Tuple(row)))
+                })();
+                self.transient_roots.truncate(roots);
+                result
+            }
+            _ => Err(Error::Type("next requires iterator")),
+        }
+    }
+
+    fn generator_next(&mut self, generator: Value, depth: usize) -> Result<Value> {
+        let Object::Generator {
+            parts,
+            binding,
+            running,
+            done,
+        } = self.heap.get(generator)?
+        else {
+            unreachable!()
+        };
+        if *running {
+            return Err(error("ValueError: generator already executing"));
+        }
+        if *done {
+            return Ok(self.heap.allocate(Object::Done));
+        }
+        let parts = parts.clone();
+        let binding = binding.clone();
+        if let Object::Generator { running, .. } = &mut *self.heap.get_mut(generator)? {
+            *running = true;
+        }
+        let roots = self.transient_roots.len();
+        self.transient_roots.push(generator);
+        let result = (|| {
+            loop {
+                let value = self.next_at(parts[0], depth + 1)?;
+                if self.is_done(value) {
+                    return Ok(value);
+                }
+                if let Some(binding) = &binding {
+                    self.store(binding.0, &binding.1, value)?;
+                    self.tier_stats.generator_direct_bindings += 1;
+                } else {
+                    self.call(parts[1], &[value])?;
+                }
+                let mut accepted = true;
+                for &filter in &parts[3..] {
+                    let condition = self.generator_expression(filter)?;
+                    if !runtime::truth(&self.heap, condition)? {
+                        accepted = false;
+                        break;
+                    }
+                }
+                if accepted {
+                    return self.generator_expression(parts[2]);
+                }
+            }
+        })();
+        let result = result.map_err(|err| match err {
+            Error::Runtime(message)
+                if message == "StopIteration" || message.starts_with("StopIteration:") =>
+            {
+                error("RuntimeError: generator raised StopIteration")
+            }
+            other => other,
+        });
+        let finished = result.as_ref().map_or(true, |value| self.is_done(*value));
+        if let Object::Generator { running, done, .. } = &mut *self.heap.get_mut(generator)? {
+            *running = false;
+            *done = finished;
+        }
+        if finished
+            && let Object::Generator { parts, binding, .. } = &mut *self.heap.get_mut(generator)?
+        {
+            *parts = Rc::from([]);
+            *binding = None;
+        }
+        self.transient_roots.truncate(roots);
+        result
+    }
+
+    fn with_iterator<T>(
+        &mut self,
+        source: Value,
+        body: impl FnOnce(&mut Self, Value) -> Result<T>,
+    ) -> Result<T> {
+        let iterator = self.iter(source)?;
+        let roots = self.transient_roots.len();
+        self.transient_roots.push(iterator);
+        let result = body(self, iterator);
+        self.transient_roots.truncate(roots);
+        result
+    }
+
     fn collect_iter(&mut self, source: Value) -> Result<Vec<Value>> {
         let iterator = self.iter(source)?;
-        let mut values = vec![];
-        loop {
-            let value = self.next(iterator)?;
-            if self.is_done(value) {
-                return Ok(values);
+        let roots = self.transient_roots.len();
+        self.transient_roots.push(iterator);
+        let result = (|| {
+            let mut values = vec![];
+            loop {
+                let value = self.next(iterator)?;
+                if self.is_done(value) {
+                    return Ok(values);
+                }
+                self.transient_roots.push(value);
+                values.push(value);
             }
-            values.push(value);
-        }
+        })();
+        self.transient_roots.truncate(roots);
+        result
     }
 
     fn builtin(
@@ -1296,7 +1659,12 @@ impl Vm {
         args: &[Value],
         keywords: &[(String, Value)],
     ) -> Result<Value> {
-        if name != "print" && name != "dict" && !keywords.is_empty() {
+        if name != "print"
+            && name != "dict"
+            && name != "json.dumps"
+            && !name.starts_with("bisect.")
+            && !keywords.is_empty()
+        {
             return Err(Error::Unsupported("builtin keyword arguments"));
         }
         Ok(match name {
@@ -1304,12 +1672,12 @@ impl Vm {
                 let mut sep = " ".to_owned();
                 let mut end = "\n".to_owned();
                 for (name, value) in keywords {
-                    let Object::String(text) = self.heap.get(*value)? else {
+                    let Some(text) = self.heap.as_str(value) else {
                         return Err(Error::Type("print separator must be string"));
                     };
                     match name.as_ref() {
-                        "sep" => sep = text.clone(),
-                        "end" => end = text.clone(),
+                        "sep" => sep = text.to_owned(),
+                        "end" => end = text.to_owned(),
                         _ => return Err(error("unexpected print keyword")),
                     }
                 }
@@ -1321,12 +1689,23 @@ impl Vm {
                 self.output.push_str(&end);
                 Value::None
             }
+            name if name.starts_with("bisect.") => return self.bisect(name, args, keywords),
             "json.loads" | "json.dumps" => {
                 arity(args, 1, 1)?;
                 if name == "json.loads" {
                     crate::json::loads(&self.heap, args[0])?
                 } else {
-                    crate::json::dumps(&self.heap, args[0])?
+                    let mut options = crate::json::DumpOptions::default();
+                    for (name, value) in keywords {
+                        match name.as_str() {
+                            "ensure_ascii" => {
+                                options.ensure_ascii = runtime::truth(&self.heap, *value)?
+                            }
+                            "sort_keys" => options.sort_keys = runtime::truth(&self.heap, *value)?,
+                            _ => return Err(Error::Unsupported("json.dumps keyword")),
+                        }
+                    }
+                    crate::json::dumps(&self.heap, args[0], options)?
                 }
             }
             "chr" => {
@@ -1335,11 +1714,11 @@ impl Vm {
                 let character = code
                     .and_then(char::from_u32)
                     .ok_or_else(|| error("ValueError: invalid Unicode scalar"))?;
-                self.heap.allocate(Object::String(character.to_string()))
+                self.heap.string(character.encode_utf8(&mut [0; 4]))
             }
             "ord" => {
                 arity(args, 1, 1)?;
-                let Object::String(text) = self.heap.get(args[0])? else {
+                let Some(text) = self.heap.as_str(&(args[0])) else {
                     return Err(Error::Type("ord requires a string"));
                 };
                 let mut chars = text.chars();
@@ -1363,24 +1742,38 @@ impl Vm {
                 }
                 self.heap.allocate(Object::Range { start, stop, step })
             }
-            "list" | "tuple" | "set" => {
+            "list" | "tuple" => {
                 arity(args, 0, 1)?;
                 let items = if args.is_empty() {
                     vec![]
                 } else {
                     self.collect_iter(args[0])?
                 };
-                match name {
-                    "list" => self.heap.allocate(Object::List(items.into())),
-                    "tuple" => self.heap.allocate(Object::Tuple(items)),
-                    _ => {
-                        let set = self.heap.allocate(Object::Set(vec![]));
-                        for value in items {
-                            self.method(set, "add", &[value])?;
-                        }
-                        set
-                    }
+                if name == "list" {
+                    self.heap.allocate(Object::List(items.into()))
+                } else {
+                    self.heap.allocate(Object::Tuple(items))
                 }
+            }
+            "set" => {
+                arity(args, 0, 1)?;
+                let set = self.heap.allocate(Object::Set(Default::default()));
+                if let Some(&source) = args.first() {
+                    let roots = self.transient_roots.len();
+                    self.transient_roots.push(set);
+                    let result = self.with_iterator(source, |vm, iterator| {
+                        loop {
+                            let value = vm.next(iterator)?;
+                            if vm.is_done(value) {
+                                return Ok(());
+                            }
+                            vm.set_method(set, "add", &[value])?;
+                        }
+                    });
+                    self.transient_roots.truncate(roots);
+                    result?;
+                }
+                set
             }
             "dict" => {
                 arity(args, 0, 1)?;
@@ -1422,7 +1815,7 @@ impl Vm {
                         Value::Int(n as i64)
                     }
                     value => {
-                        let Object::String(text) = self.heap.get(value)? else {
+                        let Some(text) = self.heap.as_str(&(value)) else {
                             return Err(Error::Type("invalid integer"));
                         };
                         Value::Int(
@@ -1436,8 +1829,8 @@ impl Vm {
             "float" => {
                 arity(args, 0, 1)?;
                 let value = args.first().copied().unwrap_or(Value::Float(0.0));
-                Value::Float(if let Value::Ref(_) = value {
-                    let Object::String(text) = self.heap.get(value)? else {
+                Value::Float(if self.heap.as_str(&value).is_some() {
+                    let Some(text) = self.heap.as_str(&(value)) else {
                         return Err(Error::Type("invalid float"));
                     };
                     text.parse()
@@ -1461,7 +1854,7 @@ impl Vm {
                 } else {
                     self.repr(args[0], name == "repr")?
                 };
-                self.heap.allocate(Object::String(text))
+                self.heap.string_owned(text)
             }
             "math.sqrt" => ScalarBuiltin::Sqrt.evaluate(&self.heap, args)?,
             "math.sin" | "math.cos" | "math.log" => {
@@ -1487,49 +1880,67 @@ impl Vm {
             }
             "sum" => {
                 arity(args, 1, 2)?;
-                let mut result = args.get(1).copied().unwrap_or(Value::Int(0));
-                for value in self.collect_iter(args[0])? {
-                    result = runtime::add(&mut self.heap, result, value)?;
+                let start = args.get(1).copied().unwrap_or(Value::Int(0));
+                if self.heap.as_str(&start).is_some() {
+                    return Err(Error::Type("sum cannot start with a string"));
                 }
-                result
+                self.with_iterator(args[0], |vm, iterator| {
+                    let slot = vm.transient_roots.len();
+                    vm.transient_roots.push(start);
+                    loop {
+                        let value = vm.next(iterator)?;
+                        if vm.is_done(value) {
+                            return Ok(vm.transient_roots[slot]);
+                        }
+                        vm.transient_roots[slot] =
+                            runtime::add(&mut vm.heap, vm.transient_roots[slot], value)?;
+                    }
+                })?
             }
             "min" | "max" => {
                 arity(args, 1, usize::MAX)?;
-                let items = if args.len() == 1 {
-                    self.collect_iter(args[0])?
+                let source = if args.len() == 1 {
+                    args[0]
                 } else {
-                    args.to_vec()
+                    self.heap.allocate(Object::Tuple(args.to_vec()))
                 };
-                let mut result = *items
-                    .first()
-                    .ok_or_else(|| error("ValueError: empty sequence"))?;
-                for value in items.into_iter().skip(1) {
-                    if compare(
-                        &self.heap,
-                        if name == "min" { "<" } else { ">" },
-                        value,
-                        result,
-                    )? {
-                        result = value;
+                self.with_iterator(source, |vm, iterator| {
+                    let first = vm.next(iterator)?;
+                    if vm.is_done(first) {
+                        return Err(error("ValueError: empty sequence"));
                     }
-                }
-                result
+                    let slot = vm.transient_roots.len();
+                    vm.transient_roots.push(first);
+                    loop {
+                        let value = vm.next(iterator)?;
+                        if vm.is_done(value) {
+                            return Ok(vm.transient_roots[slot]);
+                        }
+                        if compare(
+                            &vm.heap,
+                            if name == "min" { "<" } else { ">" },
+                            value,
+                            vm.transient_roots[slot],
+                        )? {
+                            vm.transient_roots[slot] = value;
+                        }
+                    }
+                })?
             }
             "all" | "any" => {
                 arity(args, 1, 1)?;
-                let iter = self.iter(args[0])?;
-                let mut result = name == "all";
-                loop {
-                    let value = self.next(iter)?;
-                    if self.is_done(value) {
-                        break;
+                let result = self.with_iterator(args[0], |vm, iterator| {
+                    loop {
+                        let value = vm.next(iterator)?;
+                        if vm.is_done(value) {
+                            return Ok(name == "all");
+                        }
+                        let truth = runtime::truth(&vm.heap, value)?;
+                        if truth == (name == "any") {
+                            return Ok(truth);
+                        }
                     }
-                    let truth = runtime::truth(&self.heap, value)?;
-                    if truth == (name == "any") {
-                        result = truth;
-                        break;
-                    }
-                }
+                })?;
                 Value::Bool(result)
             }
             "enumerate" => {
@@ -1582,8 +1993,103 @@ impl Vm {
                 arity(args, 0, 0)?;
                 return Err(Error::Unsupported("object()"));
             }
+            name if is_exception(name) => self.construct_exception(name, args),
             _ => return Err(error(format!("unknown builtin {name}"))),
         })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn construct_exception(&self, name: &str, args: &[Value]) -> Value {
+        self.heap.allocate(Object::Exception {
+            kind: name.into(),
+            arguments: args.to_vec(),
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn raise_exception(&mut self, values: &[Value]) -> Result<Value> {
+        let mut value = values
+            .first()
+            .copied()
+            .or_else(|| self.active_exceptions.last().copied())
+            .ok_or_else(|| error("RuntimeError: No active exception to reraise"))?;
+        if let Ok(Object::Native(name)) = self.heap.get(value)
+            && is_exception(name)
+        {
+            value = self.construct_exception(name, &[]);
+        }
+        let Ok(Object::Exception { kind, .. }) = self.heap.get(value) else {
+            return Err(Error::Type("exceptions must derive from BaseException"));
+        };
+        let message = self.repr(value, false)?;
+        let message = if message.is_empty() {
+            kind.clone()
+        } else {
+            format!("{kind}: {message}")
+        };
+        self.pending_exception = Some(value);
+        Err(error(message))
+    }
+
+    fn exception_from_error(&self, err: Error) -> Result<Value> {
+        let kind = match &err {
+            Error::Type(_) | Error::Arguments { .. } => "TypeError",
+            Error::Index => "IndexError",
+            Error::MissingKey => "KeyError",
+            Error::IntegerOverflow => "OverflowError",
+            Error::Uninitialized(_) => "UnboundLocalError",
+            Error::Runtime(message) => {
+                if message.starts_with("JSON error:") {
+                    "ValueError"
+                } else {
+                    message
+                        .split(':')
+                        .next()
+                        .filter(|kind| is_exception(kind))
+                        .unwrap_or("RuntimeError")
+                }
+            }
+            _ => return Err(err),
+        };
+        let message = if let Error::Type(reason) = &err {
+            (*reason).to_owned()
+        } else {
+            err.to_string()
+        };
+        let text = message
+            .strip_prefix(kind)
+            .and_then(|s| s.strip_prefix(": "))
+            .unwrap_or(&message);
+        let args = if message == kind {
+            vec![]
+        } else {
+            vec![self.heap.string(text)]
+        };
+        Ok(self.construct_exception(kind, &args))
+    }
+
+    fn exception_matches(&self, value: Value, class: Value) -> Result<bool> {
+        let invalid = || Error::Type("catching classes that do not inherit from BaseException");
+        let valid =
+            |class| matches!(self.heap.get(class), Ok(Object::Native(name)) if is_exception(name));
+        if let Ok(Object::Tuple(classes)) = self.heap.get(class) {
+            // Python validates the entire flat tuple before testing any matching class.
+            if !classes.iter().copied().all(valid) {
+                return Err(invalid());
+            }
+            for &class in classes {
+                if self.instance_of(value, class)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        } else if valid(class) {
+            self.instance_of(value, class)
+        } else {
+            Err(invalid())
+        }
     }
 
     fn instance_of(&self, value: Value, class: Value) -> Result<bool> {
@@ -1597,6 +2103,9 @@ impl Vm {
                 Ok(false)
             }
             Object::Native(name) => Ok(match name.as_ref() {
+                name if is_exception(name) => {
+                    matches!(self.heap.get(value), Ok(Object::Exception { kind, .. }) if kind == name || name == "BaseException" || (name == "Exception" && kind != "BaseException"))
+                }
                 "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
                 "bool" => matches!(value, Value::Bool(_)),
                 "float" => matches!(value, Value::Float(_)),
@@ -1605,7 +2114,7 @@ impl Vm {
                 "tuple" => matches!(self.heap.get(value), Ok(Object::Tuple(_))),
                 "dict" => matches!(self.heap.get(value), Ok(Object::Dict(_))),
                 "set" => matches!(self.heap.get(value), Ok(Object::Set(_))),
-                "str" => matches!(self.heap.get(value), Ok(Object::String(_))),
+                "str" => self.heap.as_str(&value).is_some(),
                 _ => return Err(Error::Type("isinstance requires type")),
             }),
             Object::Class { .. } => {
@@ -1731,12 +2240,30 @@ impl Vm {
             }
             "extend" => {
                 arity(args, 1, 1)?;
-                // Snapshot before mutation so extending a list with itself terminates.
-                let values = self.collect_iter(args[0])?;
-                if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
-                    for value in values {
-                        items.push(value);
+                if receiver == args[0] {
+                    // The self-extension case consumes the original list exactly once.
+                    let values = self.collect_iter(receiver)?;
+                    if let Object::List(items) = &mut *self.heap.get_mut(receiver)? {
+                        for value in values {
+                            items.push(value);
+                        }
                     }
+                } else {
+                    let roots = self.transient_roots.len();
+                    self.transient_roots.push(receiver);
+                    let result = self.with_iterator(args[0], |vm, iterator| {
+                        loop {
+                            let value = vm.next(iterator)?;
+                            if vm.is_done(value) {
+                                return Ok(());
+                            }
+                            if let Object::List(items) = &mut *vm.heap.get_mut(receiver)? {
+                                items.push(value);
+                            }
+                        }
+                    });
+                    self.transient_roots.truncate(roots);
+                    result?;
                 }
             }
             "insert" => {
@@ -1865,242 +2392,266 @@ impl Vm {
             }
             "update" => {
                 arity(args, 1, 1)?;
-                let pairs = if let Object::Dict(items) = self.heap.get(args[0])? {
-                    items
+                if let Object::Dict(items) = self.heap.get(args[0])? {
+                    let pairs = items
                         .iter()
-                        .map(|(k, v)| (key_value(&self.heap, k), *v))
-                        .collect::<Vec<_>>()
-                } else {
-                    let mut pairs = vec![];
-                    for item in self.collect_iter(args[0])? {
-                        let pair = self.collect_iter(item)?;
+                        .map(|(key, value)| (key_value(&self.heap, key), *value))
+                        .collect::<Vec<_>>();
+                    for (key, value) in pairs {
+                        self.heap.set_item(receiver, key, value)?;
+                    }
+                    return Ok(Value::None);
+                }
+                let roots = self.transient_roots.len();
+                self.transient_roots.push(receiver);
+                let result = self.with_iterator(args[0], |vm, iterator| {
+                    loop {
+                        let item = vm.next(iterator)?;
+                        if vm.is_done(item) {
+                            return Ok(Value::None);
+                        }
+                        let pair = vm.with_iterator(item, |vm, row| {
+                            let mut pair = vec![];
+                            for _ in 0..3 {
+                                let value = vm.next(row)?;
+                                if vm.is_done(value) {
+                                    break;
+                                }
+                                vm.transient_roots.push(value);
+                                pair.push(value);
+                            }
+                            Ok(pair)
+                        })?;
                         if pair.len() != 2 {
                             return Err(error("ValueError: dictionary pair length"));
                         }
-                        pairs.push((pair[0], pair[1]));
+                        vm.heap.set_item(receiver, pair[0], pair[1])?;
                     }
-                    pairs
-                };
-                for (key, value) in pairs {
-                    self.heap.set_item(receiver, key, value)?;
-                }
-                Ok(Value::None)
+                });
+                self.transient_roots.truncate(roots);
+                result
             }
+
             _ => Err(error("unknown dictionary method")),
         }
     }
 
+    fn set_method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        match name {
+            "add" | "discard" | "remove" => {
+                arity(args, 1, 1)?;
+                let key = self.heap.key(args[0])?;
+                let mut guard = self.heap.get_mut(receiver)?;
+                let Object::Set(items) = &mut *guard else {
+                    unreachable!()
+                };
+                if name == "add" {
+                    // Equal bool/int/float keys retain the first inserted Python representative.
+                    if items.get(&key).is_none() {
+                        items.insert(key, args[0]);
+                    }
+                } else if items.remove(&key).is_none() && name == "remove" {
+                    return Err(Error::MissingKey);
+                }
+                Ok(Value::None)
+            }
+            "clear" => {
+                arity(args, 0, 0)?;
+                if let Object::Set(items) = &mut *self.heap.get_mut(receiver)? {
+                    items.clear();
+                }
+                Ok(Value::None)
+            }
+            "copy" => {
+                arity(args, 0, 0)?;
+                let Object::Set(items) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                Ok(self.heap.allocate(Object::Set(items.clone())))
+            }
+            _ => Err(error("unknown set method")),
+        }
+    }
+
     fn method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        if let Value::InlineString(text) = receiver {
+            return self.string_method(text.as_str(), name, args);
+        }
         match self.heap.get(receiver)? {
             Object::List(_) => return self.list_method(receiver, name, args),
             Object::Dict(_) => return self.dict_method(receiver, name, args),
+            Object::Set(_) => return self.set_method(receiver, name, args),
             _ => {}
         }
         let object = self.heap.get(receiver)?.clone();
         match object {
-            Object::Set(mut items) => {
-                let result = match name {
-                    "add" => {
-                        arity(args, 1, 1)?;
-                        self.heap.key(args[0])?;
-                        let mut found = false;
-                        for &value in &items {
-                            found |= equal(&self.heap, value, args[0], 0)?;
-                        }
-                        if !found {
-                            items.push(args[0]);
-                        }
-                        Value::None
-                    }
-                    "discard" | "remove" => {
-                        arity(args, 1, 1)?;
-                        let mut found = None;
-                        for (i, &value) in items.iter().enumerate() {
-                            if equal(&self.heap, value, args[0], 0)? {
-                                found = Some(i);
-                                break;
-                            }
-                        }
-                        if let Some(i) = found {
-                            items.remove(i);
-                        } else if name == "remove" {
-                            return Err(Error::MissingKey);
-                        }
-                        Value::None
-                    }
-                    "clear" => {
-                        arity(args, 0, 0)?;
-                        items.clear();
-                        Value::None
-                    }
-                    "copy" => {
-                        arity(args, 0, 0)?;
-                        return Ok(self.heap.allocate(Object::Set(items)));
-                    }
-                    _ => return Err(error("unknown set method")),
-                };
-                *self.heap.get_mut(receiver)? = Object::Set(items);
-                Ok(result)
-            }
-            Object::String(text) => {
-                let result = match name {
-                    "join" => {
-                        arity(args, 1, 1)?;
-                        let values = self.collect_iter(args[0])?;
-                        let parts = values
-                            .iter()
-                            .map(|&v| match self.heap.get(v)? {
-                                Object::String(s) => Ok(s.clone()),
-                                _ => Err(Error::Type("join requires strings")),
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        text_heap(&self.heap, parts.join(&text))
-                    }
-                    "split" => {
-                        arity(args, 0, 2)?;
-                        let limit = args
-                            .get(1)
-                            .map(|&value| integer(value))
-                            .transpose()?
-                            .unwrap_or(-1);
-                        let parts = if args.is_empty() || args[0] == Value::None {
-                            let mut rest = text.trim_start();
-                            let mut parts = vec![];
-                            while !rest.is_empty() {
-                                if limit >= 0 && parts.len() == limit as usize {
-                                    parts.push(rest.to_owned());
-                                    break;
-                                }
-                                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                                parts.push(rest[..end].to_owned());
-                                rest = rest[end..].trim_start();
-                            }
-                            parts
-                        } else {
-                            let Object::String(sep) = self.heap.get(args[0])? else {
-                                return Err(Error::Type("separator must be string"));
-                            };
-                            if sep.is_empty() {
-                                return Err(error("ValueError: empty separator"));
-                            }
-                            if limit < 0 {
-                                text.split(sep).map(str::to_owned).collect()
-                            } else {
-                                text.splitn(limit as usize + 1, sep)
-                                    .map(str::to_owned)
-                                    .collect()
-                            }
-                        };
-                        self.heap.allocate(Object::List(
-                            parts
-                                .into_iter()
-                                .map(|s| text_heap(&self.heap, s))
-                                .collect::<Vec<_>>()
-                                .into(),
-                        ))
-                    }
-                    "splitlines" => {
-                        arity(args, 0, 1)?;
-                        let keep = args
-                            .first()
-                            .map(|&value| runtime::truth(&self.heap, value))
-                            .transpose()?
-                            .unwrap_or(false);
-                        let mut parts = vec![];
-                        let mut start = 0;
-                        let mut chars = text.char_indices().peekable();
-                        // str::lines omits Python's additional Unicode line boundaries.
-                        while let Some((index, ch)) = chars.next() {
-                            if matches!(
-                                ch,
-                                '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{001c}'
-                                    ..='\u{001e}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
-                            ) {
-                                let mut end = index + ch.len_utf8();
-                                if ch == '\r' && chars.peek().is_some_and(|&(_, next)| next == '\n')
-                                {
-                                    end = chars.next().unwrap().0 + 1;
-                                }
-                                parts.push(text_heap(
-                                    &self.heap,
-                                    text[start..if keep { end } else { index }].into(),
-                                ));
-                                start = end;
-                            }
-                        }
-                        if start < text.len() {
-                            parts.push(text_heap(&self.heap, text[start..].into()));
-                        }
-                        self.heap.allocate(Object::List(parts.into()))
-                    }
-                    "rjust" => {
-                        arity(args, 1, 2)?;
-                        let width = integer(args[0])?;
-                        let fill = if let Some(&value) = args.get(1) {
-                            let Object::String(fill) = self.heap.get(value)? else {
-                                return Err(Error::Type("fill character must be a string"));
-                            };
-                            if fill.chars().count() != 1 {
-                                return Err(Error::Type(
-                                    "fill character must be exactly one character",
-                                ));
-                            }
-                            fill.chars().next().unwrap()
-                        } else {
-                            ' '
-                        };
-                        let padding =
-                            width.saturating_sub(text.chars().count() as i64).max(0) as usize;
-                        let mut result = String::new();
-                        result
-                            .try_reserve(
-                                padding
-                                    .checked_mul(fill.len_utf8())
-                                    .and_then(|n| n.checked_add(text.len()))
-                                    .ok_or(Error::IntegerOverflow)?,
-                            )
-                            .map_err(|_| error("MemoryError: string too large"))?;
-                        result.extend(std::iter::repeat_n(fill, padding));
-                        result.push_str(&text);
-                        text_heap(&self.heap, result)
-                    }
-                    "upper" | "lower" | "strip" => {
-                        arity(args, 0, 0)?;
-                        text_heap(
-                            &self.heap,
-                            match name {
-                                "upper" => text.to_uppercase(),
-                                "lower" => text.to_lowercase(),
-                                _ => text.trim().into(),
-                            },
-                        )
-                    }
-                    "startswith" | "endswith" => {
-                        arity(args, 1, 1)?;
-                        let Object::String(part) = self.heap.get(args[0])? else {
-                            return Err(Error::Type("expected string"));
-                        };
-                        Value::Bool(if name == "startswith" {
-                            text.starts_with(part)
-                        } else {
-                            text.ends_with(part)
-                        })
-                    }
-                    "replace" => {
-                        arity(args, 2, 2)?;
-                        let (Object::String(from), Object::String(to)) =
-                            (self.heap.get(args[0])?, self.heap.get(args[1])?)
-                        else {
-                            return Err(Error::Type("replace requires strings"));
-                        };
-                        text_heap(&self.heap, text.replace(from, to))
-                    }
-                    _ => return Err(error("unknown string method")),
-                };
-                Ok(result)
-            }
+            Object::String(text) => self.string_method(&text, name, args),
             _ => Err(Error::Type("unsupported method")),
         }
+    }
+
+    fn string_method(&mut self, text: &str, name: &str, args: &[Value]) -> Result<Value> {
+        let result = match name {
+            "join" => {
+                arity(args, 1, 1)?;
+                match self.heap.get(args[0]) {
+                    Ok(Object::List(items)) => {
+                        if let Some(values) = items.native_values() {
+                            return join_values(&self.heap, text, values);
+                        }
+                        if items.is_empty() {
+                            return Ok(self.heap.string(""));
+                        }
+                        return Err(Error::Type("join requires strings"));
+                    }
+                    Ok(Object::Tuple(values)) => return join_values(&self.heap, text, values),
+                    _ => {}
+                }
+                let values = self.collect_iter(args[0])?;
+                join_values(&self.heap, text, &values)?
+            }
+            "split" => {
+                arity(args, 0, 2)?;
+                let limit = args
+                    .get(1)
+                    .map(|&value| integer(value))
+                    .transpose()?
+                    .unwrap_or(-1);
+                let parts = if args.is_empty() || args[0] == Value::None {
+                    let mut rest = text.trim_start();
+                    let mut parts = vec![];
+                    while !rest.is_empty() {
+                        if limit >= 0 && parts.len() == limit as usize {
+                            parts.push(rest.to_owned());
+                            break;
+                        }
+                        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                        parts.push(rest[..end].to_owned());
+                        rest = rest[end..].trim_start();
+                    }
+                    parts
+                } else {
+                    let Some(sep) = self.heap.as_str(&(args[0])) else {
+                        return Err(Error::Type("separator must be string"));
+                    };
+                    if sep.is_empty() {
+                        return Err(error("ValueError: empty separator"));
+                    }
+                    if limit < 0 {
+                        text.split(sep).map(str::to_owned).collect()
+                    } else {
+                        text.splitn(limit as usize + 1, sep)
+                            .map(str::to_owned)
+                            .collect()
+                    }
+                };
+                self.heap.allocate(Object::List(
+                    parts
+                        .into_iter()
+                        .map(|s| text_heap(&self.heap, s))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ))
+            }
+            "splitlines" => {
+                arity(args, 0, 1)?;
+                let keep = args
+                    .first()
+                    .map(|&value| runtime::truth(&self.heap, value))
+                    .transpose()?
+                    .unwrap_or(false);
+                let mut parts = vec![];
+                let mut start = 0;
+                let mut chars = text.char_indices().peekable();
+                // str::lines omits Python's additional Unicode line boundaries.
+                while let Some((index, ch)) = chars.next() {
+                    if matches!(
+                        ch,
+                        '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{001c}'
+                            ..='\u{001e}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+                    ) {
+                        let mut end = index + ch.len_utf8();
+                        if ch == '\r' && chars.peek().is_some_and(|&(_, next)| next == '\n') {
+                            end = chars.next().unwrap().0 + 1;
+                        }
+                        parts.push(text_heap(
+                            &self.heap,
+                            text[start..if keep { end } else { index }].into(),
+                        ));
+                        start = end;
+                    }
+                }
+                if start < text.len() {
+                    parts.push(text_heap(&self.heap, text[start..].into()));
+                }
+                self.heap.allocate(Object::List(parts.into()))
+            }
+            "rjust" => {
+                arity(args, 1, 2)?;
+                let width = integer(args[0])?;
+                let fill = if let Some(&value) = args.get(1) {
+                    let Some(fill) = self.heap.as_str(&(value)) else {
+                        return Err(Error::Type("fill character must be a string"));
+                    };
+                    if fill.chars().count() != 1 {
+                        return Err(Error::Type("fill character must be exactly one character"));
+                    }
+                    fill.chars().next().unwrap()
+                } else {
+                    ' '
+                };
+                let padding = width.saturating_sub(text.chars().count() as i64).max(0) as usize;
+                let mut result = String::new();
+                result
+                    .try_reserve(
+                        padding
+                            .checked_mul(fill.len_utf8())
+                            .and_then(|n| n.checked_add(text.len()))
+                            .ok_or(Error::IntegerOverflow)?,
+                    )
+                    .map_err(|_| error("MemoryError: string too large"))?;
+                result.extend(std::iter::repeat_n(fill, padding));
+                result.push_str(text);
+                text_heap(&self.heap, result)
+            }
+            "isdigit" => {
+                arity(args, 0, 0)?;
+                Value::Bool(!text.is_empty() && text.chars().all(crate::unicode::is_digit))
+            }
+            "upper" | "lower" | "strip" => {
+                arity(args, 0, 0)?;
+                text_heap(
+                    &self.heap,
+                    match name {
+                        "upper" => text.to_uppercase(),
+                        "lower" => text.to_lowercase(),
+                        _ => text.trim().into(),
+                    },
+                )
+            }
+            "startswith" | "endswith" => {
+                arity(args, 1, 1)?;
+                let Some(part) = self.heap.as_str(&(args[0])) else {
+                    return Err(Error::Type("expected string"));
+                };
+                Value::Bool(if name == "startswith" {
+                    text.starts_with(part)
+                } else {
+                    text.ends_with(part)
+                })
+            }
+            "replace" => {
+                arity(args, 2, 2)?;
+                let (Some(from), Some(to)) =
+                    (self.heap.as_str(&args[0]), self.heap.as_str(&args[1]))
+                else {
+                    return Err(Error::Type("replace requires strings"));
+                };
+                text_heap(&self.heap, text.replace(from, to))
+            }
+            _ => return Err(error("unknown string method")),
+        };
+        Ok(result)
     }
 
     fn repr(&self, value: Value, quote: bool) -> Result<String> {
@@ -2109,7 +2660,7 @@ impl Vm {
 }
 
 fn text_heap(heap: &Heap, text: String) -> Value {
-    heap.allocate(Object::String(text))
+    heap.string_owned(text)
 }
 fn arity(args: &[Value], min: usize, max: usize) -> Result<()> {
     if args.len() < min || args.len() > max {
@@ -2139,11 +2690,13 @@ fn key_value(heap: &Heap, key: &Key) -> Value {
         Key::None => Value::None,
         Key::Bool(value) => Value::Bool(*value),
         Key::Int(n) => Value::Int(*n),
-        Key::String(s) => text_heap(heap, s.clone()),
+        Key::String(s) => heap.string(s),
         Key::Float(bits) => Value::Float(f64::from_bits(*bits)),
-        Key::Tuple(keys) => heap.allocate(Object::Tuple(
-            keys.iter().map(|key| key_value(heap, key)).collect(),
-        )),
+        Key::Tuple(keys) => stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            heap.allocate(Object::Tuple(
+                keys.iter().map(|key| key_value(heap, key)).collect(),
+            ))
+        }),
     }
 }
 fn normalize_index(value: Value, len: usize) -> Result<usize> {
@@ -2205,6 +2758,10 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
         indices.push(i as usize);
         i += step;
     }
+    if let Some(text) = heap.as_str(&object) {
+        let chars = text.chars().collect::<Vec<_>>();
+        return Ok(text_heap(heap, indices.iter().map(|&i| chars[i]).collect()));
+    }
     Ok(match heap.get(object)? {
         Object::List(items) => heap.allocate(Object::List(
             indices.iter().map(|&i| items[i]).collect::<Vec<_>>().into(),
@@ -2222,10 +2779,14 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
 
 fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
     if op == "*" {
-        if let (Value::Ref(_), Ok(n)) = (a, integer(b)) {
+        if matches!(a, Value::Ref(_) | Value::InlineString(_))
+            && let Ok(n) = integer(b)
+        {
             return repeat(heap, a, n);
         }
-        if let (Ok(n), Value::Ref(_)) = (integer(a), b) {
+        if matches!(b, Value::Ref(_) | Value::InlineString(_))
+            && let Ok(n) = integer(a)
+        {
             return repeat(heap, b, n);
         }
     }
@@ -2307,6 +2868,9 @@ fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
 }
 fn repeat(heap: &Heap, value: Value, n: i64) -> Result<Value> {
     let n = usize::try_from(n.max(0)).map_err(|_| Error::IntegerOverflow)?;
+    if let Some(text) = heap.as_str(&value) {
+        return Ok(text_heap(heap, text.repeat(n)));
+    }
     Ok(match heap.get(value)? {
         Object::String(s) => text_heap(heap, s.repeat(n)),
         Object::List(items) => heap.allocate(Object::List(items.repeat(n).into())),
@@ -2328,6 +2892,9 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
     if let Some(ordering) = numeric_order(a, b) {
         return Ok(ordering == Some(std::cmp::Ordering::Equal));
     }
+    if let (Some(a), Some(b)) = (heap.as_str(&a), heap.as_str(&b)) {
+        return Ok(a == b);
+    }
     if let (Value::Ref(_), Value::Ref(_)) = (a, b) {
         match (heap.get(a)?, heap.get(b)?) {
             (Object::String(a), Object::String(b)) => return Ok(a == b),
@@ -2345,22 +2912,7 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
                 return Ok(true);
             }
             (Object::Set(a), Object::Set(b)) => {
-                if a.len() != b.len() {
-                    return Ok(false);
-                }
-                for &value in a {
-                    let mut found = false;
-                    for &candidate in b {
-                        if equal(heap, value, candidate, depth + 1)? {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        return Ok(false);
-                    }
-                }
-                return Ok(true);
+                return Ok(a.len() == b.len() && a.iter().all(|(key, _)| b.get(key).is_some()));
             }
             (Object::Dict(a), Object::Dict(b)) => {
                 if a.len() != b.len() {
@@ -2381,16 +2933,22 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
     }
     Ok(false)
 }
-fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool> {
+pub(crate) fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool> {
     match op {
         "==" => return equal(heap, a, b, 0),
         "!=" => return equal(heap, a, b, 0).map(|v| !v),
         "is" => return Ok(a == b),
         "is not" => return Ok(a != b),
         "in" | "not in" => {
+            if let Some(text) = heap.as_str(&b) {
+                let part = heap
+                    .as_str(&a)
+                    .ok_or(Error::Type("string membership requires string"))?;
+                return Ok(text.contains(part) == (op == "in"));
+            }
             let found = match heap.get(b)? {
-                Object::Dict(items) => heap.dict_get(items, a)?.is_some(),
-                object @ (Object::List(_) | Object::Tuple(_) | Object::Set(_)) => {
+                Object::Dict(items) | Object::Set(items) => heap.dict_get(items, a)?.is_some(),
+                object @ (Object::List(_) | Object::Tuple(_)) => {
                     let items = object.values().unwrap();
                     let mut found = false;
                     for &item in items {
@@ -2449,7 +3007,23 @@ fn render(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Re
     })
 }
 fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>) -> Result<String> {
+    if let Value::InlineString(text) = value {
+        return Ok(if quote {
+            format!(
+                "'{}'",
+                text.as_str()
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t")
+            )
+        } else {
+            text.as_str().into()
+        });
+    }
     Ok(match value {
+        Value::InlineString(_) => unreachable!(),
         Value::Unbound => return Err(Error::InvalidIr("unbound value representation")),
         Value::None => "None".into(),
         Value::Bool(b) => if b { "True" } else { "False" }.into(),
@@ -2485,7 +3059,7 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
                         s.clone()
                     }
                 }
-                object @ (Object::List(_) | Object::Tuple(_) | Object::Set(_)) => {
+                object @ (Object::List(_) | Object::Tuple(_)) => {
                     let items = object.values().unwrap();
                     let parts = items
                         .iter()
@@ -2497,14 +3071,18 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
                             parts.join(", "),
                             if items.len() == 1 { "," } else { "" }
                         ),
-                        Object::Set(_) => {
-                            if items.is_empty() {
-                                "set()".into()
-                            } else {
-                                format!("{{{}}}", parts.join(", "))
-                            }
-                        }
                         _ => format!("[{}]", parts.join(", ")),
+                    }
+                }
+                Object::Set(items) => {
+                    let parts = items
+                        .iter()
+                        .map(|(_, value)| render(heap, *value, true, active))
+                        .collect::<Result<Vec<_>>>()?;
+                    if parts.is_empty() {
+                        "set()".into()
+                    } else {
+                        format!("{{{}}}", parts.join(", "))
                     }
                 }
                 Object::Dict(items) => {
@@ -2519,6 +3097,27 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
                         })
                         .collect::<Result<Vec<_>>>()?;
                     format!("{{{}}}", parts.join(", "))
+                }
+                Object::Exception { kind, arguments } => {
+                    if quote {
+                        let parts = arguments
+                            .iter()
+                            .map(|&arg| render(heap, arg, true, active))
+                            .collect::<Result<Vec<_>>>()?;
+                        format!("{kind}({})", parts.join(", "))
+                    } else {
+                        match arguments.as_slice() {
+                            [] => String::new(),
+                            [arg] => render(heap, *arg, false, active)?,
+                            args => {
+                                let parts = args
+                                    .iter()
+                                    .map(|&arg| render(heap, arg, true, active))
+                                    .collect::<Result<Vec<_>>>()?;
+                                format!("({})", parts.join(", "))
+                            }
+                        }
+                    }
                 }
                 Object::Class { name, .. } => format!("<class '{name}'>"),
                 Object::Instance { class, .. } => {
@@ -2573,6 +3172,9 @@ fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cm
     if let Some(order) = numeric_order(a, b) {
         return Ok(order);
     }
+    if let (Some(a), Some(b)) = (heap.as_str(&a), heap.as_str(&b)) {
+        return Ok(Some(a.cmp(b)));
+    }
     match (heap.get(a), heap.get(b)) {
         (Ok(Object::String(a)), Ok(Object::String(b))) => Ok(Some(a.cmp(b))),
         (Ok(a @ Object::List(_)), Ok(b @ Object::List(_)))
@@ -2587,4 +3189,65 @@ fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cm
         }
         _ => Err(Error::Type("unsupported ordering")),
     }
+}
+
+fn is_exception(name: &str) -> bool {
+    matches!(
+        name,
+        "BaseException"
+            | "Exception"
+            | "ValueError"
+            | "TypeError"
+            | "RuntimeError"
+            | "StopIteration"
+            | "ZeroDivisionError"
+            | "UnboundLocalError"
+            | "OverflowError"
+            | "KeyError"
+            | "IndexError"
+    )
+}
+
+// Builtin sequences cannot execute Python while their strings are borrowed. Allocate only the result.
+fn join_values(heap: &Heap, separator: &str, values: &[Value]) -> Result<Value> {
+    let mut size = separator
+        .len()
+        .checked_mul(values.len().saturating_sub(1))
+        .ok_or(Error::IntegerOverflow)?;
+    for value in values {
+        let text = heap
+            .as_str(value)
+            .ok_or(Error::Type("join requires strings"))?;
+        size = size.checked_add(text.len()).ok_or(Error::IntegerOverflow)?;
+    }
+    if let [only] = values {
+        return Ok(*only);
+    }
+    if size <= crate::InlineString::CAPACITY {
+        let mut bytes = [0u8; crate::InlineString::CAPACITY];
+        let mut offset = 0;
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                bytes[offset..offset + separator.len()].copy_from_slice(separator.as_bytes());
+                offset += separator.len();
+            }
+            let text = heap.as_str(value).unwrap();
+            bytes[offset..offset + text.len()].copy_from_slice(text.as_bytes());
+            offset += text.len();
+        }
+        return Ok(
+            heap.string(std::str::from_utf8(&bytes[..offset]).expect("joined UTF-8 fragments"))
+        );
+    }
+    let mut result = String::new();
+    result
+        .try_reserve_exact(size)
+        .map_err(|_| error("MemoryError: string too large"))?;
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            result.push_str(separator);
+        }
+        result.push_str(heap.as_str(value).unwrap());
+    }
+    Ok(heap.string_owned(result))
 }

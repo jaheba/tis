@@ -12,6 +12,7 @@ impl Operation {
         let s = |value: StateId| states[value.0];
         let e = |value: ExitId| exits[value.0];
         match self {
+            Self::Copy(value) => Self::Copy(r(*value)),
             Self::FloatListView {
                 value,
                 length,

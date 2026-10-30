@@ -98,7 +98,7 @@ assert A().read()==10
 assert x==10
 for i in range(300):
     assert read()==30
-assert ('dynamic'+str(123)) is not ('dynamic'+str(123))
+assert ('dynamic-long-'+str(123)) is not ('dynamic-long-'+str(123))
 "#;
     for tier in [
         Tiering::Bytecode,
@@ -113,6 +113,27 @@ assert ('dynamic'+str(123)) is not ('dynamic'+str(123))
             vm.thresholds.function_entries = 1;
             vm.thresholds.loop_backedges = 4;
             vm.run_program(&mut compile(source).unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn encoded_immediates_share_code_across_heaps_in_both_interpreters() {
+    for mode in [BytecodeMode::Stack, BytecodeMode::Register] {
+        let mut program = compile(r#"
+values = [None, True, False, -123, 1.25, '', '12345678901', 'é東京abcd', '123456789012', 'é東京abcde']
+assert values == [None, True, False, -123, 1.25, '', '12345678901', 'é東京abcd', '123456789012', 'é東京abcde']
+assert len(values[6]) == 11
+"#).unwrap();
+        let mut left = Vm::new();
+        let mut right = Vm::new();
+        left.bytecode = mode;
+        right.bytecode = mode;
+        for _ in 0..3 {
+            left.run_program(&mut program).unwrap();
+            right.run_program(&mut program).unwrap();
+            left.collect_garbage(&[]).unwrap();
+            right.collect_garbage(&[]).unwrap();
         }
     }
 }

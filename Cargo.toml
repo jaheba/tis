@@ -5,10 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
+compact_str = "=0.10.0"
 ruff_python_parser = "=0.0.14"
 ruff_python_ast = "=0.0.14"
 serde = "1.0"
 serde_json = { version = "=1.0.150", features = ["preserve_order", "arbitrary_precision"] }
+jiter = { version = "=0.17.0", default-features = false }
 stacker = "=0.1.25"
 cranelift-codegen = "=0.137.0"
 cranelift-frontend = "=0.137.0"

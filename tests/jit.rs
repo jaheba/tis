@@ -267,10 +267,7 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
         })
         .unwrap();
     let result = vm.resume_hir(&mut f, frame).unwrap();
-    assert_eq!(
-        vm.heap.get(result).unwrap(),
-        &Object::String("hello tis".into())
-    );
+    assert_eq!(vm.heap.as_str(&(result)).unwrap(), "hello tis");
     assert_eq!(
         vm.heap.get_item(list, Value::Int(0)).unwrap(),
         Value::Int(10)
@@ -292,7 +289,7 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
 
 #[test]
 fn root_maps_truth_conversion_and_string_allocation_are_explicit() {
-    let program = compile("x = [1]\nif x:\n    print('ok')\n").unwrap();
+    let program = compile("x = [1]\nif x:\n    print('heap allocated literal')\n").unwrap();
     let lir = program
         .function("<module>")
         .unwrap()

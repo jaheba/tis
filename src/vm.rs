@@ -1,7 +1,7 @@
 use crate::{
     Error, Heap, Object, Result, Value,
     bytecode::{Code, Opcode, read_operand},
-    hir::{AddFeedback, AddStrategy, Constant, Function, ValueId},
+    hir::{AddFeedback, AddStrategy, Function, ValueId},
     runtime,
 };
 use std::{cell::RefCell, rc::Rc};
@@ -79,6 +79,16 @@ pub struct Vm {
     pub output: String,
     pub(crate) depth: usize,
     pub(crate) transient_roots: Vec<Value>,
+    pub(crate) try_bodies:
+        std::collections::BTreeMap<(crate::profile::FunctionId, u64), Rc<RefCell<Function>>>,
+    definition_codes: std::collections::BTreeMap<(crate::profile::FunctionId, u64), Rc<Code>>,
+    pub(crate) expression_plans: std::collections::BTreeMap<
+        (crate::profile::FunctionId, u64),
+        Option<Rc<crate::execution::expression::Plan>>,
+    >,
+    pub(crate) expression_scratch: Vec<Value>,
+    pub(crate) pending_exception: Option<Value>,
+    pub(crate) active_exceptions: Vec<Value>,
     pinned: std::collections::BTreeMap<usize, Value>,
     next_root: usize,
     next_collection: usize,
@@ -95,6 +105,9 @@ impl Vm {
         text: &str,
         cache: &std::cell::Cell<Option<Value>>,
     ) -> Value {
+        if let Some(text) = crate::InlineString::new(text) {
+            return Value::InlineString(text);
+        }
         if let Some(value) = cache.get()
             && self.heap.get(value).is_ok()
         {
@@ -120,6 +133,9 @@ impl Vm {
 
     /// Frame values occupy one stack window; both return and error release that window.
     pub fn run(&mut self, function: &mut Function, arguments: &[Value]) -> Result<Value> {
+        if self.depth == 0 {
+            self.pending_exception = None;
+        }
         let handle = Rc::new(RefCell::new(function.clone()));
         let parent = self.ensure_globals();
         let result = self.invoke_function(handle.clone(), parent, &[], arguments, &[]);
@@ -158,7 +174,27 @@ impl Vm {
         if bindings.is_some() {
             self.tier_stats.positional_frames += 1;
         }
-        let code = function.borrow_mut().shared_bytecode()?;
+        let code = {
+            let mut function = function.borrow_mut();
+            if let Some(code) = &function.code {
+                code.clone()
+            } else {
+                let key = (function.id(), function.revision());
+                if let Some(code) = self.definition_codes.get(&key) {
+                    function.code = Some(code.clone());
+                    code.clone()
+                } else {
+                    let start = std::time::Instant::now();
+                    let result = function.shared_bytecode();
+                    self.tier_stats.bytecode_compile_ns += start.elapsed().as_nanos() as u64;
+                    let code = result?;
+                    self.tier_stats.bytecode_compilations += 1;
+                    // Buffers contain no owned heap handles; their weak caches validate heap/environment identity.
+                    self.definition_codes.insert(key, code.clone());
+                    code
+                }
+            }
+        };
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
@@ -260,6 +296,10 @@ impl Vm {
             self.stack.truncate(base);
             return Err(error);
         }
+        if self.depth == 0 {
+            self.pending_exception = None;
+        }
+        let exception_depth = self.active_exceptions.len();
         self.depth += 1;
         self.environments.push(environment);
         self.local_frames.push(LocalFrame {
@@ -316,6 +356,7 @@ impl Vm {
         self.local_frames.pop();
         self.local_slots.truncate(local_start);
         self.depth -= 1;
+        self.active_exceptions.truncate(exception_depth);
         self.stack.truncate(base);
         result
     }
@@ -512,6 +553,8 @@ impl Vm {
             .chain(self.environments.iter().copied())
             .chain(self.local_slots.iter().filter_map(|value| *value))
             .chain(self.transient_roots.iter().copied())
+            .chain(self.pending_exception)
+            .chain(self.active_exceptions.iter().copied())
             .chain(self.pinned.values().copied())
             .chain(self.modules.values().copied())
             .chain(self.literal_pool.values().copied())
@@ -541,7 +584,7 @@ impl Vm {
         std::mem::take(&mut self.compilation_requests)
     }
 
-    fn consider_compilation(
+    pub(crate) fn consider_compilation(
         &mut self,
         function: &Rc<RefCell<Function>>,
         hotspot: crate::profile::Hotspot,
@@ -683,8 +726,9 @@ impl Vm {
             match opcode {
                 Opcode::EnterBlock => {
                     let block = read_operand(&code.body, &mut ip)?;
-                    let is_backedge = self.record_block(function, code, block, current_block)?;
-                    collecting = self.collecting(function);
+                    let (is_backedge, phase) =
+                        self.record_block_and_phase(function, code, block, current_block)?;
+                    collecting = phase;
                     current_block = Some(block);
                     if is_backedge
                         && let Some(lir) = self.artifact(code.function, code.revision)
@@ -715,12 +759,8 @@ impl Vm {
                         .get(index)
                         .ok_or(Error::InvalidIr("invalid constant"))?
                     {
-                        Constant::Unbound => Value::Unbound,
-                        Constant::None => Value::None,
-                        Constant::Bool(value) => Value::Bool(*value),
-                        Constant::Int(value) => Value::Int(*value),
-                        Constant::Float(value) => Value::Float(*value),
-                        Constant::String(value) => {
+                        crate::bytecode::EncodedConstant::Immediate(value) => *value,
+                        crate::bytecode::EncodedConstant::String(value) => {
                             self.intern_literal(value, &code.literal_cache[index])
                         }
                     };
@@ -1024,11 +1064,30 @@ impl Vm {
         block: usize,
         previous: Option<usize>,
     ) -> Result<bool> {
-        let backedge = previous.is_some_and(|from| code.backedges.contains(&(from, block)));
+        self.record_block_and_phase(function, code, block, previous)
+            .map(|(backedge, _)| backedge)
+    }
+
+    // Read the live phase at every block, including after recursive calls; only backedges can
+    // change it here. Returning it avoids the interpreter borrowing the same profile twice.
+    pub(crate) fn record_block_and_phase(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        block: usize,
+        previous: Option<usize>,
+    ) -> Result<(bool, bool)> {
+        let backedge = previous.is_some_and(|from| {
+            code.backedge_sources
+                .get(block)
+                .is_some_and(|sources| sources.contains(&from))
+        });
+        let mut collecting;
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
-            if self.profiling.collecting(profile.phase) {
+            collecting = self.profiling.collecting(profile.phase);
+            if collecting {
                 let count = profile
                     .blocks
                     .get_mut(block)
@@ -1048,8 +1107,9 @@ impl Vm {
         }
         if backedge {
             self.consider_compilation(function, crate::profile::Hotspot::Loop { header: block });
+            collecting = self.collecting(function);
         }
-        Ok(backedge)
+        Ok((backedge, collecting))
     }
     pub(crate) fn observe_site(
         &self,

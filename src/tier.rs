@@ -2,7 +2,7 @@
 use crate::{
     Error, Object, Result, Value, Vm,
     bytecode::Code,
-    hir::{self, BlockId, Function},
+    hir::{BlockId, Function},
     lir::{self, Helper, Operation, Register, Terminator},
     profile::FunctionId,
     runtime,
@@ -19,6 +19,10 @@ pub enum Tiering {
 }
 #[derive(Debug, Clone, Default)]
 pub struct TierStats {
+    pub generator_expression_kernels: u64,
+    pub generator_direct_bindings: u64,
+    pub bytecode_compilations: u64,
+    pub bytecode_compile_ns: u64,
     pub mutation_entries: u64,
     pub mutation_writes: u64,
     pub mutation_guard_exits: u64,
@@ -337,18 +341,12 @@ impl Vm {
                         };
                         Some(Datum::Boxed(value))
                     }
-                    Operation::Constant(constant) => Some(Datum::Boxed(match constant {
-                        hir::Constant::Unbound => Value::Unbound,
-                        hir::Constant::None => Value::None,
-                        hir::Constant::Bool(v) => Value::Bool(*v),
-                        hir::Constant::Int(v) => Value::Int(*v),
-                        hir::Constant::Float(v) => Value::Float(*v),
-                        hir::Constant::String(_) => {
-                            return Err(Error::InvalidIr(
-                                "allocating LIR constant without safepoint",
-                            ));
-                        }
-                    })),
+                    Operation::Copy(value) => Some(read(&registers, *value)?),
+                    Operation::Constant(constant) => {
+                        Some(Datum::Boxed(constant.immediate().ok_or(
+                            Error::InvalidIr("allocating LIR constant without safepoint"),
+                        )?))
+                    }
                     Operation::GuardInt { value, exit } => {
                         if !matches!(read(&registers, *value)?, Datum::Boxed(Value::Int(_))) {
                             return self.lir_exit(function, lir, *exit, &registers);
@@ -851,6 +849,7 @@ impl Vm {
                 self.heap.set_item(args[0], args[1], args[2])?;
                 Value::None
             }
+            Helper::StringNext => self.next(args[0])?,
             Helper::ScalarCall(_) => self.call_from_registers(args[0], &args[1..])?,
             Helper::Len => Value::Int(
                 i64::try_from(self.heap.len(args[0])?).map_err(|_| Error::IntegerOverflow)?,

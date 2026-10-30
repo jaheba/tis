@@ -245,7 +245,8 @@ impl Plan {
                 let result = instruction.result.unwrap();
                 match &instruction.operation {
                     Operation::Constant(hir::Constant::String(_)) => return Ok(None),
-                    Operation::BoolNot(_)
+                    Operation::Copy(_)
+                    | Operation::BoolNot(_)
                     | Operation::BoxBool(_)
                     | Operation::NumberCompare { .. }
                     | Operation::Constant(_)

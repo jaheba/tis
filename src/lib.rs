@@ -1,6 +1,7 @@
 //! A Python subset compiled through IR to bytecode, with an independent runtime.
 
 mod bindings;
+mod bisect;
 mod body_inline;
 pub mod inline_frames;
 mod leaf_inline;
@@ -11,6 +12,7 @@ pub mod bytecode;
 mod dict;
 mod error;
 mod json;
+mod unicode;
 pub use dict::Dict;
 mod execution;
 pub mod frontend;
@@ -42,5 +44,5 @@ pub use tier::{TierStats, Tiering};
 pub use error::{Error, Result};
 pub use frontend::{CompileOptions, Program, compile, compile_with_options};
 pub use heap::{Heap, Key, Object};
-pub use value::{ObjectId, StringLiteral, Value};
+pub use value::{InlineString, ObjectId, StringLiteral, Value};
 pub use vm::Vm;

@@ -19,7 +19,13 @@ fn edges(term: &Terminator) -> Vec<&super::Edge> {
     }
 }
 
-pub(super) fn analyze(function: &Function) -> Result<Analysis> {
+struct ControlFlow {
+    reachable: Vec<bool>,
+    dominators: Vec<Vec<u64>>,
+    backedges: BTreeSet<(usize, usize)>,
+}
+
+fn control_flow(function: &Function) -> Result<ControlFlow> {
     if !function.local_states.is_empty()
         && (function.local_states.len() != function.blocks.len()
             || function
@@ -95,11 +101,16 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
                 .map(|edge| edge.block.0),
         );
     }
-    let all = (0..count)
-        .filter(|&block| reachable[block])
-        .collect::<BTreeSet<_>>();
+    // Validation needs membership/intersection only; materialize public sets on demand.
+    let mut all = vec![0u64; count.div_ceil(64)];
+    for (block, &is_reachable) in reachable.iter().enumerate() {
+        if is_reachable {
+            all[block / 64] |= 1u64 << (block % 64);
+        }
+    }
     let mut dominators = vec![all.clone(); count];
-    dominators[0] = BTreeSet::from([0]);
+    dominators[0].fill(0);
+    dominators[0][0] = 1;
     loop {
         let mut changed = false;
         for block in 1..count {
@@ -109,10 +120,12 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
             let mut next = all.clone();
             for &pred in &predecessors[block] {
                 if reachable[pred] {
-                    next = next.intersection(&dominators[pred]).copied().collect();
+                    for (word, predecessor) in next.iter_mut().zip(&dominators[pred]) {
+                        *word &= predecessor;
+                    }
                 }
             }
-            next.insert(block);
+            next[block / 64] |= 1u64 << (block % 64);
             if next != dominators[block] {
                 dominators[block] = next;
                 changed = true;
@@ -129,7 +142,8 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
             .as_ref()
             .ok_or(Error::InvalidIr("undefined value"))?;
         if reachable[block]
-            && (!dominators[block].contains(&definition) || (definition == block && at >= position))
+            && (dominators[block][definition / 64] & (1u64 << (definition % 64)) == 0
+                || (definition == block && at >= position))
         {
             return Err(Error::InvalidIr("value does not dominate use"));
         }
@@ -191,13 +205,38 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
             for &arg in &edge.arguments {
                 check(arg, block, body.instructions.len() + 1)?;
             }
-            if reachable[block] && dominators[block].contains(&edge.block.0) {
+            if reachable[block]
+                && dominators[block][edge.block.0 / 64] & (1u64 << (edge.block.0 % 64)) != 0
+            {
                 backedges.insert((block, edge.block.0));
             }
         }
     }
+    Ok(ControlFlow {
+        reachable,
+        dominators,
+        backedges,
+    })
+}
+
+pub(super) fn validated_reachable(function: &Function) -> Result<Vec<bool>> {
+    Ok(control_flow(function)?.reachable)
+}
+
+pub(super) fn validated_backedges(function: &Function) -> Result<BTreeSet<(usize, usize)>> {
+    Ok(control_flow(function)?.backedges)
+}
+
+pub(super) fn analyze(function: &Function) -> Result<Analysis> {
+    let ControlFlow {
+        reachable,
+        dominators,
+        backedges,
+    } = control_flow(function)?;
+    let count = function.blocks.len();
     let mut live_in = vec![BTreeSet::new(); count];
-    let transfer = |block: usize, live_in: &Vec<BTreeSet<ValueId>>| {
+    // Fixed-point iterations need sets only; snapshot vectors are built after convergence.
+    let transfer = |block: usize, live_in: &Vec<BTreeSet<ValueId>>, snapshots: bool| {
         let body = &function.blocks[block];
         let term = body.terminator.as_ref().unwrap();
         let mut live = BTreeSet::new();
@@ -230,8 +269,16 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
                 .flatten()
                 .copied(),
         );
-        let terminator_live = live.iter().copied().collect::<Vec<_>>();
-        let mut before = vec![vec![]; body.instructions.len()];
+        let terminator_live = if snapshots {
+            live.iter().copied().collect()
+        } else {
+            vec![]
+        };
+        let mut before = if snapshots {
+            vec![vec![]; body.instructions.len()]
+        } else {
+            vec![]
+        };
         for (index, instruction) in body.instructions.iter().enumerate().rev() {
             live.remove(&instruction.result);
             live.extend(instruction.op.inputs());
@@ -245,14 +292,16 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
                     .flatten()
                     .copied(),
             );
-            before[index] = live.iter().copied().collect();
+            if snapshots {
+                before[index] = live.iter().copied().collect();
+            }
         }
         (live, before, terminator_live)
     };
     loop {
         let mut changed = false;
         for block in (0..count).rev() {
-            let (next, _, _) = transfer(block, &live_in);
+            let (next, _, _) = transfer(block, &live_in, false);
             if next != live_in[block] {
                 live_in[block] = next;
                 changed = true;
@@ -262,15 +311,22 @@ pub(super) fn analyze(function: &Function) -> Result<Analysis> {
             break;
         }
     }
-    let live_before = (0..count)
-        .map(|block| transfer(block, &live_in).1)
-        .collect();
-    let live_terminator = (0..count)
-        .map(|block| transfer(block, &live_in).2)
-        .collect();
+    let (live_before, live_terminator): (Vec<_>, Vec<_>) = (0..count)
+        .map(|block| {
+            let (_, before, terminator) = transfer(block, &live_in, true);
+            (before, terminator)
+        })
+        .unzip();
     Ok(Analysis {
         reachable,
-        dominators,
+        dominators: dominators
+            .into_iter()
+            .map(|words| {
+                (0..count)
+                    .filter(|&block| words[block / 64] & (1u64 << (block % 64)) != 0)
+                    .collect()
+            })
+            .collect(),
         backedges,
         live_in: live_in
             .into_iter()

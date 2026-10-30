@@ -51,8 +51,10 @@ impl Function {
             .iter_mut()
             .flat_map(|block| &mut block.instructions)
         {
-            if let Op::Runtime(CoreOp::Function(body) | CoreOp::Class(_, body), _) =
-                &mut instruction.op
+            if let Op::Runtime(
+                CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                _,
+            ) = &mut instruction.op
             {
                 body.promote_locals()?;
             }
@@ -60,13 +62,13 @@ impl Function {
         if self.local_slots.is_empty() || !self.local_states.is_empty() {
             return Ok(());
         }
-        let analysis = self.analyze()?;
+        let reachable = super::analysis::validated_reachable(self)?;
         let n = self.local_slots.len();
         let mut original = self.blocks.clone();
         let mut predecessors = vec![vec![]; original.len()];
         for (from, block) in original.iter_mut().enumerate() {
             for edge in edges(block.terminator.as_mut().unwrap()) {
-                if analysis.reachable[from] {
+                if reachable[from] {
                     predecessors[edge.block.0].push(from);
                 }
             }
@@ -317,7 +319,7 @@ impl Function {
             }
         }
         self.invalidate();
-        self.analyze()?;
+        self.validated_backedges()?;
         Ok(())
     }
 }

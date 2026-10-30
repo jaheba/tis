@@ -112,6 +112,7 @@ impl LoopRegion {
                                 index: lir::SequenceIndex::Constant(_),
                                 ..
                             }
+                            | Operation::Copy(_)
                             | Operation::Constant(_)
                             | Operation::GuardInt { .. }
                             | Operation::GuardFloat { .. }

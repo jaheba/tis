@@ -313,7 +313,9 @@ impl<'a, 'b> Emitter<'a, 'b> {
         let is_ref = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 5);
         let reference = self.b.create_block();
         let primitive = self.b.create_block();
-        self.b.ins().brif(is_ref, reference, &[], primitive, &[]);
+        let is_inline = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 6);
+        let packed = self.b.ins().bor(is_ref, is_inline);
+        self.b.ins().brif(packed, reference, &[], primitive, &[]);
         self.b.switch_to_block(reference);
         let heap = self
             .b
@@ -329,7 +331,10 @@ impl<'a, 'b> Emitter<'a, 'b> {
             .load(types::I32, MemFlagsData::new().with_readonly(), p, 12);
         let heap = self.b.ins().uextend(types::I64, heap);
         let heap = self.b.ins().ishl_imm_u(heap, 32);
-        let tag = self.b.ins().bor_imm_s(heap, REF as i64);
+        let reference_tag = self.b.ins().iconst(types::I64, REF as i64);
+        let inline_tag = self.b.ins().iconst(types::I64, INLINE_STRING as i64);
+        let prefix = self.b.ins().select(is_ref, reference_tag, inline_tag);
+        let tag = self.b.ins().bor(heap, prefix);
         let index = self.b.ins().uextend(types::I64, index);
         let generation = self.b.ins().uextend(types::I64, generation);
         let generation = self.b.ins().ishl_imm_u(generation, 32);
@@ -580,7 +585,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 let bits = self.b.ins().uextend(types::I64, inverted);
                 [self.b.ins().iconst(types::I64, BOOL as i64), bits]
             }
-            Operation::BoxBool(value) => self.read(*value),
+            Operation::BoxBool(value) | Operation::Copy(value) => self.read(*value),
             Operation::NumberCompare {
                 value,
                 integer,

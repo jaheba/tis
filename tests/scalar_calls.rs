@@ -188,7 +188,7 @@ fn shared_scalar_evaluator_preserves_all_tier_values_and_errors() {
             Object::List(vec![Value::Int(1)].into()),
             Object::Tuple(vec![Value::Int(1), Value::Int(2)]),
             Object::Dict(Default::default()),
-            Object::Set(vec![Value::Int(1)]),
+            Object::Set(vec![(tis::Key::Int(1), Value::Int(1))].into()),
         ] {
             let baseline = control.heap.allocate(object.clone());
             let input = vm.heap.allocate(object);

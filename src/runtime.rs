@@ -12,6 +12,9 @@ pub(crate) fn add(heap: &mut Heap, lhs: Value, rhs: Value) -> Result<Value> {
     if let (Some(lhs), Some(rhs)) = (number(lhs), number(rhs)) {
         return Ok(Value::Float(lhs + rhs));
     }
+    if let (Some(lhs), Some(rhs)) = (heap.as_str(&lhs), heap.as_str(&rhs)) {
+        return Ok(heap.string_owned(format!("{lhs}{rhs}")));
+    }
     if let (Value::Ref(_), Value::Ref(_)) = (lhs, rhs) {
         let object = match (heap.get(lhs)?, heap.get(rhs)?) {
             (Object::String(lhs), Object::String(rhs)) => Object::String(format!("{lhs}{rhs}")),
@@ -53,6 +56,7 @@ pub(crate) fn less(lhs: Value, rhs: Value) -> Result<Value> {
 pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
     Ok(match value {
         Value::Unbound => return Err(Error::InvalidIr("unbound value escaped a local read")),
+        Value::InlineString(text) => !text.as_str().is_empty(),
         Value::None => false,
         Value::Bool(value) => value,
         Value::Int(value) => value != 0,

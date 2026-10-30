@@ -123,6 +123,8 @@ impl Schema {
                 Operation::BoxFloat(_) => Some(Expr::Scalar(crate::profile::ValueKind::Float)),
                 Operation::BoxInt(_) => Some(Expr::Scalar(crate::profile::ValueKind::Int)),
                 Operation::BoxBool(_) => Some(Expr::Scalar(crate::profile::ValueKind::Bool)),
+                // Region scalar signatures currently describe numeric values, not inline strings.
+                Operation::Constant(crate::hir::Constant::String(_)) => return None,
                 Operation::Constant(c) => Some(Expr::Scalar(match c {
                     crate::hir::Constant::Float(_) => crate::profile::ValueKind::Float,
                     crate::hir::Constant::Int(_) => crate::profile::ValueKind::Int,

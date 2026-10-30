@@ -21,10 +21,7 @@ fn addition_specializes_then_falls_back_for_new_types() {
     let left = vm.heap.allocate(Object::String("left".into()));
     let right = vm.heap.allocate(Object::String("right".into()));
     let result = vm.run(&mut function, &[left, right]).unwrap();
-    assert_eq!(
-        vm.heap.get(result).unwrap(),
-        &Object::String("leftright".into())
-    );
+    assert_eq!(vm.heap.as_str(&(result)).unwrap(), "leftright");
     assert_eq!(function.feedback(addition).unwrap().guard_failures, 1);
     assert_eq!(
         function.feedback(addition).unwrap().strategy,
@@ -207,7 +204,7 @@ fn unicode_indexing_and_immutable_tuples() {
     let text = heap.allocate(Object::String("é🙂".into()));
     assert_eq!(heap.len(text), Ok(2));
     let character = heap.get_item(text, Value::Int(-1)).unwrap();
-    assert_eq!(heap.get(character).unwrap(), &Object::String("🙂".into()));
+    assert_eq!(heap.as_str(&(character)).unwrap(), "🙂");
     assert_eq!(heap.get_item(text, Value::Int(2)), Err(Error::Index));
     let tuple = heap.allocate(Object::Tuple(vec![Value::Int(1)]));
     assert_eq!(
