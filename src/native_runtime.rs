@@ -283,7 +283,7 @@ pub(crate) extern "C" fn field_callback(
         if registers != context.registers {
             return Err(Error::InvalidIr("field register image"));
         }
-        if context.collecting {
+        if context.collecting || vm.attribute_protocols {
             return Ok(false);
         }
         let &(block, index) = context
@@ -1079,6 +1079,30 @@ impl Context<'_> {
         let instruction = &self.lir.blocks[block].instructions[index];
         let scoped = || SCOPED && self.lir.is_scoped_instruction(instruction);
         if event == HELPER
+            && !self.collecting
+            && !scoped()
+            && !vm.attribute_protocols
+            && let Operation::Call {
+                helper: lir::Helper::SetAttr(attribute),
+                arguments,
+                ..
+            } = &instruction.operation
+        {
+            let receiver = registers[arguments[0].0].value()?;
+            if matches!(vm.heap.get(receiver), Ok(crate::Object::Instance { .. })) {
+                // The global protocol guard proves this exact instance store cannot call Python or GC.
+                // The gateway already flushed buffered region writes before this non-collecting path.
+                let value = registers[arguments[1].0].value()?;
+                vm.raw_set_attribute(receiver, attribute, value)?;
+                self.views.clear();
+                registers[instruction
+                    .result
+                    .ok_or(Error::InvalidIr("field store destination"))?
+                    .0] = Slot::boxed(Value::None);
+                return Ok(());
+            }
+        }
+        if event == HELPER
             && let Operation::NumberCompare {
                 value,
                 integer,
@@ -1308,7 +1332,7 @@ impl Context<'_> {
                     vm.tier_stats.native_truth_fallbacks += 1;
                     Slot {
                         tag: RAW_BOOL,
-                        a: crate::runtime::truth(&vm.heap, registers[value.0].value()?)? as u64,
+                        a: vm.py_truth(registers[value.0].value()?)? as u64,
                     }
                 }
                 _ => unreachable!(),

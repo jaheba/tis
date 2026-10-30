@@ -134,6 +134,11 @@ pub enum CoreOp {
     UnpackStar(usize, usize),
     LoadName(String),
     StoreName(String),
+    DeleteName(String),
+    DeleteBinding(String),
+    DeleteAttr(String),
+    DeleteItem,
+    ZeroSuper(Option<String>),
     LoadLocal(usize),
     StoreLocal(usize),
     CheckLocal(usize),
@@ -147,6 +152,8 @@ pub enum CoreOp {
     GetAttr(String),
     SetAttr(String),
     TryCall(Box<Function>),
+    With(Box<Function>),
+    PropagateException,
     ExceptionMatch,
     EnterExcept,
     ExitExcept,
@@ -253,11 +260,21 @@ impl Function {
         fn references(function: &Function, names: &mut std::collections::BTreeSet<String>) {
             for instruction in function.blocks.iter().flat_map(|b| &b.instructions) {
                 match &instruction.op {
-                    Op::Runtime(CoreOp::LoadName(name) | CoreOp::StoreName(name), _) => {
+                    Op::Runtime(
+                        CoreOp::LoadName(name)
+                        | CoreOp::StoreName(name)
+                        | CoreOp::DeleteName(name)
+                        | CoreOp::DeleteBinding(name)
+                        | CoreOp::ZeroSuper(Some(name)),
+                        _,
+                    ) => {
                         names.insert(name.clone());
                     }
                     Op::Runtime(
-                        CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                        CoreOp::Function(body)
+                        | CoreOp::TryCall(body)
+                        | CoreOp::With(body)
+                        | CoreOp::Class(_, body),
                         _,
                     ) => {
                         references(body, names);
@@ -269,11 +286,25 @@ impl Function {
         let mut captured = std::collections::BTreeSet::new();
         for instruction in self.blocks.iter().flat_map(|b| &b.instructions) {
             if let Op::Runtime(
-                CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                CoreOp::Function(body)
+                | CoreOp::TryCall(body)
+                | CoreOp::With(body)
+                | CoreOp::Class(_, body),
                 _,
             ) = &instruction.op
             {
                 references(body, &mut captured);
+            }
+        }
+        for instruction in self.blocks.iter().flat_map(|block| &block.instructions) {
+            if let Op::Runtime(
+                CoreOp::DeleteName(name)
+                | CoreOp::DeleteBinding(name)
+                | CoreOp::ZeroSuper(Some(name)),
+                _,
+            ) = &instruction.op
+            {
+                captured.insert(name.clone());
             }
         }
         // Overlapping names in nested scopes conservatively retain a shared environment binding.
@@ -290,7 +321,9 @@ impl Function {
         for instruction in self.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
             if let Op::Runtime(operation, _) = &mut instruction.op {
                 match operation {
-                    CoreOp::Function(body) | CoreOp::TryCall(body) => body.index_locals(false),
+                    CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::With(body) => {
+                        body.index_locals(false)
+                    }
                     CoreOp::Class(_, body) => body.index_locals(true),
                     CoreOp::LoadName(name) | CoreOp::StoreName(name) => {
                         if let Ok(slot) = self.local_slots.binary_search(name) {
@@ -403,7 +436,10 @@ impl Function {
         for block in &mut snapshot.blocks {
             for instruction in &mut block.instructions {
                 if let Op::Runtime(
-                    CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                    CoreOp::Function(body)
+                    | CoreOp::TryCall(body)
+                    | CoreOp::With(body)
+                    | CoreOp::Class(_, body),
                     _,
                 ) = &mut instruction.op
                 {

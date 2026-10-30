@@ -46,8 +46,9 @@ impl Vm {
         let key = bound[4].unwrap_or(Value::None);
         let insert = name.starts_with("bisect.insort");
         let left = name.ends_with("_left");
-        if key == Value::None {
-            let index = search(&self.heap, sequence, value, lo, hi, left)?;
+        if key == Value::None
+            && let Ok(index) = search(&self.heap, sequence, value, lo, hi, left)
+        {
             if insert {
                 let mut object = self.heap.get_mut(sequence)?;
                 let Object::List(values) = &mut *object else {
@@ -68,23 +69,23 @@ impl Vm {
                 value
             };
             self.transient_roots.push(search);
-            let mut hi = if hi == -1 {
-                i64::try_from(self.heap.len(sequence)?).map_err(|_| Error::IntegerOverflow)?
-            } else {
-                hi
-            };
+            let mut hi = if hi == -1 { self.py_len(sequence)? } else { hi };
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                let candidate = self.heap.get_item(sequence, Value::Int(mid))?;
+                let candidate = self.py_get_item(sequence, Value::Int(mid))?;
                 let candidate = if key == Value::None {
                     candidate
                 } else {
                     self.call(key, &[candidate])?
                 };
                 let advance = if left {
-                    compare(&self.heap, "<", candidate, search)?
+                    self.protocol_roots(&[candidate], |vm| {
+                        vm.py_compare_bool("<", candidate, search)
+                    })?
                 } else {
-                    !compare(&self.heap, "<", search, candidate)?
+                    !self.protocol_roots(&[candidate], |vm| {
+                        vm.py_compare_bool("<", search, candidate)
+                    })?
                 };
                 if advance {
                     lo = mid + 1;

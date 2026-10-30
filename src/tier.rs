@@ -293,7 +293,7 @@ impl Vm {
                         };
                         if let Operation::FloatListStore { value, .. } = &instruction.operation {
                             let value = read(&registers, *value)?.float()?;
-                            self.heap.set_item(
+                            self.py_set_item(
                                 source,
                                 Value::Int(index as i64),
                                 Value::Float(value),
@@ -474,10 +474,9 @@ impl Vm {
                         if checkpoint {
                             self.lir_roots(lir, *state, roots, &registers, base, &mut rooted)?;
                         }
-                        Some(Datum::Bool(runtime::truth(
-                            &self.heap,
-                            read(&registers, *value)?.boxed()?,
-                        )?))
+                        Some(Datum::Bool(
+                            self.py_truth(read(&registers, *value)?.boxed()?)?,
+                        ))
                     }
                     Operation::Call {
                         helper,
@@ -832,28 +831,26 @@ impl Vm {
                 Value::None
             }
             Helper::StringConstant(literal) => self.intern_literal(&literal.text, &literal.cache),
-            Helper::Add => runtime::add(&mut self.heap, args[0], args[1])?,
-            Helper::Subtract => runtime::subtract(args[0], args[1])?,
-            Helper::Less => runtime::less(args[0], args[1])?,
+            Helper::Add => self.py_binary("+", args[0], args[1])?,
+            Helper::Subtract => self.py_binary("-", args[0], args[1])?,
+            Helper::Less => self.py_compare("<", args[0], args[1])?,
             Helper::List => self.heap.allocate(Object::List(args.to_vec().into())),
             Helper::Tuple => self.heap.allocate(Object::Tuple(args.to_vec())),
             Helper::Dict => {
                 let dict = self.heap.allocate(Object::Dict(Default::default()));
                 for pair in args.as_chunks::<2>().0 {
-                    self.heap.set_item(dict, pair[0], pair[1])?;
+                    self.py_set_item(dict, pair[0], pair[1])?;
                 }
                 dict
             }
-            Helper::GetItem => self.heap.get_item(args[0], args[1])?,
+            Helper::GetItem => self.py_get_item(args[0], args[1])?,
             Helper::SetItem => {
-                self.heap.set_item(args[0], args[1], args[2])?;
+                self.py_set_item(args[0], args[1], args[2])?;
                 Value::None
             }
             Helper::StringNext => self.next(args[0])?,
             Helper::ScalarCall(_) => self.call_from_registers(args[0], &args[1..])?,
-            Helper::Len => Value::Int(
-                i64::try_from(self.heap.len(args[0])?).map_err(|_| Error::IntegerOverflow)?,
-            ),
+            Helper::Len => Value::Int(self.py_len(args[0])?),
             Helper::Python(crate::hir::CoreOp::Call(names))
                 if names.iter().all(Option::is_none) =>
             {
@@ -977,7 +974,10 @@ impl Vm {
                     want_nest,
                 );
                 let result = result.and_then(|mut native| {
-                    if (self.readonly_regions || self.mutation_regions) && !feedback {
+                    if (self.readonly_regions || self.mutation_regions)
+                        && !feedback
+                        && !self.attribute_protocols
+                    {
                         native.compile_regions(
                             &function.borrow(),
                             self.readonly_regions,

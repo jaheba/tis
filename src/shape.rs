@@ -67,14 +67,24 @@ impl Attributes {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(*self.shape.fields.get(name)?)
     }
+    pub(crate) fn remove(&mut self, name: &str) -> Option<Value> {
+        let index = *self.shape.fields.get(name)?;
+        let value = self.values.remove(index);
+        let mut fields = self.shape.fields.clone();
+        fields.remove(name);
+        for slot in fields.values_mut() {
+            if *slot > index {
+                *slot -= 1;
+            }
+        }
+        self.shape = Shape::layout(fields);
+        Some(value)
+    }
     pub fn values(&self) -> impl Iterator<Item = &Value> {
         self.values.iter()
     }
     pub fn insert(&mut self, name: String, value: Value) -> Option<Value> {
         self.insert_slot(&name, value).1
-    }
-    pub(crate) fn insert_ref(&mut self, name: &str, value: Value) -> Option<Value> {
-        self.insert_slot(name, value).1
     }
     fn insert_slot(&mut self, name: &str, value: Value) -> (usize, Option<Value>) {
         if let Some(&index) = self.shape.fields.get(name) {

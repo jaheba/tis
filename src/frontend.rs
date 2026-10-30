@@ -1,5 +1,6 @@
 //! Ruff AST lowering. Every executable construct becomes value IR before bytecode.
 
+mod exceptions;
 use crate::{
     Error, Result,
     hir::{BlockId, Constant, CoreOp, Edge, Function, Op, Terminator, ValueId},
@@ -91,6 +92,9 @@ struct Builder {
     function: Function,
     loops: Vec<(BlockId, BlockId, usize)>,
     except_depth: usize,
+    control: bool,
+    external_loop: bool,
+    super_parameter: Option<String>,
 }
 impl Builder {
     fn new(body: &[Stmt], module: bool) -> Result<Self> {
@@ -114,6 +118,9 @@ impl Builder {
             function,
             loops: vec![],
             except_depth: 0,
+            control: false,
+            external_loop: false,
+            super_parameter: None,
         })
     }
     fn runtime(&mut self, block: BlockId, op: CoreOp, values: Vec<ValueId>) -> ValueId {
@@ -173,6 +180,7 @@ impl Builder {
             .chain(&parameters.args)
             .map(|p| p.parameter.name.to_string())
             .collect();
+        self.super_parameter = self.function.parameter_names.first().cloned();
         self.function.keyword_only = parameters
             .kwonlyargs
             .iter()
@@ -269,9 +277,13 @@ impl Builder {
                 } else {
                     self.none(block)
                 };
-                self.close_except(block, 0);
-                self.function.terminate(block, Terminator::Return(value));
+                self.return_value(block, value);
                 return Ok(None);
+            }
+            Stmt::Delete(stmt) => {
+                for target in &stmt.targets {
+                    block = self.delete_target(target, block)?;
+                }
             }
             Stmt::Assign(stmt) => {
                 let (next, value) = self.expression(&stmt.value, block)?;
@@ -301,19 +313,31 @@ impl Builder {
                 if stmt.is_async || stmt.type_params.is_some() {
                     return Err(Error::Unsupported("async or generic function"));
                 }
-                if !stmt.decorator_list.is_empty() {
-                    return Err(Error::Unsupported("function decorators"));
+                let mut decorators = vec![];
+                for decorator in &stmt.decorator_list {
+                    let (next, value) = self.expression(&decorator.expression, block)?;
+                    block = next;
+                    decorators.push(value);
                 }
                 let function =
                     Self::function(&stmt.parameters, &stmt.body)?.with_name(stmt.name.to_string());
                 let (next, defaults) = self.defaults(&stmt.parameters, block)?;
                 block = next;
-                let value = self.runtime(block, CoreOp::Function(Box::new(function)), defaults);
+                let mut value = self.runtime(block, CoreOp::Function(Box::new(function)), defaults);
+                for decorator in decorators.into_iter().rev() {
+                    value = self.runtime(block, CoreOp::Call(vec![None]), vec![decorator, value]);
+                }
                 self.runtime(block, CoreOp::StoreName(stmt.name.to_string()), vec![value]);
             }
             Stmt::ClassDef(stmt) => {
-                if !stmt.decorator_list.is_empty() || stmt.type_params.is_some() {
-                    return Err(Error::Unsupported("decorated or generic class"));
+                if stmt.type_params.is_some() {
+                    return Err(Error::Unsupported("generic class"));
+                }
+                let mut decorators = vec![];
+                for decorator in &stmt.decorator_list {
+                    let (next, value) = self.expression(&decorator.expression, block)?;
+                    block = next;
+                    decorators.push(value);
                 }
                 let mut bases = vec![];
                 if let Some(arguments) = &stmt.arguments {
@@ -321,9 +345,6 @@ impl Builder {
                         return Err(Error::Unsupported("class keywords"));
                     }
                     for expr in &arguments.args {
-                        if matches!(expr,Expr::Name(name) if name.id.as_str()=="object") {
-                            continue;
-                        }
                         let (next, value) = self.expression(expr, block)?;
                         block = next;
                         bases.push(value);
@@ -333,11 +354,14 @@ impl Builder {
                 body.function.name = format!("<class {}>", stmt.name);
                 let end = body.statements(&stmt.body, Some(body.function.entry()))?;
                 body.finish(end)?;
-                let value = self.runtime(
+                let mut value = self.runtime(
                     block,
                     CoreOp::Class(stmt.name.to_string(), Box::new(body.function)),
                     bases,
                 );
+                for decorator in decorators.into_iter().rev() {
+                    value = self.runtime(block, CoreOp::Call(vec![None]), vec![decorator, value]);
+                }
                 self.runtime(block, CoreOp::StoreName(stmt.name.to_string()), vec![value]);
             }
             Stmt::If(stmt) => {
@@ -388,35 +412,33 @@ impl Builder {
                 block = exit;
             }
             Stmt::Break(_) => {
-                let &(_, exit, depth) = self
-                    .loops
-                    .last()
-                    .ok_or_else(|| Error::Syntax("break outside loop".into()))?;
-                self.close_except(block, depth);
-                self.jump(block, exit);
+                self.loop_control(block, false)?;
                 return Ok(None);
             }
             Stmt::Continue(_) => {
-                let &(head, _, depth) = self
-                    .loops
-                    .last()
-                    .ok_or_else(|| Error::Syntax("continue outside loop".into()))?;
-                self.close_except(block, depth);
-                self.jump(block, head);
+                self.loop_control(block, true)?;
                 return Ok(None);
             }
             Stmt::Try(stmt) => return self.try_statement(stmt, block),
-            Stmt::Raise(stmt) => {
-                if stmt.cause.is_some() {
-                    return Err(Error::Unsupported("raise from"));
+            Stmt::With(stmt) => {
+                if stmt.is_async {
+                    return Err(Error::Unsupported("async with"));
                 }
-                let values = if let Some(exception) = &stmt.exc {
+                return self.with_items(&stmt.items, &stmt.body, block);
+            }
+            Stmt::Raise(stmt) => {
+                let mut values = if let Some(exception) = &stmt.exc {
                     let (next, value) = self.expression(exception, block)?;
                     block = next;
                     vec![value]
                 } else {
                     vec![]
                 };
+                if let Some(cause) = &stmt.cause {
+                    let (next, cause) = self.expression(cause, block)?;
+                    block = next;
+                    values.push(cause);
+                }
                 self.runtime(block, CoreOp::Raise, values);
                 let value = self.none(block);
                 self.function.terminate(block, Terminator::Return(value));
@@ -719,6 +741,18 @@ impl Builder {
             Expr::Call(expr) => {
                 let (next, callable) = self.expression(&expr.func, block)?;
                 block = next;
+                if matches!(&*expr.func,Expr::Name(name) if name.id.as_str()=="super")
+                    && expr.arguments.args.is_empty()
+                    && expr.arguments.keywords.is_empty()
+                {
+                    let value = self.runtime(
+                        block,
+                        CoreOp::ZeroSuper(self.super_parameter.clone()),
+                        vec![callable],
+                    );
+                    return Ok((block, value));
+                }
+
                 let mut values = vec![callable];
                 let mut names = vec![];
                 for expr in &expr.arguments.args {
@@ -1001,6 +1035,18 @@ impl Builder {
     }
 
     fn try_statement(&mut self, stmt: &ast::StmtTry, block: BlockId) -> Result<Option<BlockId>> {
+        let simple = matches!(stmt.body.as_slice(), [Stmt::Expr(_)])
+            || matches!(stmt.body.as_slice(), [Stmt::Assign(a)] if a.targets.iter().all(|t|matches!(t, Expr::Name(_))));
+        if !simple
+            || !stmt.finalbody.is_empty()
+            || stmt.handlers.iter().any(|h| {
+                let ast::ExceptHandler::ExceptHandler(h) = h;
+                h.name.is_some()
+            })
+        {
+            return self.general_try(stmt, block);
+        }
+
         if stmt.is_star || !stmt.finalbody.is_empty() || stmt.handlers.is_empty() {
             return Err(Error::Unsupported("try finally or except star"));
         }
@@ -1082,7 +1128,7 @@ impl Builder {
         self.except_depth -= 1;
         if let Some(block) = next {
             self.runtime(block, CoreOp::ExitExcept, vec![]);
-            self.runtime(block, CoreOp::Raise, vec![value]);
+            self.runtime(block, CoreOp::PropagateException, vec![value]);
             let none = self.none(block);
             self.function.terminate(block, Terminator::Return(none));
         }
@@ -1319,6 +1365,11 @@ fn bindings(
                     target_names(target, locals);
                 }
             }
+            Stmt::Delete(stmt) => {
+                for target in &stmt.targets {
+                    target_names(target, locals);
+                }
+            }
             Stmt::AnnAssign(stmt) => target_names(&stmt.target, locals),
             Stmt::AugAssign(stmt) => target_names(&stmt.target, locals),
             Stmt::FunctionDef(stmt) => {
@@ -1342,12 +1393,23 @@ fn bindings(
                     bindings(&clause.body, locals, globals, nonlocals);
                 }
             }
+            Stmt::With(stmt) => {
+                for item in &stmt.items {
+                    if let Some(target) = &item.optional_vars {
+                        target_names(target, locals);
+                    }
+                }
+                bindings(&stmt.body, locals, globals, nonlocals);
+            }
             Stmt::Try(stmt) => {
                 bindings(&stmt.body, locals, globals, nonlocals);
                 bindings(&stmt.orelse, locals, globals, nonlocals);
                 bindings(&stmt.finalbody, locals, globals, nonlocals);
                 for handler in &stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if let Some(name) = &handler.name {
+                        locals.insert(name.to_string());
+                    }
                     bindings(&handler.body, locals, globals, nonlocals);
                 }
             }
@@ -1441,9 +1503,11 @@ fn validate_scope(
                 validate_scope(&stmt.body, parents, in_function, true)?;
                 validate_scope(&stmt.orelse, parents, in_function, in_loop)?;
             }
+            Stmt::With(stmt) => validate_scope(&stmt.body, parents, in_function, in_loop)?,
             Stmt::Try(stmt) => {
                 validate_scope(&stmt.body, parents, in_function, in_loop)?;
                 validate_scope(&stmt.orelse, parents, in_function, in_loop)?;
+                validate_scope(&stmt.finalbody, parents, in_function, in_loop)?;
                 for handler in &stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(handler) = handler;
                     validate_scope(&handler.body, parents, in_function, in_loop)?;

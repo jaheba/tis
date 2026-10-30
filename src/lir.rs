@@ -576,8 +576,12 @@ impl Function {
                         Operation::Truth {
                             value: Register(inputs[0].0),
                             state,
-                            roots: vec![],
-                            effects: Effects::READ_ONLY,
+                            roots: output.states[state.0]
+                                .values
+                                .iter()
+                                .map(|(_, register)| *register)
+                                .collect(),
+                            effects: Effects::CONSERVATIVE,
                         },
                     );
                     let inverted = output.register(Type::Bool);
@@ -1327,7 +1331,11 @@ impl Function {
                         instruction: body.instructions.len(),
                     };
                     let state = output.state(hir, point, &analysis.live_terminator[block_id]);
-                    let roots = Vec::new();
+                    let roots = output.states[state.0]
+                        .values
+                        .iter()
+                        .map(|(_, register)| *register)
+                        .collect();
                     let truth = output.register(Type::Bool);
                     instructions.push(Instruction {
                         result: Some(truth),
@@ -1337,7 +1345,7 @@ impl Function {
                             value: Register(condition.0),
                             state,
                             roots,
-                            effects: Effects::READ_ONLY,
+                            effects: Effects::CONSERVATIVE,
                         },
                     });
                     Terminator::Branch {
@@ -1753,10 +1761,15 @@ impl Function {
                             .any(|(_, register)| register == value)
                             && !snapshot.inline_roots().contains(value)
                             || snapshot.resume != instruction.point
-                            || !effects.covers(Effects::READ_ONLY)
+                            || !effects.covers(Effects::CONSERVATIVE)
                             || roots.iter().copied().collect::<BTreeSet<_>>()
                                 != if effects.needs_safepoint() {
-                                    snapshot.values.iter().map(|(_, r)| *r).collect()
+                                    snapshot
+                                        .values
+                                        .iter()
+                                        .map(|(_, r)| *r)
+                                        .chain(snapshot.inline_roots().iter().copied())
+                                        .collect()
                                 } else {
                                     BTreeSet::new()
                                 }
@@ -2642,46 +2655,31 @@ impl Helper {
             | Self::CurrentEnvironment
             | Self::LeafReturn(_)
             | Self::TupleReturn(_)
-            | Self::Subtract
+            | Self::LoadName(_) => readonly,
+            Self::StoreName(_) => writing,
+            Self::StringConstant(_) | Self::List | Self::Tuple => allocating,
+            Self::Subtract
             | Self::Less
             | Self::Len
-            | Self::LoadName(_) => readonly,
-            Self::SetItem | Self::StoreName(_) | Self::SetAttr(_) => writing,
-            Self::GetAttr(_) | Self::ScalarCall(_) | Self::StringNext | Self::InlineCall { .. } => {
-                Effects::CONSERVATIVE
-            }
-            Self::StringConstant(_)
+            | Self::SetItem
+            | Self::SetAttr(_)
+            | Self::GetAttr(_)
+            | Self::ScalarCall(_)
+            | Self::StringNext
+            | Self::InlineCall { .. }
             | Self::Add
-            | Self::List
-            | Self::Tuple
             | Self::Dict
-            | Self::GetItem => allocating,
+            | Self::GetItem => Effects::CONSERVATIVE,
             Self::Python(op) => match op {
                 CoreOp::LoadName(_)
                 | CoreOp::LoadLocal(_)
                 | CoreOp::CheckLocal(_)
-                | CoreOp::IsDone
-                | CoreOp::Compare(_)
-                | CoreOp::Unary(_) => readonly,
-                // Attribute setters only update instance/class maps; descriptors and Python setters
-                // are not supported, and these writes cannot trigger heap collection.
+                | CoreOp::IsDone => readonly,
                 CoreOp::StoreLocal(_)
                 | CoreOp::StoreName(_)
-                | CoreOp::SetAttr(_)
+                | CoreOp::DeleteName(_)
                 | CoreOp::ListAppend => writing,
-                CoreOp::Binary(op)
-                    if matches!(op.as_str(), "/" | "//" | "%" | "**" | "&" | "|" | "^") =>
-                {
-                    readonly
-                }
-                CoreOp::Inplace(op)
-                    if matches!(op.as_str(), "-" | "/" | "//" | "%" | "**" | "&" | "|" | "^") =>
-                {
-                    readonly
-                }
-                CoreOp::Binary(op) if op == "*" => allocating,
                 CoreOp::Missing | CoreOp::Slice | CoreOp::UnpackItem(_) => allocating,
-                // Iteration, calls and attribute/format operations retain conservative effects.
                 _ => Effects::CONSERVATIVE,
             },
         }
@@ -2733,9 +2731,12 @@ impl Helper {
                 CoreOp::TryCall(_) => count == 0,
                 CoreOp::EnterExcept => count == 1,
                 CoreOp::ExceptionMatch | CoreOp::ListAppend => count == 2,
-                CoreOp::ExitExcept => count == 0,
+                CoreOp::ExitExcept | CoreOp::DeleteName(_) | CoreOp::DeleteBinding(_) => count == 0,
+                CoreOp::DeleteAttr(_) | CoreOp::ZeroSuper(_) => count == 1,
+                CoreOp::DeleteItem => count == 2,
                 CoreOp::Generator(filters, _) => count == filters + 3,
-                CoreOp::Raise => count <= 1,
+                CoreOp::Raise => count <= 2,
+                CoreOp::PropagateException | CoreOp::With(_) => count == 1,
                 CoreOp::Binary(_)
                 | CoreOp::Inplace(_)
                 | CoreOp::Compare(_)

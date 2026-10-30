@@ -5,6 +5,12 @@ fn values_and_optional_registers_are_two_words() {
     assert_eq!(size_of::<Value>(), 16);
     assert_eq!(size_of::<Option<Value>>(), 16);
     assert_eq!(size_of::<ObjectId>(), 12);
+    // Cold exception metadata must not enlarge every arena slot.
+    assert!(
+        size_of::<Object>() <= 144,
+        "object size {}",
+        size_of::<Object>()
+    );
 }
 
 #[test]

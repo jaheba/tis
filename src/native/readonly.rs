@@ -396,6 +396,9 @@ impl Kernel {
         function: &Rc<RefCell<hir::Function>>,
     ) -> Result<Option<Outcome>> {
         vm.maybe_collect()?;
+        if vm.attribute_protocols {
+            return Ok(None);
+        }
         let locals = vm.local_values()?;
         let arguments = self
             .source

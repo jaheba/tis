@@ -1,0 +1,2 @@
+Completed. All source integrated in /Users/jaheba/p/tis; installed CLI updated. 387 Rust tests, all-target Clippy, fmt, diff check and 11 CPython assertion programs pass. Final quick benchmark completed, with expected old-baseline failures. No commit or push performed. README.md and summary.json contain final measurements and remaining performance overhead.
+Barnes bytecode three-sample follow-up completed without failures; see README.

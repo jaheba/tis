@@ -2,7 +2,6 @@ use crate::{
     Error, Heap, Object, Result, Value,
     bytecode::{Code, Opcode, read_operand},
     hir::{AddFeedback, AddStrategy, Function, ValueId},
-    runtime,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -74,6 +73,8 @@ pub struct Vm {
     pub(crate) globals: Option<Value>,
     // Inactive buffers contain no roots. Each active native frame owns a distinct allocation.
     pub(crate) native_register_pool: Vec<crate::native_runtime::Scratch>,
+    pub(crate) attribute_protocols: bool,
+    pub(crate) protocol_depth: usize,
     pub(crate) modules: std::collections::BTreeMap<String, Value>,
     pub(crate) literal_pool: std::collections::HashMap<String, Value>,
     pub output: String,
@@ -100,6 +101,19 @@ pub struct Vm {
 }
 
 impl Vm {
+    pub(crate) fn traceback_origin(&self) -> Option<(crate::profile::FunctionId, usize)> {
+        self.local_frames
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, frame)| {
+                !self
+                    .try_bodies
+                    .contains_key(&(frame.code.function, frame.code.revision))
+            })
+            .map(|(depth, frame)| (frame.code.function, depth))
+    }
+
     pub(crate) fn intern_literal(
         &mut self,
         text: &str,
@@ -133,13 +147,17 @@ impl Vm {
 
     /// Frame values occupy one stack window; both return and error release that window.
     pub fn run(&mut self, function: &mut Function, arguments: &[Value]) -> Result<Value> {
-        if self.depth == 0 {
+        let boundary = self.depth == 0 && self.transient_roots.is_empty();
+        if boundary {
             self.pending_exception = None;
         }
         let handle = Rc::new(RefCell::new(function.clone()));
         let parent = self.ensure_globals();
         let result = self.invoke_function(handle.clone(), parent, &[], arguments, &[]);
         *function = handle.borrow().clone();
+        if boundary {
+            self.pending_exception = None;
+        }
         result
     }
 
@@ -296,7 +314,7 @@ impl Vm {
             self.stack.truncate(base);
             return Err(error);
         }
-        if self.depth == 0 {
+        if self.depth == 0 && self.transient_roots.is_empty() {
             self.pending_exception = None;
         }
         let exception_depth = self.active_exceptions.len();
@@ -309,7 +327,7 @@ impl Vm {
         });
         // Runtime calls currently recurse through Rust; grow before entering another frame
         // so the language recursion limit is reached before exhausting the native stack.
-        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        let mut result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
             if let Some(pending) = pending {
                 let value = self.resume_inline_frames(pending.frames)?;
                 self.stack[base + pending.continuation.destination.0] = Some(value);
@@ -351,6 +369,19 @@ impl Vm {
             }
             // Completed calls let recursive bodies contribute results before compilation freezes the window.
             profile.advance(self.profiling);
+        }
+        // Materialize a Python error while its active handler context is still available.
+        if let Err(err) = &result
+            && self.pending_exception.is_none()
+            && let Ok(exception) = self.exception_from_error(err.clone())
+        {
+            self.pending_exception = Some(exception);
+        }
+        if result.is_err()
+            && let Some(exception) = self.pending_exception
+            && let Err(err) = self.record_traceback(exception, false)
+        {
+            result = Err(err);
         }
         self.environments.pop();
         self.local_frames.pop();
@@ -799,9 +830,9 @@ impl Vm {
                     let rhs = self.pop(frame_end)?;
                     let lhs = self.pop(frame_end)?;
                     let value = if matches!(opcode, Opcode::Subtract) {
-                        runtime::subtract(lhs, rhs)?
+                        self.py_binary("-", lhs, rhs)?
                     } else {
-                        runtime::less(lhs, rhs)?
+                        self.py_compare("<", lhs, rhs)?
                     };
                     self.push(value);
                 }
@@ -829,7 +860,7 @@ impl Vm {
                         _ => {
                             let result = self.heap.allocate(Object::Dict(Default::default()));
                             for pair in values.as_chunks::<2>().0 {
-                                self.heap.set_item(result, pair[0], pair[1])?;
+                                self.py_set_item(result, pair[0], pair[1])?;
                             }
                             result
                         }
@@ -839,28 +870,26 @@ impl Vm {
                 Opcode::GetItem => {
                     let key = self.pop(frame_end)?;
                     let object = self.pop(frame_end)?;
-                    let value = self.heap.get_item(object, key)?;
+                    let value = self.py_get_item(object, key)?;
                     self.push(value);
                 }
                 Opcode::SetItem => {
                     let value = self.pop(frame_end)?;
                     let key = self.pop(frame_end)?;
                     let object = self.pop(frame_end)?;
-                    self.heap.set_item(object, key, value)?;
+                    self.py_set_item(object, key, value)?;
                     self.push(Value::None);
                 }
                 Opcode::Len => {
                     let object = self.pop(frame_end)?;
-                    let len = self.heap.len(object)?;
-                    self.push(Value::Int(
-                        i64::try_from(len).map_err(|_| Error::IntegerOverflow)?,
-                    ));
+                    let len = self.py_len(object)?;
+                    self.push(Value::Int(len));
                 }
                 Opcode::Jump => ip = read_operand(&code.body, &mut ip)?,
                 Opcode::JumpIfFalse => {
                     let target = read_operand(&code.body, &mut ip)?;
                     let value = self.pop(frame_end)?;
-                    if !runtime::truth(&self.heap, value)? {
+                    if !self.py_truth(value)? {
                         ip = target;
                     }
                 }
@@ -1025,7 +1054,7 @@ impl Vm {
             feedback.strategy = AddStrategy::Generic;
             feedback.consecutive_integers = 0;
         }
-        let result = runtime::add(&mut self.heap, lhs, rhs);
+        let result = self.py_binary("+", lhs, rhs);
         if matches!(
             (lhs, rhs, &result),
             (Value::Int(_), Value::Int(_), Ok(Value::Int(_)))

@@ -1,8 +1,17 @@
 //! Lexical environments and Python object operations shared by execution backends.
+mod attributes;
+mod exceptions;
+use exceptions::exception_parent;
+mod context;
 pub(crate) mod expression;
+mod hashing;
+mod protocols;
+mod representation;
+mod slicing;
+mod types;
 
 use crate::{
-    Error, Heap, Key, Object, Result, Value, Vm,
+    Error, ExceptionData, Heap, Key, Object, Result, Value, Vm,
     hir::{CoreOp, Function},
     runtime,
 };
@@ -61,7 +70,12 @@ impl ScalarBuiltin {
         arity(args, 1, 1)?;
         Ok(match self {
             Self::BisectLeft | Self::BisectRight => unreachable!(),
-            Self::Len => Value::Int(heap.len(args[0])? as i64),
+            Self::Len => {
+                if !matches!(args[0], Value::Ref(_) | Value::InlineString(_)) {
+                    return Err(Error::Type("object has no length"));
+                }
+                Value::Int(heap.len(args[0])? as i64)
+            }
             Self::Sqrt => {
                 let value = number(args[0])?;
                 if value < 0.0 {
@@ -138,10 +152,25 @@ pub(crate) fn visit_children(object: &Object, mut visit: impl FnMut(Value)) {
     };
     match object {
         Object::List(values) if !values.is_float() => values.iter().copied().for_each(edge),
-        Object::Exception {
-            arguments: values, ..
+        Object::Property {
+            get,
+            set,
+            delete,
+            doc,
+        } => [*get, *set, *delete, *doc].into_iter().for_each(edge),
+        Object::Traceback { next, .. } => next.iter().copied().for_each(edge),
+        Object::Super { anchor, receiver } => {
+            edge(*anchor);
+            edge(*receiver);
         }
-        | Object::Tuple(values)
+        Object::StaticMethod(function) | Object::ClassMethod(function) => edge(*function),
+        Object::Exception(exception) => std::iter::once(exception.arguments)
+            .chain(exception.attributes.values().copied())
+            .chain(exception.cause)
+            .chain(exception.context)
+            .chain(exception.traceback)
+            .for_each(edge),
+        Object::Tuple(values)
         | Object::Zip {
             iterators: values, ..
         } => values.iter().copied().for_each(edge),
@@ -152,7 +181,10 @@ pub(crate) fn visit_children(object: &Object, mut visit: impl FnMut(Value)) {
             }
         }
         Object::Dict(values) | Object::Set(values) => {
-            values.iter().map(|(_, value)| *value).for_each(edge)
+            for (key, value) in values {
+                key.visit_values(&mut edge);
+                edge(*value);
+            }
         }
         Object::Environment(env) => env
             .values
@@ -197,6 +229,26 @@ impl Vm {
         }
         let mut values = crate::bindings::Bindings::new();
         for name in [
+            "slice",
+            "type",
+            "super",
+            "issubclass",
+            "hash",
+            "getattr",
+            "setattr",
+            "delattr",
+            "hasattr",
+            "property",
+            "staticmethod",
+            "classmethod",
+            "AttributeError",
+            "NameError",
+            "AssertionError",
+            "ArithmeticError",
+            "LookupError",
+            "RecursionError",
+            "NotImplementedError",
+            "NotImplemented",
             "BaseException",
             "Exception",
             "ValueError",
@@ -237,7 +289,11 @@ impl Vm {
             "all",
             "any",
         ] {
-            values.insert(name.into(), self.heap.allocate(Object::Native(name.into())));
+            let value = self.heap.allocate(Object::Native(name.into()));
+            if types::builtin_type_name(name) {
+                self.modules.insert(format!("type.{name}"), value);
+            }
+            values.insert(name.into(), value);
         }
         values.insert(
             "__name__".into(),
@@ -625,7 +681,8 @@ impl Vm {
     }
 
     pub fn call(&mut self, callable: Value, arguments: &[Value]) -> Result<Value> {
-        if self.depth == 0 {
+        let boundary = self.depth == 0 && self.transient_roots.is_empty();
+        if boundary {
             self.pending_exception = None;
         }
         let roots = self.transient_roots.len();
@@ -633,6 +690,9 @@ impl Vm {
         self.transient_roots.extend_from_slice(arguments);
         let result = self.call_keywords(callable, arguments, &[]);
         self.transient_roots.truncate(roots);
+        if boundary {
+            self.pending_exception = None;
+        }
         result
     }
 
@@ -650,11 +710,26 @@ impl Vm {
         }
         self.tier_stats.bytecode_positional_calls += 1;
         self.tier_stats.bytecode_leaf_calls += 1;
-        Some(builtin.evaluate(&self.heap, arguments))
+        if builtin == ScalarBuiltin::Len
+            && arguments
+                .first()
+                .is_some_and(|v| self.instance_class(*v).is_some())
+        {
+            return None;
+        }
+        let result = builtin.evaluate(&self.heap, arguments);
+        if matches!(
+            builtin,
+            ScalarBuiltin::BisectLeft | ScalarBuiltin::BisectRight
+        ) && matches!(result, Err(Error::Type(_)))
+        {
+            return None;
+        }
+        Some(result)
     }
 
     /// Register operands remain rooted in their caller's window until the result is stored.
-    /// Current builtins cannot execute Python or collect, except keyed list sorting.
+    /// Builtin dispatch may invoke Python protocols; operands remain rooted in the caller window.
     pub(crate) fn call_from_registers(
         &mut self,
         callable: Value,
@@ -686,6 +761,9 @@ impl Vm {
         arguments: &[Value],
         keywords: &[(String, Value)],
     ) -> Result<Value> {
+        if !matches!(callable, Value::Ref(_)) {
+            return Err(Error::Type("object is not callable"));
+        }
         let object = self.heap.get(callable)?.clone();
         match object {
             Object::Function(closure) => self.invoke_function(
@@ -712,21 +790,48 @@ impl Vm {
                 self.call_keywords(function, &args, keywords)
             }
             Object::Class { shape, .. } => {
-                let instance = self.heap.allocate(Object::Instance {
-                    class: callable,
-                    attributes: crate::Attributes::new(shape),
-                });
-                if let Some(init) = self.class_attribute(callable, "__init__")? {
-                    let args = std::iter::once(instance)
+                let instance = if let Some(new) = self.class_attribute(callable, "__new__")? {
+                    let new = if let Ok(Object::StaticMethod(function)) = self.heap.get(new) {
+                        *function
+                    } else {
+                        new
+                    };
+                    let args = std::iter::once(callable)
                         .chain(arguments.iter().copied())
                         .collect::<Vec<_>>();
-                    if self.call_keywords(init, &args, keywords)? != Value::None {
-                        return Err(error("TypeError: __init__ must return None"));
-                    }
-                } else if !arguments.is_empty() || !keywords.is_empty() {
-                    return Err(error("TypeError: class takes no arguments"));
+                    self.call_keywords(new, &args, keywords)?
+                } else {
+                    self.heap.allocate(Object::Instance {
+                        class: callable,
+                        attributes: crate::Attributes::new(shape),
+                    })
+                };
+                if !self.instance_of(instance, callable)? {
+                    return Ok(instance);
                 }
-                Ok(instance)
+                self.protocol_roots(&[instance],|vm| {
+                    if vm.exception_class(callable) {
+                        let args=vm.heap.allocate(Object::Tuple(arguments.to_vec()));
+                        vm.raw_set_attribute(instance,&crate::Attribute::from("args".to_owned()),args)?;
+                        for name in ["__cause__","__context__"] {vm.raw_set_attribute(instance,&crate::Attribute::from(name.to_owned()),Value::None)?;}
+                        vm.raw_set_attribute(instance,&crate::Attribute::from("__suppress_context__".to_owned()),Value::Bool(false))?;
+                    }
+                    if vm.special(instance,"__init__")?.is_some() {
+                        // Keyword binding is shared with ordinary calls after binding the descriptor.
+                        let init=vm.special(instance,"__init__")?.unwrap();
+                        let init=if matches!(vm.heap.get(init),Ok(Object::Native(name)) if name=="BaseException.__init__") {vm.heap.allocate(Object::Method(init,instance))}else{vm.descriptor_get(init,Some(instance),callable)?};
+                        if vm.call_keywords(init,arguments,keywords)?!=Value::None {return Err(error("TypeError: __init__ must return None"));}
+                    } else if !arguments.is_empty() || !keywords.is_empty() {return Err(error("TypeError: class takes no arguments"));}
+                    Ok(instance)
+                })
+            }
+            Object::Instance { .. } => {
+                let method = self
+                    .special(callable, "__call__")?
+                    .ok_or(Error::Type("object is not callable"))?;
+                let class = self.instance_class(callable).unwrap();
+                let method = self.descriptor_get(method, Some(callable), class)?;
+                self.call_keywords(method, arguments, keywords)
             }
             _ => Err(Error::Type("object is not callable")),
         }
@@ -769,7 +874,53 @@ impl Vm {
                 self.store(env, name, values[0])?;
                 Value::None
             }
-            CoreOp::Binary(op) => binary(&self.heap, op, values[0], values[1])?,
+            CoreOp::DeleteName(name) => {
+                let target = self.store_target(env, name)?;
+                let mut target = self.heap.get_mut(target)?;
+                let Object::Environment(target) = &mut *target else {
+                    return Err(Error::InvalidIr("exception binding environment"));
+                };
+                target.values.remove(name);
+                Value::None
+            }
+            CoreOp::DeleteBinding(name) => {
+                let target = self.store_target(env, name)?;
+                let mut target = self.heap.get_mut(target)?;
+                let Object::Environment(target) = &mut *target else {
+                    return Err(Error::InvalidIr("exception binding environment"));
+                };
+                if target.values.remove(name).is_none() {
+                    return Err(error(format!(
+                        "{}: {name}",
+                        if target.locals.contains(name) {
+                            "UnboundLocalError"
+                        } else {
+                            "NameError"
+                        }
+                    )));
+                }
+                Value::None
+            }
+            CoreOp::DeleteAttr(name) => self.delete_attribute(values[0], name)?,
+            CoreOp::DeleteItem => self.py_delete_item(values[0], values[1])?,
+            CoreOp::ZeroSuper(parameter) => {
+                if matches!(self.heap.get(values[0]),Ok(Object::Native(name)) if name=="super") {
+                    let class = self
+                        .lookup(env, "__class__")
+                        .map_err(|_| error("RuntimeError: super(): __class__ cell not found"))?;
+                    let name = parameter
+                        .as_ref()
+                        .ok_or_else(|| error("RuntimeError: super(): no arguments"))?;
+                    let receiver = self.lookup(env, name)?;
+                    self.heap.allocate(Object::Super {
+                        anchor: class,
+                        receiver,
+                    })
+                } else {
+                    self.call(values[0], &[])?
+                }
+            }
+            CoreOp::Binary(op) => self.py_binary(op, values[0], values[1])?,
             CoreOp::Inplace(op) => {
                 if op == "+" && matches!(self.heap.get(values[0]), Ok(Object::List(_))) {
                     self.method(values[0], "extend", &values[1..])?;
@@ -779,28 +930,13 @@ impl Vm {
                     let object = self.heap.get(replacement)?.clone();
                     *self.heap.get_mut(values[0])? = object;
                     values[0]
-                } else if op == "+" {
-                    runtime::add(&mut self.heap, values[0], values[1])?
-                } else if op == "-" {
-                    runtime::subtract(values[0], values[1])?
                 } else {
-                    binary(&self.heap, op, values[0], values[1])?
+                    self.py_inplace(op, values[0], values[1])?
                 }
             }
-            CoreOp::Compare(op) => Value::Bool(compare(&self.heap, op, values[0], values[1])?),
-            CoreOp::Unary(op) => match op.as_str() {
-                "not" => Value::Bool(!runtime::truth(&self.heap, values[0])?),
-                "-" => match values[0] {
-                    Value::Int(n) => Value::Int(n.checked_neg().ok_or(Error::IntegerOverflow)?),
-                    other => Value::Float(-number(other)?),
-                },
-                "+" => {
-                    number(values[0])?;
-                    values[0]
-                }
-                "~" => Value::Int(!integer(values[0])?),
-                _ => return Err(Error::Unsupported("unary operator")),
-            },
+
+            CoreOp::Compare(op) => self.py_compare(op, values[0], values[1])?,
+            CoreOp::Unary(op) => self.py_unary(op, values[0])?,
             CoreOp::Call(names) => {
                 let roots = self.transient_roots.len();
                 let result = (|| {
@@ -844,6 +980,7 @@ impl Vm {
                 self.transient_roots.truncate(roots);
                 result?
             }
+            CoreOp::With(body) => self.with_context(body, values[0], env)?,
             CoreOp::TryCall(body) => {
                 let key = (body.id(), body.revision());
                 let function = self
@@ -920,19 +1057,28 @@ impl Vm {
             }
             CoreOp::Class(name, body) => {
                 for &base in values {
-                    if !matches!(self.heap.get(base)?, Object::Class { .. }) {
+                    if !matches!(self.heap.get(base)?, Object::Class { .. })
+                        && !self.exception_class(base)
+                        && self.modules.get("type.object").copied() != Some(base)
+                    {
                         return Err(Error::Type("base must be class"));
                     }
                 }
-                if values.len() > 1 {
-                    return Err(Error::Unsupported("multiple inheritance"));
-                }
+                let lexical_parent = if self.env(env)?.class_scope {
+                    self.env(env)?.parent.unwrap()
+                } else {
+                    env
+                };
+                let cell = self.heap.allocate(Object::Environment(Environment {
+                    parent: Some(lexical_parent),
+                    values: crate::bindings::Bindings::new(),
+                    locals: BTreeSet::new(),
+                    globals: BTreeSet::new(),
+                    nonlocals: BTreeSet::new(),
+                    class_scope: false,
+                }));
                 let namespace = self.heap.allocate(Object::Environment(Environment {
-                    parent: Some(if self.env(env)?.class_scope {
-                        self.env(env)?.parent.unwrap()
-                    } else {
-                        env
-                    }),
+                    parent: Some(cell),
                     values: crate::bindings::Bindings::new(),
                     locals: BTreeSet::new(),
                     globals: BTreeSet::new(),
@@ -940,30 +1086,58 @@ impl Vm {
                     class_scope: true,
                 }));
                 self.execute_frame(Rc::new(RefCell::new((**body).clone())), namespace, &[])?;
-                self.heap.allocate(Object::Class {
+                if self.env(namespace)?.values.get("__eq__").is_some()
+                    && self.env(namespace)?.values.get("__hash__").is_none()
+                {
+                    self.store(namespace, "__hash__", Value::None)?;
+                }
+                if [
+                    "__getattribute__",
+                    "__getattr__",
+                    "__setattr__",
+                    "__delattr__",
+                    "__get__",
+                    "__set__",
+                    "__delete__",
+                ]
+                .iter()
+                .any(|name| {
+                    self.env(namespace)
+                        .is_ok_and(|env| env.values.get(name).is_some())
+                }) {
+                    self.attribute_protocols = true;
+                }
+                let class = self.heap.allocate(Object::Class {
                     code: body.id(),
                     name: name.clone(),
                     namespace,
                     bases: values.to_vec(),
                     shape: crate::Shape::new(),
-                })
+                });
+                self.store(cell, "__class__", class)?;
+                self.class_mro(class)?;
+                let members = self
+                    .env(namespace)?
+                    .values
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), *value))
+                    .collect::<Vec<_>>();
+                self.protocol_roots(&[class], |vm| {
+                    for (name, value) in members {
+                        if vm.special(value, "__set_name__")?.is_some() {
+                            let name = vm.heap.string(&name);
+                            vm.call_special(value, "__set_name__", &[class, name])?;
+                        }
+                    }
+                    Ok(class)
+                })?
             }
             CoreOp::GetAttr(name) => self.attribute(values[0], name)?,
-            CoreOp::SetAttr(name) => {
-                let mut guard = self.heap.get_mut(values[0])?;
-                match &mut *guard {
-                    Object::Instance { attributes, .. } => {
-                        attributes.insert_ref(name, values[1]);
-                    }
-                    Object::Class { namespace, .. } => {
-                        let namespace = *namespace;
-                        drop(guard);
-                        self.store(namespace, name, values[1])?;
-                    }
-                    _ => return Err(Error::Type("object has no writable attributes")),
-                }
-                Value::None
-            }
+            CoreOp::SetAttr(name) => self.protocol_set_attribute(
+                values[0],
+                &crate::Attribute::from(name.clone()),
+                values[1],
+            )?,
             CoreOp::Iter => self.iter(values[0])?,
             CoreOp::Next => self.next(values[0])?,
             CoreOp::IsDone => Value::Bool(self.is_done(values[0])),
@@ -1016,7 +1190,7 @@ impl Vm {
             }
             CoreOp::Format(spec, repr) => {
                 let text = if spec.is_empty() {
-                    self.repr(values[0], *repr)?
+                    self.py_repr(values[0], *repr)?
                 } else if spec.starts_with('.') && (spec.ends_with('f') || spec.ends_with('e')) {
                     let precision: usize = spec[1..spec.len() - 1]
                         .parse()
@@ -1053,8 +1227,9 @@ impl Vm {
                 self.heap.string_owned(text)
             }
             CoreOp::Raise => return self.raise_exception(values),
+            CoreOp::PropagateException => return self.raise_python_exception(values, true),
             CoreOp::Assert => {
-                if !runtime::truth(&self.heap, values[0])? {
+                if !self.py_truth(values[0])? {
                     return Err(error("AssertionError"));
                 }
                 Value::None
@@ -1080,6 +1255,17 @@ impl Vm {
     }
 
     pub(crate) fn class_attribute(&self, class: Value, name: &str) -> Result<Option<Value>> {
+        if matches!(self.heap.get(class),Ok(Object::Native(kind)) if is_exception(kind) || kind=="object")
+        {
+            return Ok(if name == "__init__" && self.exception_class(class) {
+                Some(
+                    self.heap
+                        .allocate(Object::Native("BaseException.__init__".into())),
+                )
+            } else {
+                None
+            });
+        }
         let Object::Class {
             namespace, bases, ..
         } = self.heap.get(class)?
@@ -1094,26 +1280,23 @@ impl Vm {
         if bases.is_empty() {
             return Ok(None);
         }
-        let mut pending = vec![class];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(class) = pending.pop() {
-            let Value::Ref(id) = class else {
-                return Err(Error::Type("expected class"));
-            };
-            if !seen.insert(id) {
-                return Err(error("cyclic class hierarchy"));
+        for base in self.class_mro(class)?.into_iter().skip(1) {
+            match self.heap.get(base)? {
+                Object::Class { namespace, .. } => {
+                    if let Some(value) = self.env(*namespace)?.values.get(name) {
+                        return Ok(Some(*value));
+                    }
+                }
+                Object::Native(kind) if is_exception(kind) && name == "__init__" => {
+                    return Ok(Some(
+                        self.heap
+                            .allocate(Object::Native("BaseException.__init__".into())),
+                    ));
+                }
+                _ => {}
             }
-            let Object::Class {
-                namespace, bases, ..
-            } = self.heap.get(class)?
-            else {
-                return Err(Error::Type("expected class"));
-            };
-            if let Some(value) = self.env(*namespace)?.values.get(name) {
-                return Ok(Some(*value));
-            }
-            pending.extend(bases.iter().rev().copied());
         }
+
         Ok(None)
     }
 
@@ -1217,10 +1400,19 @@ impl Vm {
         object: Value,
         attribute: &crate::Attribute,
     ) -> Result<Value> {
-        self.attribute_lookup(object, &attribute.text, Some(attribute))
+        self.protocol_get_attribute(object, &attribute.text, Some(attribute))
     }
 
     pub(crate) fn set_attribute(
+        &mut self,
+        object: Value,
+        attribute: &crate::Attribute,
+        value: Value,
+    ) -> Result<Value> {
+        self.protocol_set_attribute(object, attribute, value)
+    }
+
+    pub(crate) fn raw_set_attribute(
         &mut self,
         object: Value,
         attribute: &crate::Attribute,
@@ -1236,6 +1428,7 @@ impl Vm {
             Object::Class { namespace, .. } => {
                 let namespace = *namespace;
                 drop(target);
+                self.attribute_protocols = true;
                 self.store(namespace, &attribute.text, value)?;
             }
             _ => return Err(Error::Type("object has no writable attributes")),
@@ -1244,22 +1437,71 @@ impl Vm {
     }
 
     fn attribute(&mut self, object: Value, name: &str) -> Result<Value> {
-        self.attribute_lookup(object, name, None)
+        self.protocol_get_attribute(object, name, None)
     }
 
-    fn attribute_lookup(
+    fn builtin_attribute(
         &mut self,
         object: Value,
         name: &str,
         cached: Option<&crate::Attribute>,
     ) -> Result<Value> {
+        if !matches!(object, Value::Ref(_) | Value::InlineString(_)) {
+            return Err(error(format!("AttributeError: {name}")));
+        }
         if matches!(object, Value::InlineString(_)) {
             return self
                 .builtin_method(object, name)?
                 .map(|name| self.heap.allocate(Object::Bound(object, name.into())))
                 .ok_or_else(|| error(format!("AttributeError: {name}")));
         }
+        if let Some(value) = self.exception_attribute(object, name)? {
+            return Ok(value);
+        }
         match self.heap.get(object)? {
+            Object::Slice { start, stop, step } => {
+                return match name {
+                    "start" => Ok(*start),
+                    "stop" => Ok(*stop),
+                    "step" => Ok(*step),
+                    _ => Err(error(format!("AttributeError: {name}"))),
+                };
+            }
+            Object::StaticMethod(function) | Object::ClassMethod(function)
+                if name == "__func__" =>
+            {
+                return Ok(*function);
+            }
+
+            Object::Native(module)
+                if module == "object"
+                    && matches!(
+                        name,
+                        "__getattribute__" | "__setattr__" | "__delattr__" | "__new__"
+                    ) =>
+            {
+                return Ok(self
+                    .heap
+                    .allocate(Object::Native(format!("object.{name}").into())));
+            }
+            Object::Property {
+                get,
+                set,
+                delete,
+                doc,
+            } => {
+                return match name {
+                    "fget" => Ok(*get),
+                    "fset" => Ok(*set),
+                    "fdel" => Ok(*delete),
+                    "__doc__" => Ok(*doc),
+                    "getter" | "setter" | "deleter" => Ok(self
+                        .heap
+                        .allocate(Object::Bound(object, name.to_owned().into()))),
+                    _ => Err(error(format!("AttributeError: {name}"))),
+                };
+            }
+
             Object::Native(module) if module == "bisect" => {
                 let key = match name {
                     "bisect_left" => "bisect.bisect_left",
@@ -1335,11 +1577,6 @@ impl Vm {
                 }
             }
             _ => {
-                if name == "args"
-                    && let Ok(Object::Exception { arguments, .. }) = self.heap.get(object)
-                {
-                    return Ok(self.heap.allocate(Object::Tuple(arguments.clone())));
-                }
                 if let Some(name) = self.builtin_method(object, name)? {
                     return Ok(self.heap.allocate(Object::Bound(object, name.into())));
                 }
@@ -1349,6 +1586,9 @@ impl Vm {
     }
 
     pub(crate) fn iter(&mut self, source: Value) -> Result<Value> {
+        if !matches!(source, Value::Ref(_) | Value::InlineString(_)) {
+            return Err(Error::Type("object is not iterable"));
+        }
         if let Value::InlineString(text) = source {
             return Ok(self.heap.allocate(Object::Iterator {
                 source,
@@ -1365,6 +1605,30 @@ impl Vm {
                 | Object::Generator { .. }
         ) {
             return Ok(source);
+        }
+        if self.instance_class(source).is_some() {
+            if let Some(iterator) = self.call_special(source, "__iter__", &[])? {
+                if matches!(
+                    self.heap.get(iterator),
+                    Ok(Object::Iterator { .. }
+                        | Object::Enumerate { .. }
+                        | Object::Zip { .. }
+                        | Object::Generator { .. })
+                ) || self.special(iterator, "__next__")?.is_some()
+                {
+                    return Ok(iterator);
+                }
+                return Err(Error::Type("__iter__ returned a non-iterator"));
+            }
+            if self.special(source, "__getitem__")?.is_some() {
+                return Ok(self.heap.allocate(Object::Iterator {
+                    source,
+                    index: 0,
+                    size: 0,
+                    exhausted: false,
+                }));
+            }
+            return Err(Error::Type("object is not iterable"));
         }
         let size = self.heap.len(source)?;
         Ok(self.heap.allocate(Object::Iterator {
@@ -1424,6 +1688,29 @@ impl Vm {
                 self.next_complex(iterator, depth)
             });
         };
+        if self.instance_class(source).is_some() && !exhausted {
+            let value = self.py_get_item(source, Value::Int(index as i64));
+            return match value {
+                Ok(value) => {
+                    if let Object::Iterator { index, .. } = &mut *self.heap.get_mut(iterator)? {
+                        *index += 1;
+                    }
+                    Ok(value)
+                }
+                Err(err)
+                    if matches!(err, Error::Index)
+                        || self.stop_iteration(&err)
+                        || self.error_is(&err, "IndexError") =>
+                {
+                    self.pending_exception = None;
+                    if let Object::Iterator { exhausted, .. } = &mut *self.heap.get_mut(iterator)? {
+                        *exhausted = true;
+                    }
+                    Ok(self.heap.allocate(Object::Done))
+                }
+                Err(err) => Err(err),
+            };
+        }
         if exhausted {
             return Ok(self.heap.allocate(Object::Done));
         }
@@ -1498,6 +1785,14 @@ impl Vm {
     }
 
     fn next_complex(&mut self, iterator: Value, depth: usize) -> Result<Value> {
+        if self.instance_class(iterator).is_some() {
+            return match self.call_special(iterator, "__next__", &[]) {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(Error::Type("object is not an iterator")),
+                Err(err) if self.stop_iteration(&err) => Ok(self.heap.allocate(Object::Done)),
+                Err(err) => Err(err),
+            };
+        }
         if matches!(self.heap.get(iterator)?, Object::Generator { .. }) {
             return self.generator_next(iterator, depth);
         }
@@ -1588,7 +1883,7 @@ impl Vm {
                 let mut accepted = true;
                 for &filter in &parts[3..] {
                     let condition = self.generator_expression(filter)?;
-                    if !runtime::truth(&self.heap, condition)? {
+                    if !self.py_truth(condition)? {
                         accepted = false;
                         break;
                     }
@@ -1659,6 +1954,12 @@ impl Vm {
         args: &[Value],
         keywords: &[(String, Value)],
     ) -> Result<Value> {
+        if let Some(value) = self.attribute_builtin(name, args)? {
+            if !keywords.is_empty() {
+                return Err(Error::Type("unexpected attribute builtin keywords"));
+            }
+            return Ok(value);
+        }
         if name != "print"
             && name != "dict"
             && name != "json.dumps"
@@ -1683,7 +1984,7 @@ impl Vm {
                 }
                 let parts = args
                     .iter()
-                    .map(|&value| self.repr(value, false))
+                    .map(|&value| self.py_repr(value, false))
                     .collect::<Result<Vec<_>>>()?;
                 self.output.push_str(&parts.join(&sep));
                 self.output.push_str(&end);
@@ -1728,13 +2029,65 @@ impl Vm {
                     .ok_or(Error::Type("ord requires one character"))?;
                 Value::Int(i64::from(u32::from(character)))
             }
-            "len" => ScalarBuiltin::Len.evaluate(&self.heap, args)?,
+            "slice" => {
+                arity(args, 1, 3)?;
+                let (start, stop, step) = match args {
+                    [stop] => (Value::None, *stop, Value::None),
+                    [start, stop] => (*start, *stop, Value::None),
+                    [start, stop, step] => (*start, *stop, *step),
+                    _ => unreachable!(),
+                };
+                self.heap.allocate(Object::Slice { start, stop, step })
+            }
+            "type" => {
+                arity(args, 1, 1)?;
+                self.python_type(args[0])?
+            }
+            "super" => {
+                arity(args, 2, 2)?;
+                self.class_mro(args[0])?;
+                let actual = if matches!(self.heap.get(args[1]), Ok(Object::Class { .. })) {
+                    args[1]
+                } else {
+                    self.instance_class(args[1])
+                        .ok_or(Error::Type("super receiver must be instance or subclass"))?
+                };
+                if !self.class_mro(actual)?.contains(&args[0]) {
+                    return Err(Error::Type("super receiver is not a subtype"));
+                }
+                self.heap.allocate(Object::Super {
+                    anchor: args[0],
+                    receiver: args[1],
+                })
+            }
+            "issubclass" => {
+                arity(args, 2, 2)?;
+                Value::Bool(self.subclass(args[0], args[1])?)
+            }
+            "hash" => {
+                arity(args, 1, 1)?;
+                Value::Int(hashing::key_hash(&self.py_key(args[0])?))
+            }
+            "len" => {
+                arity(args, 1, 1)?;
+                Value::Int(self.py_len(args[0])?)
+            }
+            "BaseException.__init__" => {
+                arity(args, 1, usize::MAX)?;
+                let arguments = self.heap.allocate(Object::Tuple(args[1..].to_vec()));
+                self.default_set_attribute(args[0], "args", arguments)?;
+                Value::None
+            }
             "range" => {
                 arity(args, 1, 3)?;
                 let (start, stop, step) = match args {
-                    [stop] => (0, integer(*stop)?, 1),
-                    [start, stop] => (integer(*start)?, integer(*stop)?, 1),
-                    [start, stop, step] => (integer(*start)?, integer(*stop)?, integer(*step)?),
+                    [stop] => (0, self.py_index(*stop)?, 1),
+                    [start, stop] => (self.py_index(*start)?, self.py_index(*stop)?, 1),
+                    [start, stop, step] => (
+                        self.py_index(*start)?,
+                        self.py_index(*stop)?,
+                        self.py_index(*step)?,
+                    ),
                     _ => unreachable!(),
                 };
                 if step == 0 {
@@ -1783,7 +2136,7 @@ impl Vm {
                 }
                 for (name, value) in keywords {
                     let key = text_heap(&self.heap, name.clone());
-                    self.heap.set_item(dict, key, *value)?;
+                    self.py_set_item(dict, key, *value)?;
                 }
                 dict
             }
@@ -1793,6 +2146,14 @@ impl Vm {
             }
             "next" => {
                 arity(args, 1, 2)?;
+                if self.instance_class(args[0]).is_some() {
+                    return match self.call_special(args[0], "__next__", &[]) {
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => Err(Error::Type("object is not an iterator")),
+                        Err(err) if args.len() == 2 && self.stop_iteration(&err) => Ok(args[1]),
+                        Err(err) => Err(err),
+                    };
+                }
                 let value = self.next(args[0])?;
                 if self.is_done(value) {
                     if args.len() == 2 {
@@ -1806,6 +2167,16 @@ impl Vm {
             }
             "int" => {
                 arity(args, 0, 1)?;
+                if let Some(&value) = args.first()
+                    && self.instance_class(value).is_some()
+                {
+                    if let Some(converted) = self.call_special(value, "__int__", &[])? {
+                        return integer(converted)
+                            .map(Value::Int)
+                            .map_err(|_| Error::Type("__int__ must return an integer"));
+                    }
+                    return self.py_index(value).map(Value::Int);
+                }
                 match args.first().copied().unwrap_or(Value::Int(0)) {
                     Value::Int(n) => Value::Int(n),
                     Value::Bool(b) => Value::Int(i64::from(b)),
@@ -1828,6 +2199,17 @@ impl Vm {
             }
             "float" => {
                 arity(args, 0, 1)?;
+                if let Some(&value) = args.first()
+                    && self.instance_class(value).is_some()
+                {
+                    if let Some(converted) = self.call_special(value, "__float__", &[])? {
+                        return match converted {
+                            Value::Float(_) => Ok(converted),
+                            _ => Err(Error::Type("__float__ must return float")),
+                        };
+                    }
+                    return self.py_index(value).map(|n| Value::Float(n as f64));
+                }
                 let value = args.first().copied().unwrap_or(Value::Float(0.0));
                 Value::Float(if self.heap.as_str(&value).is_some() {
                     let Some(text) = self.heap.as_str(&(value)) else {
@@ -1844,7 +2226,7 @@ impl Vm {
                 Value::Bool(if args.is_empty() {
                     false
                 } else {
-                    runtime::truth(&self.heap, args[0])?
+                    self.py_truth(args[0])?
                 })
             }
             "str" | "repr" => {
@@ -1852,7 +2234,7 @@ impl Vm {
                 let text = if args.is_empty() {
                     String::new()
                 } else {
-                    self.repr(args[0], name == "repr")?
+                    self.py_repr(args[0], name == "repr")?
                 };
                 self.heap.string_owned(text)
             }
@@ -1873,6 +2255,9 @@ impl Vm {
             }
             "abs" => {
                 arity(args, 1, 1)?;
+                if let Some(value) = self.call_special(args[0], "__abs__", &[])? {
+                    return Ok(value);
+                }
                 match args[0] {
                     Value::Int(n) => Value::Int(n.checked_abs().ok_or(Error::IntegerOverflow)?),
                     value => Value::Float(number(value)?.abs()),
@@ -1892,8 +2277,9 @@ impl Vm {
                         if vm.is_done(value) {
                             return Ok(vm.transient_roots[slot]);
                         }
-                        vm.transient_roots[slot] =
-                            runtime::add(&mut vm.heap, vm.transient_roots[slot], value)?;
+                        vm.transient_roots[slot] = vm.protocol_roots(&[value], |vm| {
+                            vm.py_binary("+", vm.transient_roots[slot], value)
+                        })?;
                     }
                 })?
             }
@@ -1916,12 +2302,13 @@ impl Vm {
                         if vm.is_done(value) {
                             return Ok(vm.transient_roots[slot]);
                         }
-                        if compare(
-                            &vm.heap,
-                            if name == "min" { "<" } else { ">" },
-                            value,
-                            vm.transient_roots[slot],
-                        )? {
+                        if vm.protocol_roots(&[value], |vm| {
+                            vm.py_compare_bool(
+                                if name == "min" { "<" } else { ">" },
+                                value,
+                                vm.transient_roots[slot],
+                            )
+                        })? {
                             vm.transient_roots[slot] = value;
                         }
                     }
@@ -1935,7 +2322,7 @@ impl Vm {
                         if vm.is_done(value) {
                             return Ok(name == "all");
                         }
-                        let truth = runtime::truth(&vm.heap, value)?;
+                        let truth = vm.protocol_roots(&[value], |vm| vm.py_truth(value))?;
                         if truth == (name == "any") {
                             return Ok(truth);
                         }
@@ -1972,7 +2359,7 @@ impl Vm {
                     // A fallible insertion sort keeps comparisons in the runtime service.
                     for i in 1..items.len() {
                         let mut j = i;
-                        while j > 0 && compare(&self.heap, "<", items[j], items[j - 1])? {
+                        while j > 0 && self.py_compare_bool("<", items[j], items[j - 1])? {
                             items.swap(j, j - 1);
                             j -= 1;
                         }
@@ -2001,39 +2388,25 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn construct_exception(&self, name: &str, args: &[Value]) -> Value {
-        self.heap.allocate(Object::Exception {
-            kind: name.into(),
-            arguments: args.to_vec(),
-        })
+        self.heap
+            .allocate(Object::Exception(Box::new(ExceptionData {
+                kind: name.into(),
+                arguments: self.heap.allocate(Object::Tuple(args.to_vec())),
+                attributes: BTreeMap::new(),
+                cause: None,
+                context: None,
+                suppress_context: false,
+                traceback: None,
+            })))
     }
 
     #[cold]
     #[inline(never)]
     fn raise_exception(&mut self, values: &[Value]) -> Result<Value> {
-        let mut value = values
-            .first()
-            .copied()
-            .or_else(|| self.active_exceptions.last().copied())
-            .ok_or_else(|| error("RuntimeError: No active exception to reraise"))?;
-        if let Ok(Object::Native(name)) = self.heap.get(value)
-            && is_exception(name)
-        {
-            value = self.construct_exception(name, &[]);
-        }
-        let Ok(Object::Exception { kind, .. }) = self.heap.get(value) else {
-            return Err(Error::Type("exceptions must derive from BaseException"));
-        };
-        let message = self.repr(value, false)?;
-        let message = if message.is_empty() {
-            kind.clone()
-        } else {
-            format!("{kind}: {message}")
-        };
-        self.pending_exception = Some(value);
-        Err(error(message))
+        self.raise_python_exception(values, false)
     }
 
-    fn exception_from_error(&self, err: Error) -> Result<Value> {
+    pub(crate) fn exception_from_error(&mut self, err: Error) -> Result<Value> {
         let kind = match &err {
             Error::Type(_) | Error::Arguments { .. } => "TypeError",
             Error::Index => "IndexError",
@@ -2067,13 +2440,15 @@ impl Vm {
         } else {
             vec![self.heap.string(text)]
         };
-        Ok(self.construct_exception(kind, &args))
+        let value = self.construct_exception(kind, &args);
+        self.attach_context(value)?;
+        self.record_traceback(value, false)?;
+        Ok(value)
     }
 
     fn exception_matches(&self, value: Value, class: Value) -> Result<bool> {
         let invalid = || Error::Type("catching classes that do not inherit from BaseException");
-        let valid =
-            |class| matches!(self.heap.get(class), Ok(Object::Native(name)) if is_exception(name));
+        let valid = |class| self.exception_class(class);
         if let Ok(Object::Tuple(classes)) = self.heap.get(class) {
             // Python validates the entire flat tuple before testing any matching class.
             if !classes.iter().copied().all(valid) {
@@ -2103,9 +2478,7 @@ impl Vm {
                 Ok(false)
             }
             Object::Native(name) => Ok(match name.as_ref() {
-                name if is_exception(name) => {
-                    matches!(self.heap.get(value), Ok(Object::Exception { kind, .. }) if kind == name || name == "BaseException" || (name == "Exception" && kind != "BaseException"))
-                }
+                name if is_exception(name) => self.is_exception_instance(value, name),
                 "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
                 "bool" => matches!(value, Value::Bool(_)),
                 "float" => matches!(value, Value::Float(_)),
@@ -2115,6 +2488,7 @@ impl Vm {
                 "dict" => matches!(self.heap.get(value), Ok(Object::Dict(_))),
                 "set" => matches!(self.heap.get(value), Ok(Object::Set(_))),
                 "str" => self.heap.as_str(&value).is_some(),
+                name if types::builtin_type_name(name) => self.value_type_name(value)? == name,
                 _ => return Err(Error::Type("isinstance requires type")),
             }),
             Object::Class { .. } => {
@@ -2191,9 +2565,9 @@ impl Vm {
                         } else if right == end {
                             false
                         } else if reverse {
-                            compare(&self.heap, "<", keys[order[left]], keys[order[right]])?
+                            self.py_compare_bool("<", keys[order[left]], keys[order[right]])?
                         } else {
-                            compare(&self.heap, "<", keys[order[right]], keys[order[left]])?
+                            self.py_compare_bool("<", keys[order[right]], keys[order[left]])?
                         };
                         *slot = if take_right {
                             let i = order[right];
@@ -2305,20 +2679,29 @@ impl Vm {
             }
             "count" | "index" | "remove" => {
                 arity(args, 1, 1)?;
-                let Object::List(items) = self.heap.get(receiver)? else {
-                    unreachable!()
-                };
                 let mut count = 0;
                 let mut found = None;
-                for i in 0..items.len() {
-                    let value = items.value(i).ok_or(Error::Index)?;
-                    if equal(&self.heap, value, args[0], 0)? {
+                let mut i = 0;
+                loop {
+                    let value = match self.heap.get(receiver)? {
+                        Object::List(items) => items.value(i),
+                        _ => unreachable!(),
+                    };
+                    let Some(value) = value else {
+                        break;
+                    };
+                    if value == args[0]
+                        || self.protocol_roots(&[value], |vm| {
+                            vm.py_compare_bool("==", value, args[0])
+                        })?
+                    {
                         count += 1;
                         found = Some(i);
                         if name != "count" {
                             break;
                         }
                     }
+                    i += 1;
                 }
                 if name == "count" {
                     return Ok(Value::Int(count));
@@ -2345,37 +2728,7 @@ impl Vm {
                     kind: name.into(),
                 }))
             }
-            "get" | "setdefault" | "pop" => {
-                arity(args, 1, 2)?;
-                let Object::Dict(items) = self.heap.get(receiver)? else {
-                    unreachable!()
-                };
-                if name != "pop"
-                    && let Some(value) = self.heap.dict_get(items, args[0])?
-                {
-                    return Ok(value);
-                }
-                let key = self.heap.key(args[0])?;
-                let Object::Dict(items) = self.heap.get(receiver)? else {
-                    unreachable!()
-                };
-                if let Some(&value) = items.get(&key) {
-                    if name == "pop"
-                        && let Object::Dict(items) = &mut *self.heap.get_mut(receiver)?
-                    {
-                        items.remove(&key);
-                    }
-                    return Ok(value);
-                }
-                let default = args.get(1).copied().unwrap_or(Value::None);
-                if name == "setdefault" {
-                    self.heap.set_item(receiver, args[0], default)?;
-                }
-                if name == "pop" && args.len() == 1 {
-                    return Err(Error::MissingKey);
-                }
-                Ok(default)
-            }
+            "get" | "setdefault" | "pop" => self.mapping_method(receiver, name, args),
             "clear" => {
                 arity(args, 0, 0)?;
                 if let Object::Dict(items) = &mut *self.heap.get_mut(receiver)? {
@@ -2397,9 +2750,17 @@ impl Vm {
                         .iter()
                         .map(|(key, value)| (key_value(&self.heap, key), *value))
                         .collect::<Vec<_>>();
-                    for (key, value) in pairs {
-                        self.heap.set_item(receiver, key, value)?;
-                    }
+                    let roots = pairs
+                        .iter()
+                        .flat_map(|(k, v)| [*k, *v])
+                        .chain(std::iter::once(receiver))
+                        .collect::<Vec<_>>();
+                    self.protocol_roots(&roots, |vm| {
+                        for &(key, value) in &pairs {
+                            vm.py_set_item(receiver, key, value)?;
+                        }
+                        Ok(())
+                    })?;
                     return Ok(Value::None);
                 }
                 let roots = self.transient_roots.len();
@@ -2425,7 +2786,7 @@ impl Vm {
                         if pair.len() != 2 {
                             return Err(error("ValueError: dictionary pair length"));
                         }
-                        vm.heap.set_item(receiver, pair[0], pair[1])?;
+                        vm.py_set_item(receiver, pair[0], pair[1])?;
                     }
                 });
                 self.transient_roots.truncate(roots);
@@ -2440,20 +2801,21 @@ impl Vm {
         match name {
             "add" | "discard" | "remove" => {
                 arity(args, 1, 1)?;
-                let key = self.heap.key(args[0])?;
-                let mut guard = self.heap.get_mut(receiver)?;
-                let Object::Set(items) = &mut *guard else {
-                    unreachable!()
-                };
-                if name == "add" {
-                    // Equal bool/int/float keys retain the first inserted Python representative.
-                    if items.get(&key).is_none() {
-                        items.insert(key, args[0]);
+                self.protocol_roots(&[receiver, args[0]], |vm| {
+                    if name == "add" {
+                        vm.mapping_set(receiver, args[0], args[0], true)?;
+                    } else {
+                        let key = vm.py_key(args[0])?;
+                        if let Some(key) = vm.mapping_find(receiver, &key)? {
+                            if let Object::Set(items) = &mut *vm.heap.get_mut(receiver)? {
+                                items.remove(&key);
+                            }
+                        } else if name == "remove" {
+                            return Err(Error::MissingKey);
+                        }
                     }
-                } else if items.remove(&key).is_none() && name == "remove" {
-                    return Err(Error::MissingKey);
-                }
-                Ok(Value::None)
+                    Ok(Value::None)
+                })
             }
             "clear" => {
                 arity(args, 0, 0)?;
@@ -2474,6 +2836,28 @@ impl Vm {
     }
 
     fn method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        if let Ok(Object::Property {
+            get,
+            set,
+            delete,
+            doc,
+        }) = self.heap.get(receiver)
+        {
+            let (mut get, mut set, mut delete, doc) = (*get, *set, *delete, *doc);
+            arity(args, 1, 1)?;
+            match name {
+                "getter" => get = args[0],
+                "setter" => set = args[0],
+                "deleter" => delete = args[0],
+                _ => return Err(Error::Type("property method")),
+            }
+            return Ok(self.heap.allocate(Object::Property {
+                get,
+                set,
+                delete,
+                doc,
+            }));
+        }
         if let Value::InlineString(text) = receiver {
             return self.string_method(text.as_str(), name, args);
         }
@@ -2687,6 +3071,7 @@ fn number(value: Value) -> Result<f64> {
 }
 fn key_value(heap: &Heap, key: &Key) -> Value {
     match key {
+        Key::Protocol(value, _) => *value,
         Key::None => Value::None,
         Key::Bool(value) => Value::Bool(*value),
         Key::Int(n) => Value::Int(*n),
@@ -2726,11 +3111,11 @@ pub(crate) fn range_len(start: i64, stop: i64, step: i64) -> Result<usize> {
     .map_err(|_| Error::IntegerOverflow)
 }
 
-pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
+fn slice_limits(heap: &Heap, key: Value, len: usize) -> Result<(i128, i128, i128)> {
     let Object::Slice { start, stop, step } = *heap.get(key)? else {
         return Err(Error::Type("expected slice"));
     };
-    let len = heap.len(object)? as i128;
+    let len = len as i128;
     let step = if step == Value::None {
         1
     } else {
@@ -2751,13 +3136,21 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
             n.clamp(-1, len - 1)
         })
     };
-    let mut i = bound(start, if step > 0 { 0 } else { len - 1 })?;
+    let i = bound(start, if step > 0 { 0 } else { len - 1 })?;
     let stop = bound(stop, if step > 0 { len } else { -1 })?;
+    Ok((i, stop, step))
+}
+fn slice_positions(mut start: i128, stop: i128, step: i128) -> Vec<usize> {
     let mut indices = vec![];
-    while if step > 0 { i < stop } else { i > stop } {
-        indices.push(i as usize);
-        i += step;
+    while if step > 0 { start < stop } else { start > stop } {
+        indices.push(start as usize);
+        start += step;
     }
+    indices
+}
+pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
+    let (start, stop, step) = slice_limits(heap, key, heap.len(object)?)?;
+    let indices = slice_positions(start, stop, step);
     if let Some(text) = heap.as_str(&object) {
         let chars = text.chars().collect::<Vec<_>>();
         return Ok(text_heap(heap, indices.iter().map(|&i| chars[i]).collect()));
@@ -3098,7 +3491,11 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
                         .collect::<Result<Vec<_>>>()?;
                     format!("{{{}}}", parts.join(", "))
                 }
-                Object::Exception { kind, arguments } => {
+                Object::Exception(exception) => {
+                    let kind = &exception.kind;
+                    let Object::Tuple(arguments) = heap.get(exception.arguments)? else {
+                        return Err(Error::InvalidIr("exception arguments"));
+                    };
                     if quote {
                         let parts = arguments
                             .iter()
@@ -3192,20 +3589,7 @@ fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cm
 }
 
 fn is_exception(name: &str) -> bool {
-    matches!(
-        name,
-        "BaseException"
-            | "Exception"
-            | "ValueError"
-            | "TypeError"
-            | "RuntimeError"
-            | "StopIteration"
-            | "ZeroDivisionError"
-            | "UnboundLocalError"
-            | "OverflowError"
-            | "KeyError"
-            | "IndexError"
-    )
+    name == "BaseException" || exception_parent(name).is_some()
 }
 
 // Builtin sequences cannot execute Python while their strings are borrowed. Allocate only the result.

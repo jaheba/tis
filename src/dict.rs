@@ -32,8 +32,16 @@ pub struct Dict {
     heads: HashMap<u64, usize, BuildHasherDefault<Prehashed>>,
     next: Vec<usize>,
     hasher: RandomState,
+    protocol_keys: bool,
+    version: u64,
 }
 impl Dict {
+    pub(crate) fn has_protocol_keys(&self) -> bool {
+        self.protocol_keys
+    }
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
     fn position(&self, key: &Key, hash: u64) -> Option<usize> {
         let mut index = self.heads.get(&hash).copied().unwrap_or(END);
         while index != END {
@@ -66,6 +74,8 @@ impl Dict {
         if let Some(index) = self.position(&key, hash) {
             return Some(std::mem::replace(&mut self.entries[index].1, value));
         }
+        self.protocol_keys |= key.has_protocol();
+        self.version = self.version.wrapping_add(1);
         let index = self.entries.len();
         self.next
             .push(self.heads.insert(hash, index).unwrap_or(END));
@@ -75,6 +85,7 @@ impl Dict {
     pub fn remove(&mut self, key: &Key) -> Option<Value> {
         let index = self.position(key, self.hasher.hash_one(key))?;
         let (_, value) = self.entries.remove(index);
+        self.version = self.version.wrapping_add(1);
         self.heads.clear();
         self.next.clear();
         for (index, (key, _)) in self.entries.iter().enumerate() {
@@ -87,6 +98,8 @@ impl Dict {
         Some(value)
     }
     pub fn clear(&mut self) {
+        self.protocol_keys = false;
+        self.version = self.version.wrapping_add(1);
         self.entries.clear();
         self.heads.clear();
         self.next.clear();
@@ -129,6 +142,10 @@ impl PartialEq for Dict {
 impl Hash for Key {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            Self::Protocol(_, hash) => {
+                6u8.hash(state);
+                hash.hash(state);
+            }
             Self::Bool(v) => Key::Int(i64::from(*v)).hash(state),
             Self::Float(bits) => {
                 let value = f64::from_bits(*bits);

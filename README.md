@@ -51,8 +51,34 @@ Equal inline strings share identity under `is`, including independently construc
 - Shared lexical environments for closures, including `global` and `nonlocal` assignment.
 - `for`, `while`, loop `else`, `break` and `continue`.
 - List, set and dictionary comprehensions with nested generators and filters, in their own lexical scope.
-- Basic classes, constructors, instance/class attributes, bound methods and single inheritance.
+- Classes with C3 multiple inheritance, constructors, bound methods, decorators and `super()`.
+- Arithmetic/reflected/in-place slots, rich comparisons, truth/length, indexing, iteration, calling and string conversion.
+- Custom descriptors, properties, static/class methods and attribute access/mutation hooks.
+- Hashable user objects in dictionaries and sets, including equality callbacks and keys retained through GC.
+- General `try`/`except`/`else`/`finally`, exception subclasses, `except ... as ...`, chaining and bare reraising.
+- Synchronous context managers, including suppression and cleanup on return, break and continue.
+- Lazy single-clause generator expressions; list slice assignment/deletion and `__index__` conversions.
 - Core builtins, container methods, lazy `range`, `enumerate` and `zip`, and basic f-string formatting.
+
+Object protocols use class lookup, independently of instance attributes.
+Generic operations may reenter Python, allocate and mutate; their LIR effects retain full GC/deoptimization state.
+Guarded builtin operations keep non-reentrant fast paths.
+Installing descriptors or attribute hooks, or mutating a class namespace, disables direct field/region shortcuts
+for that VM, including previously compiled readers.
+This conservative guard can later become a per-type version check.
+Builtin-only dictionaries retain indexed lookups; protocol keys use rooted, hash-filtered snapshots and retry
+when equality callbacks structurally mutate the mapping.
+
+Protected suites are HIR functions sharing their enclosing environment.
+Their explicit control outcomes carry normal completion, return, break, continue or an exception through cleanup.
+They do not reparse source or delegate execution to another interpreter.
+
+The language remains a subset: metaclasses, `__slots__`, `__del__` finalizers,
+builtin-type subclassing (except exceptions), general `yield`,
+async constructs, `except*`, arbitrary module imports and most of the standard library are unsupported.
+Integers remain signed 64-bit values.
+Tracebacks retain raise/unwind identity and chains, including context-manager callbacks;
+Python frame objects, source-line traceback formatting and traceback frame inspection are not implemented.
 
 The executing function retains its HIR and runtime profile.
 Detailed feedback follows `Cold → Profiling → Ready → Compiled` for each HIR identity and revision.

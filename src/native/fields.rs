@@ -49,6 +49,14 @@ pub(super) fn load(
         host,
         offset_of!(crate::native_runtime::Context<'_>, vm) as i32,
     );
+    let protocols = b.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        vm,
+        offset_of!(Vm, attribute_protocols) as i32,
+    );
+    let plain = b.ins().icmp_imm_s(IntCC::Equal, protocols, 0);
+    guard!(plain);
     let directory = b.ins().iadd_imm_s(
         vm,
         (offset_of!(Vm, heap) + offset_of!(crate::Heap, native_fields)) as i64,

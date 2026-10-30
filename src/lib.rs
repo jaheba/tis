@@ -43,6 +43,6 @@ pub use tier::{TierStats, Tiering};
 
 pub use error::{Error, Result};
 pub use frontend::{CompileOptions, Program, compile, compile_with_options};
-pub use heap::{Heap, Key, Object};
+pub use heap::{ExceptionData, Heap, Key, Object};
 pub use value::{InlineString, ObjectId, StringLiteral, Value};
 pub use vm::Vm;

@@ -10,7 +10,10 @@ impl Function {
             .flat_map(|block| &mut block.instructions)
         {
             if let Op::Runtime(
-                CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::Class(_, body),
+                CoreOp::Function(body)
+                | CoreOp::TryCall(body)
+                | CoreOp::With(body)
+                | CoreOp::Class(_, body),
                 _,
             ) = &mut instruction.op
             {

@@ -3,7 +3,6 @@ use crate::{
     Error, Object, Result, Value, Vm,
     bytecode::{Code, register::Opcode},
     hir::{Function, ValueId},
-    runtime,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -109,7 +108,7 @@ impl Vm {
                 Opcode::Jump | Opcode::Branch => {
                     let edge = if matches!(op, Opcode::Jump) {
                         a
-                    } else if runtime::truth(&self.heap, self.read(base, ValueId(a))?)? {
+                    } else if self.py_truth(self.read(base, ValueId(a))?)? {
                         b
                     } else {
                         c
@@ -195,46 +194,38 @@ impl Vm {
                         }
                         result
                     }
-                    Opcode::Subtract => runtime::subtract(
+                    Opcode::Subtract => self.py_binary(
+                        "-",
                         self.read(base, ValueId(a))?,
                         self.read(base, ValueId(b))?,
                     )?,
-                    Opcode::Less => {
-                        runtime::less(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?
-                    }
+                    Opcode::Less => self.py_compare(
+                        "<",
+                        self.read(base, ValueId(a))?,
+                        self.read(base, ValueId(b))?,
+                    )?,
                     Opcode::StringEqual => {
                         let left = self.read(base, ValueId(a))?;
                         let right = self.read(base, ValueId(b))?;
-                        let equal = if let (Value::InlineString(left), Value::InlineString(right)) =
+                        if let (Value::InlineString(left), Value::InlineString(right)) =
                             (left, right)
                         {
-                            (left == right) != (c != 0)
+                            Value::Bool((left == right) != (c != 0))
                         } else {
-                            // Heap strings and other Python values retain the general comparison rules.
-                            crate::execution::compare(
-                                &self.heap,
-                                if c == 0 { "==" } else { "!=" },
-                                left,
-                                right,
-                            )?
-                        };
-                        Value::Bool(equal)
+                            self.py_compare(if c == 0 { "==" } else { "!=" }, left, right)?
+                        }
                     }
                     Opcode::GetItem => self
-                        .heap
-                        .get_item(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?,
+                        .py_get_item(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?,
                     Opcode::SetItem => {
-                        self.heap.set_item(
+                        self.py_set_item(
                             self.read(base, ValueId(a))?,
                             self.read(base, ValueId(b))?,
                             self.read(base, ValueId(c))?,
                         )?;
                         Value::None
                     }
-                    Opcode::Len => Value::Int(
-                        i64::try_from(self.heap.len(self.read(base, ValueId(a))?)?)
-                            .map_err(|_| Error::IntegerOverflow)?,
-                    ),
+                    Opcode::Len => Value::Int(self.py_len(self.read(base, ValueId(a))?)?),
                     Opcode::LoadName => {
                         let (crate::hir::CoreOp::LoadName(name), _) = &code.operations[a] else {
                             return Err(Error::InvalidIr("name load"));
@@ -332,7 +323,7 @@ impl Vm {
                             Opcode::Dict => {
                                 let dict = self.heap.allocate(Object::Dict(Default::default()));
                                 for pair in arguments.as_chunks::<2>().0 {
-                                    self.heap.set_item(dict, pair[0], pair[1])?;
+                                    self.py_set_item(dict, pair[0], pair[1])?;
                                 }
                                 dict
                             }

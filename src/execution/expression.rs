@@ -97,6 +97,40 @@ impl Vm {
         values.resize(plan.values, Value::None);
         let result = (|| -> Result<Option<Value>> {
             for (destination, step) in &plan.operations {
+                if let Step::Operation(Op::GetItem(_, key)) = step
+                    && let Ok(Object::Slice { start, stop, step }) = self.heap.get(values[key.0])
+                    && [*start, *stop, *step]
+                        .iter()
+                        .any(|v| self.instance_class(*v).is_some())
+                {
+                    return Ok(None);
+                }
+
+                if let Step::Operation(op)=step && op.inputs().iter().any(|id|matches!(self.heap.get(values[id.0]),Ok(Object::Dict(items)|Object::Set(items)) if items.has_protocol_keys())) {return Ok(None);}
+
+                if let Step::Operation(op) = step {
+                    if op
+                        .inputs()
+                        .iter()
+                        .any(|id| self.instance_class(values[id.0]).is_some())
+                    {
+                        return Ok(None);
+                    }
+                    if matches!(op, Op::Runtime(CoreOp::Compare(_), _))
+                        && op.inputs().iter().any(|id| {
+                            matches!(
+                                self.heap.get(values[id.0]),
+                                Ok(Object::List(_)
+                                    | Object::Tuple(_)
+                                    | Object::Dict(_)
+                                    | Object::Set(_))
+                            )
+                        })
+                    {
+                        return Ok(None);
+                    }
+                }
+
                 values[*destination] = match step {
                     Step::Literal(literal) => self.intern_literal(&literal.text, &literal.cache),
                     Step::Operation(op) => match op {

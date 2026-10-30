@@ -31,6 +31,17 @@ impl Bindings {
         self.slots[slot].take()
     }
 
+    /// Definition order follows stable slots, rather than the name index's lexical order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        let mut names = self.names.iter().collect::<Vec<_>>();
+        names.sort_by_key(|(_, slot)| **slot);
+        names.into_iter().filter_map(move |(name, slot)| {
+            self.slots[*slot]
+                .as_ref()
+                .map(|value| (name.as_str(), value))
+        })
+    }
+
     pub fn values(&self) -> impl Iterator<Item = &Value> {
         self.slots.iter().filter_map(Option::as_ref)
     }

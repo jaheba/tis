@@ -39,6 +39,25 @@ pub enum Key {
     String(compact_str::CompactString),
     Float(u64),
     Tuple(Vec<Key>),
+    Protocol(Value, i64),
+}
+
+impl Key {
+    pub(crate) fn has_protocol(&self) -> bool {
+        matches!(self, Self::Protocol(..))
+            || matches!(self,Self::Tuple(keys) if keys.iter().any(Self::has_protocol))
+    }
+    pub(crate) fn visit_values(&self, f: &mut impl FnMut(Value)) {
+        match self {
+            Self::Protocol(value, _) => f(*value),
+            Self::Tuple(keys) => {
+                for key in keys {
+                    key.visit_values(f);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +106,23 @@ pub enum Object {
         running: bool,
         done: bool,
     },
+    Property {
+        get: Value,
+        set: Value,
+        delete: Value,
+        doc: Value,
+    },
+    Super {
+        anchor: Value,
+        receiver: Value,
+    },
+    StaticMethod(Value),
+    ClassMethod(Value),
+    Traceback {
+        next: Option<Value>,
+        function: crate::profile::FunctionId,
+        depth: usize,
+    },
     Done,
     Enumerate {
         iterator: Value,
@@ -100,10 +136,19 @@ pub enum Object {
         source: Value,
         kind: String,
     },
-    Exception {
-        kind: String,
-        arguments: Vec<Value>,
-    },
+    Exception(Box<ExceptionData>),
+}
+
+/// Cold exception metadata stays boxed so it does not enlarge every heap entry.
+#[derive(Debug, Clone)]
+pub struct ExceptionData {
+    pub kind: String,
+    pub arguments: Value,
+    pub attributes: std::collections::BTreeMap<String, Value>,
+    pub cause: Option<Value>,
+    pub context: Option<Value>,
+    pub suppress_context: bool,
+    pub traceback: Option<Value>,
 }
 
 impl Object {
@@ -604,6 +649,7 @@ impl PartialEq for Key {
             (Self::None, Self::None) => true,
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (Self::Protocol(a, _), Self::Protocol(b, _)) => a == b,
             _ => false,
         }
     }

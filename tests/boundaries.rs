@@ -68,13 +68,13 @@ fn eager_native_execution_keeps_operand_and_result_feedback() {
 }
 
 #[test]
-fn helpers_keep_full_deopt_state_but_only_safepoints_have_gc_maps() {
+fn protocol_helpers_keep_full_deopt_state_and_gc_maps() {
     use tis::lir::{Helper, LoweringMode, Operation};
     let mut program =
         compile("def f(a):\n    a[0]=1\n    if a:\n        return [a]\n    return []\n").unwrap();
     let f = program.function_mut("f").unwrap();
     let mut lir = f.lower_lir(LoweringMode::Generic).unwrap();
-    let mut nonallocating = 0;
+    let mut protocol_helpers = 0;
     for block in &lir.blocks {
         for instruction in &block.instructions {
             match &instruction.operation {
@@ -91,16 +91,30 @@ fn helpers_keep_full_deopt_state_but_only_safepoints_have_gc_maps() {
                     roots,
                     ..
                 } => {
-                    assert!(!effects.needs_safepoint());
-                    assert!(roots.is_empty());
-                    assert!(!lir.states[state.0].values.is_empty());
-                    nonallocating += 1;
+                    assert!(effects.may_call && effects.may_allocate && effects.may_write);
+                    assert_eq!(
+                        roots
+                            .iter()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        lir.states[state.0].values.iter().map(|(_, r)| *r).collect()
+                    );
+                    assert!(!roots.is_empty());
+                    protocol_helpers += 1;
                 }
                 _ => {}
             }
         }
     }
-    assert!(nonallocating >= 2);
+    assert!(protocol_helpers >= 2);
+    let mut forged = lir.clone();
+    for instruction in forged.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+        if let Operation::Truth { effects, roots, .. } = &mut instruction.operation {
+            *effects = tis::lir::Effects::READ_ONLY;
+            roots.clear();
+        }
+    }
+    assert!(forged.verify().is_err());
     // A forged non-allocating annotation cannot suppress the roots for a real allocator.
     let mut altered = false;
     for block in &mut lir.blocks {
