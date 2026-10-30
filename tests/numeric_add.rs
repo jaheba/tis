@@ -88,11 +88,25 @@ fn numeric_union_overflow_and_type_exits_keep_prior_effects() {
         ] {
             let mut vm = warmed(tier);
             let add = vm.get_global("add").unwrap();
-            assert!(vm.call(add, &args).is_err());
-            vm.run_program(
-                &mut compile("assert events[-1]=='before'\nassert events[-2]=='after'\n").unwrap(),
-            )
-            .unwrap();
+            if args[0] == Value::None {
+                assert!(vm.call(add, &args).is_err());
+                vm.run_program(
+                    &mut compile("assert events[-1]=='before'\nassert events[-2]=='after'\n")
+                        .unwrap(),
+                )
+                .unwrap();
+            } else {
+                let result = vm.call(add, &args).unwrap();
+                let expected = if args[1] == Value::Int(1) {
+                    "9223372036854775808"
+                } else {
+                    "-9223372036854775809"
+                };
+                assert!(
+                    matches!(vm.heap.get(result),Ok(tis::Object::BigInt(n)) if n.to_string()==expected)
+                );
+                vm.run_program(&mut compile("assert events[-1]=='after'\nassert events[-2]=='before'\nassert events[-3]=='after'\n").unwrap()).unwrap();
+            }
             assert!(vm.tier_stats.deoptimizations > 0);
             assert_eq!(vm.stack_len(), 0);
             vm.collect_garbage(&[]).unwrap();

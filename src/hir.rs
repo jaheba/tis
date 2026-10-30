@@ -132,6 +132,7 @@ pub struct Block {
 pub enum CoreOp {
     Missing,
     BytesLiteral(Vec<u8>),
+    IntegerLiteral(num_bigint::BigInt),
     Import(String),
     UnpackStar(usize, usize),
     LoadName(String),

@@ -1,5 +1,5 @@
 //! Guarded, non-reentrant execution of small straight-line HIR expressions.
-use super::{ScalarBuiltin, compare, integer, number};
+use super::{ScalarBuiltin, compare, number};
 use crate::{
     Error, Object, Result, StringLiteral, Value, Vm,
     hir::{Constant, CoreOp, Function, Op, Terminator},
@@ -97,11 +97,17 @@ impl Vm {
         values.resize(plan.values, Value::None);
         let result = (|| -> Result<Option<Value>> {
             for (destination, step) in &plan.operations {
+                // Wide indices need the ordinary sequence error/bound normalization path.
+                if let Step::Operation(Op::GetItem(_, key)) = step
+                    && crate::integer::is_big(&self.heap, values[key.0])
+                {
+                    return Ok(None);
+                }
                 if let Step::Operation(Op::GetItem(_, key)) = step
                     && let Ok(Object::Slice { start, stop, step }) = self.heap.get(values[key.0])
-                    && [*start, *stop, *step]
-                        .iter()
-                        .any(|v| self.instance_class(*v).is_some())
+                    && [*start, *stop, *step].iter().any(|v| {
+                        self.instance_class(*v).is_some() || crate::integer::is_big(&self.heap, *v)
+                    })
                 {
                     return Ok(None);
                 }
@@ -140,8 +146,12 @@ impl Vm {
                         Op::Add(a, b) => {
                             crate::runtime::add(&mut self.heap, values[a.0], values[b.0])?
                         }
-                        Op::Subtract(a, b) => crate::runtime::subtract(values[a.0], values[b.0])?,
-                        Op::Less(a, b) => crate::runtime::less(values[a.0], values[b.0])?,
+                        Op::Subtract(a, b) => {
+                            crate::runtime::subtract(&self.heap, values[a.0], values[b.0])?
+                        }
+                        Op::Less(a, b) => {
+                            crate::runtime::less(&self.heap, values[a.0], values[b.0])?
+                        }
                         Op::GetItem(a, b) => self.heap.get_item(values[a.0], values[b.0])?,
                         Op::Len(a) => Value::Int(
                             i64::try_from(self.heap.len(values[a.0])?)
@@ -156,20 +166,19 @@ impl Vm {
                         )?),
                         Op::Runtime(CoreOp::Unary(op), args) => {
                             let value = values[args[0].0];
-                            match op.as_str() {
-                                "not" => Value::Bool(!crate::runtime::truth(&self.heap, value)?),
-                                "+" => {
-                                    number(value)?;
-                                    value
-                                }
-                                "-" => match value {
-                                    Value::Int(n) => {
-                                        Value::Int(n.checked_neg().ok_or(Error::IntegerOverflow)?)
+                            if op == "not" {
+                                Value::Bool(!crate::runtime::truth(&self.heap, value)?)
+                            } else if crate::integer::is_integer(&self.heap, value) {
+                                crate::integer::unary(&self.heap, op, value)?
+                            } else {
+                                match op.as_str() {
+                                    "+" => {
+                                        number(value)?;
+                                        value
                                     }
-                                    value => Value::Float(-number(value)?),
-                                },
-                                "~" => Value::Int(!integer(value)?),
-                                _ => return Ok(None),
+                                    "-" => Value::Float(-number(value)?),
+                                    _ => return Ok(None),
+                                }
                             }
                         }
                         Op::Runtime(CoreOp::Call(_), inputs) => {

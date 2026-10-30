@@ -2,6 +2,7 @@
 mod attributes;
 mod bytes;
 mod exceptions;
+mod integers;
 use exceptions::exception_parent;
 mod context;
 pub(crate) mod expression;
@@ -9,6 +10,7 @@ mod hashing;
 mod protocols;
 mod representation;
 mod slicing;
+mod sorting;
 mod types;
 
 use crate::{
@@ -78,7 +80,7 @@ impl ScalarBuiltin {
                 Value::Int(heap.len(args[0])? as i64)
             }
             Self::Sqrt => {
-                let value = number(args[0])?;
+                let value = crate::integer::number(heap, args[0])?;
                 if value < 0.0 {
                     return Err(error("ValueError: math domain error"));
                 }
@@ -283,6 +285,11 @@ impl Vm {
             "bool",
             "bytes",
             "abs",
+            "hex",
+            "oct",
+            "bin",
+            "divmod",
+            "pow",
             "sum",
             "min",
             "max",
@@ -859,6 +866,15 @@ impl Vm {
             .last()
             .ok_or(Error::InvalidIr("missing frame environment"))?;
         Ok(match operation {
+            CoreOp::IntegerLiteral(n) => {
+                if let Some(&value) = self.integer_pool.get(n) {
+                    value
+                } else {
+                    let value = crate::integer::value(&self.heap, n.clone());
+                    self.integer_pool.insert(n.clone(), value);
+                    value
+                }
+            }
             CoreOp::BytesLiteral(data) => self.intern_bytes(data),
             CoreOp::Missing => self.heap.allocate(Object::Done),
             CoreOp::UnpackStar(before, after) => {
@@ -1319,6 +1335,13 @@ impl Vm {
 
     /// Only builtin containers and strings bind through this path; instances retain normal lookup.
     pub(crate) fn builtin_method(&self, object: Value, name: &str) -> Result<Option<&'static str>> {
+        if crate::integer::is_integer(&self.heap, object) {
+            return Ok(match name {
+                "bit_length" => Some("bit_length"),
+                "bit_count" => Some("bit_count"),
+                _ => None,
+            });
+        }
         if matches!(object, Value::InlineString(_)) {
             return Ok(
                 if [
@@ -1469,6 +1492,12 @@ impl Vm {
         name: &str,
         cached: Option<&crate::Attribute>,
     ) -> Result<Value> {
+        if crate::integer::is_integer(&self.heap, object) {
+            return self
+                .builtin_method(object, name)?
+                .map(|name| self.heap.allocate(Object::Bound(object, name.into())))
+                .ok_or_else(|| error(format!("AttributeError: {name}")));
+        }
         if !matches!(object, Value::Ref(_) | Value::InlineString(_)) {
             return Err(error(format!("AttributeError: {name}")));
         }
@@ -2032,9 +2061,15 @@ impl Vm {
             }
             return Ok(value);
         }
+        if name == "int" {
+            return self.construct_integer(args, keywords);
+        }
         if name == "bytes" && !keywords.is_empty() {
             let bound = self.bytes_keywords(args, keywords, true)?;
             return self.construct_bytes(&bound);
+        }
+        if name == "sorted" {
+            return self.sorted(args, keywords);
         }
         if name != "print"
             && name != "dict"
@@ -2243,38 +2278,7 @@ impl Vm {
             }
             "bytes" => self.construct_bytes(args)?,
             "bytes.fromhex" => self.bytes_fromhex(args)?,
-            "int" => {
-                arity(args, 0, 1)?;
-                if let Some(&value) = args.first()
-                    && self.instance_class(value).is_some()
-                {
-                    if let Some(converted) = self.call_special(value, "__int__", &[])? {
-                        return integer(converted)
-                            .map(Value::Int)
-                            .map_err(|_| Error::Type("__int__ must return an integer"));
-                    }
-                    return self.py_index(value).map(Value::Int);
-                }
-                match args.first().copied().unwrap_or(Value::Int(0)) {
-                    Value::Int(n) => Value::Int(n),
-                    Value::Bool(b) => Value::Int(i64::from(b)),
-                    Value::Float(n)
-                        if n.is_finite() && n >= i64::MIN as f64 && n < -(i64::MIN as f64) =>
-                    {
-                        Value::Int(n as i64)
-                    }
-                    value => {
-                        let Some(text) = self.heap.as_str(&(value)) else {
-                            return Err(Error::Type("invalid integer"));
-                        };
-                        Value::Int(
-                            text.trim()
-                                .parse()
-                                .map_err(|_| error("ValueError: invalid integer"))?,
-                        )
-                    }
-                }
-            }
+            "int" => self.construct_integer(args, keywords)?,
             "float" => {
                 arity(args, 0, 1)?;
                 if let Some(&value) = args.first()
@@ -2286,7 +2290,8 @@ impl Vm {
                             _ => Err(Error::Type("__float__ must return float")),
                         };
                     }
-                    return self.py_index(value).map(|n| Value::Float(n as f64));
+                    let value = self.py_index_value(value)?;
+                    return crate::integer::number(&self.heap, value).map(Value::Float);
                 }
                 let value = args.first().copied().unwrap_or(Value::Float(0.0));
                 Value::Float(if self.heap.as_str(&value).is_some() {
@@ -2296,7 +2301,7 @@ impl Vm {
                     text.parse()
                         .map_err(|_| error("ValueError: invalid float"))?
                 } else {
-                    number(value)?
+                    crate::integer::number(&self.heap, value)?
                 })
             }
             "bool" => {
@@ -2331,10 +2336,41 @@ impl Vm {
                     _ => value.cos(),
                 })
             }
+            "hex" | "oct" | "bin" => {
+                arity(args, 1, 1)?;
+                let n = self.integer_argument(args[0])?;
+                let n = crate::integer::get(&self.heap, n)?;
+                let (base, prefix) = match name {
+                    "hex" => (16, "0x"),
+                    "oct" => (8, "0o"),
+                    _ => (2, "0b"),
+                };
+                use num_traits::Signed;
+                self.heap.string_owned(format!(
+                    "{}{prefix}{}",
+                    if n.is_negative() { "-" } else { "" },
+                    n.abs().to_str_radix(base)
+                ))
+            }
+            "divmod" => {
+                arity(args, 2, 2)?;
+                self.protocol_roots(args, |vm| vm.py_divmod(args[0], args[1]))?
+            }
+            "pow" => {
+                arity(args, 2, 3)?;
+                if args.get(2).is_none_or(|n| *n == Value::None) {
+                    self.py_binary("**", args[0], args[1])?
+                } else {
+                    crate::integer::modular_power(&self.heap, args[0], args[1], args[2])?
+                }
+            }
             "abs" => {
                 arity(args, 1, 1)?;
                 if let Some(value) = self.call_special(args[0], "__abs__", &[])? {
                     return Ok(value);
+                }
+                if crate::integer::is_integer(&self.heap, args[0]) {
+                    return crate::integer::unary(&self.heap, "abs", args[0]);
                 }
                 match args[0] {
                     Value::Int(n) => Value::Int(n.checked_abs().ok_or(Error::IntegerOverflow)?),
@@ -2428,27 +2464,12 @@ impl Vm {
                     done: false,
                 })
             }
-            "reversed" | "sorted" => {
+            "reversed" => {
                 arity(args, 1, 1)?;
                 let mut items = self.collect_iter(args[0])?;
-                if name == "reversed" {
-                    items.reverse();
-                } else {
-                    // A fallible insertion sort keeps comparisons in the runtime service.
-                    for i in 1..items.len() {
-                        let mut j = i;
-                        while j > 0 && self.py_compare_bool("<", items[j], items[j - 1])? {
-                            items.swap(j, j - 1);
-                            j -= 1;
-                        }
-                    }
-                }
+                items.reverse();
                 let list = self.heap.allocate(Object::List(items.into()));
-                if name == "reversed" {
-                    self.iter(list)?
-                } else {
-                    list
-                }
+                self.iter(list)?
             }
             "isinstance" => {
                 arity(args, 2, 2)?;
@@ -2557,7 +2578,7 @@ impl Vm {
             }
             Object::Native(name) => Ok(match name.as_ref() {
                 name if is_exception(name) => self.is_exception_instance(value, name),
-                "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
+                "int" => crate::integer::is_integer(&self.heap, value),
                 "bool" => matches!(value, Value::Bool(_)),
                 "float" => matches!(value, Value::Float(_)),
                 "object" => true,
@@ -2586,100 +2607,6 @@ impl Vm {
             }
             _ => Err(Error::Type("isinstance requires type")),
         }
-    }
-
-    fn sort_list(
-        &mut self,
-        receiver: Value,
-        args: &[Value],
-        keywords: &[(String, Value)],
-    ) -> Result<Value> {
-        arity(args, 0, 0)?;
-        let mut key = Value::None;
-        let mut reverse = false;
-        for (name, value) in keywords {
-            match name.as_ref() {
-                "key" => key = *value,
-                "reverse" => reverse = runtime::truth(&self.heap, *value)?,
-                _ => return Err(error("TypeError: invalid sort keyword")),
-            }
-        }
-        let items = match self.heap.get(receiver)? {
-            Object::List(items) => items.to_vec(),
-            _ => return Err(Error::Type("sort requires list")),
-        };
-        // Key callbacks see an empty list. Detached items and callback-created keys must remain
-        // rooted until sorting finishes, including error paths and collections inside a key.
-        if let Object::List(list) = &mut *self.heap.get_mut(receiver)? {
-            *list = vec![].into();
-        }
-        let roots = self.transient_roots.len();
-        self.transient_roots.extend_from_slice(&items);
-        self.transient_roots.push(key);
-        let result = (|| {
-            let mut keys = Vec::with_capacity(items.len());
-            for &item in &items {
-                let value = if key == Value::None {
-                    item
-                } else {
-                    self.call(key, &[item])?
-                };
-                self.transient_roots.push(value);
-                keys.push(value);
-            }
-            // Stable bottom-up merging permits fallible Python comparisons without a Rust
-            // comparator that must invent an ordering after an exception.
-            let mut order = (0..items.len()).collect::<Vec<_>>();
-            let mut scratch = order.clone();
-            let mut width = 1;
-            while width < order.len() {
-                for start in (0..order.len()).step_by(width * 2) {
-                    let middle = (start + width).min(order.len());
-                    let end = (middle + width).min(order.len());
-                    let (mut left, mut right) = (start, middle);
-                    for slot in &mut scratch[start..end] {
-                        let take_right = if left == middle {
-                            true
-                        } else if right == end {
-                            false
-                        } else if reverse {
-                            self.py_compare_bool("<", keys[order[left]], keys[order[right]])?
-                        } else {
-                            self.py_compare_bool("<", keys[order[right]], keys[order[left]])?
-                        };
-                        *slot = if take_right {
-                            let i = order[right];
-                            right += 1;
-                            i
-                        } else {
-                            let i = order[left];
-                            left += 1;
-                            i
-                        };
-                    }
-                }
-                std::mem::swap(&mut order, &mut scratch);
-                width = width.saturating_mul(2);
-            }
-            Ok(order.into_iter().map(|i| items[i]).collect::<Vec<_>>())
-        })();
-        let modified = match self.heap.get(receiver)? {
-            Object::List(list) => !list.is_empty(),
-            _ => false,
-        };
-        let restored = match &result {
-            Ok(sorted) => sorted.clone(),
-            Err(_) => items,
-        };
-        if let Object::List(list) = &mut *self.heap.get_mut(receiver)? {
-            *list = restored.into();
-        }
-        self.transient_roots.truncate(roots);
-        result?;
-        if modified {
-            return Err(error("ValueError: list modified during sort"));
-        }
-        Ok(Value::None)
     }
 
     fn list_method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
@@ -2914,6 +2841,9 @@ impl Vm {
     }
 
     fn method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        if crate::integer::is_integer(&self.heap, receiver) {
+            return self.integer_method(receiver, name, args);
+        }
         if matches!(self.heap.get(receiver), Ok(Object::Bytes(_))) {
             return self.bytes_method(receiver, name, args);
         }
@@ -3162,6 +3092,7 @@ fn key_value(heap: &Heap, key: &Key) -> Value {
         Key::None => Value::None,
         Key::Bool(value) => Value::Bool(*value),
         Key::Int(n) => Value::Int(*n),
+        Key::BigInt(n) => n.0,
         Key::String(s) => heap.string(s),
         Key::Bytes(data) => data.0,
         Key::Float(bits) => Value::Float(f64::from_bits(*bits)),
@@ -3237,12 +3168,57 @@ fn slice_positions(mut start: i128, stop: i128, step: i128) -> Vec<usize> {
     indices
 }
 pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
+    if let Some(text) = heap.as_str(&object) {
+        let ascii = text.is_ascii();
+        let len = if ascii {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+        let (start, stop, step) = slice_limits(heap, key, len)?;
+        if (step > 0 && start >= stop) || (step < 0 && start <= stop) {
+            return Ok(heap.string(""));
+        }
+        // ASCII positions are byte offsets. Short contiguous results stay inline without a
+        // character array or temporary output String; Unicode paths iterate code points.
+        if ascii && step == 1 {
+            return Ok(heap.string(&text[start as usize..stop as usize]));
+        }
+        let stride = usize::try_from(step.unsigned_abs()).unwrap_or(usize::MAX);
+        let result = if ascii {
+            let bytes = text.as_bytes();
+            if step > 0 {
+                bytes[start as usize..stop as usize]
+                    .iter()
+                    .step_by(stride)
+                    .map(|&byte| char::from(byte))
+                    .collect()
+            } else {
+                bytes[(stop + 1) as usize..(start + 1) as usize]
+                    .iter()
+                    .rev()
+                    .step_by(stride)
+                    .map(|&byte| char::from(byte))
+                    .collect()
+            }
+        } else if step > 0 {
+            text.chars()
+                .skip(start as usize)
+                .take((stop - start) as usize)
+                .step_by(stride)
+                .collect()
+        } else {
+            text.chars()
+                .rev()
+                .skip((len as i128 - 1 - start) as usize)
+                .take((start - stop) as usize)
+                .step_by(stride)
+                .collect()
+        };
+        return Ok(heap.string_owned(result));
+    }
     let (start, stop, step) = slice_limits(heap, key, heap.len(object)?)?;
     let indices = slice_positions(start, stop, step);
-    if let Some(text) = heap.as_str(&object) {
-        let chars = text.chars().collect::<Vec<_>>();
-        return Ok(text_heap(heap, indices.iter().map(|&i| chars[i]).collect()));
-    }
     Ok(match heap.get(object)? {
         Object::List(items) => heap.allocate(Object::List(
             indices.iter().map(|&i| items[i]).collect::<Vec<_>>().into(),
@@ -3253,15 +3229,35 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
         Object::Bytes(data) => {
             heap.allocate(Object::Bytes(indices.iter().map(|&i| data[i]).collect()))
         }
-        Object::String(text) => {
-            let chars = text.chars().collect::<Vec<_>>();
-            text_heap(heap, indices.iter().map(|&i| chars[i]).collect())
-        }
         _ => return Err(Error::Type("object does not support slicing")),
     })
 }
 
 fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
+    if op == "*" {
+        let pair = if crate::integer::is_big(heap, a) {
+            Some((b, a))
+        } else if crate::integer::is_big(heap, b) {
+            Some((a, b))
+        } else {
+            None
+        };
+        if let Some((sequence, _count)) = pair
+            && (heap.as_str(&sequence).is_some()
+                || matches!(
+                    heap.get(sequence),
+                    Ok(Object::List(_) | Object::Tuple(_) | Object::Bytes(_))
+                ))
+        {
+            return Err(Error::IntegerOverflow);
+        }
+    }
+    if crate::integer::is_big(heap, a)
+        || crate::integer::is_big(heap, b)
+        || matches!(op, "<<" | ">>")
+    {
+        return crate::integer::binary(heap, op, a, b);
+    }
     if op == "*" {
         if matches!(a, Value::Ref(_) | Value::InlineString(_))
             && let Ok(n) = integer(b)
@@ -3275,13 +3271,18 @@ fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
         }
     }
     if let (Ok(a), Ok(b)) = (integer(a), integer(b)) {
+        if op == "/" {
+            return crate::integer::binary(heap, op, Value::Int(a), Value::Int(b));
+        }
         let result = match op {
             "*" => a.checked_mul(b),
             "//" => {
                 if b == 0 {
                     return Err(error("ZeroDivisionError"));
                 }
-                let q = a.checked_div(b).ok_or(Error::IntegerOverflow)?;
+                let Some(q) = a.checked_div(b) else {
+                    return crate::integer::binary(heap, op, Value::Int(a), Value::Int(b));
+                };
                 Some(
                     q - if a % b != 0 && (a < 0) != (b < 0) {
                         1
@@ -3294,7 +3295,9 @@ fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
                 if b == 0 {
                     return Err(error("ZeroDivisionError"));
                 }
-                let r = a.checked_rem(b).ok_or(Error::IntegerOverflow)?;
+                let Some(r) = a.checked_rem(b) else {
+                    return Ok(Value::Int(0));
+                };
                 if r != 0 && (r < 0) != (b < 0) {
                     r.checked_add(b)
                 } else {
@@ -3308,7 +3311,10 @@ fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
             _ => None,
         };
         if ["*", "//", "%", "&", "|", "^"].contains(&op) || (op == "**" && b >= 0) {
-            return result.map(Value::Int).ok_or(Error::IntegerOverflow);
+            return match result {
+                Some(n) => Ok(Value::Int(n)),
+                None => crate::integer::binary(heap, op, Value::Int(a), Value::Int(b)),
+            };
         }
     }
     let (a, b) = (number(a)?, number(b)?);
@@ -3320,23 +3326,8 @@ fn binary(heap: &Heap, op: &str, a: Value, b: Value) -> Result<Value> {
             }
             a / b
         }
-        "//" => {
-            if b == 0.0 {
-                return Err(error("ZeroDivisionError"));
-            }
-            (a / b).floor()
-        }
-        "%" => {
-            if b == 0.0 {
-                return Err(error("ZeroDivisionError"));
-            }
-            let r = a % b;
-            if r != 0.0 && (r < 0.0) != (b < 0.0) {
-                r + b
-            } else {
-                r
-            }
-        }
+        "//" => crate::integer::float_divmod(a, b)?.0,
+        "%" => crate::integer::float_divmod(a, b)?.1,
         "**" => {
             if a == 0.0 && b < 0.0 {
                 return Err(error("ZeroDivisionError"));
@@ -3374,7 +3365,7 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
     if let (Ok(a), Ok(b)) = (integer(a), integer(b)) {
         return Ok(a == b);
     }
-    if let Some(ordering) = numeric_order(a, b) {
+    if let Some(ordering) = crate::integer::order(heap, a, b).or_else(|| numeric_order(a, b)) {
         return Ok(ordering == Some(std::cmp::Ordering::Equal));
     }
     if let (Some(a), Some(b)) = (heap.as_str(&a), heap.as_str(&b)) {
@@ -3543,6 +3534,7 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
             active.push(value);
             let result = match heap.get(value)? {
                 Object::Bytes(data) => bytes::repr(data),
+                Object::BigInt(n) => n.to_string(),
                 Object::String(s) => {
                     if quote {
                         format!(
@@ -3671,7 +3663,7 @@ fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cm
     if depth > 128 {
         return Err(error("RecursionError: comparison depth"));
     }
-    if let Some(order) = numeric_order(a, b) {
+    if let Some(order) = crate::integer::order(heap, a, b).or_else(|| numeric_order(a, b)) {
         return Ok(order);
     }
     if let (Some(a), Some(b)) = (heap.as_str(&a), heap.as_str(&b)) {

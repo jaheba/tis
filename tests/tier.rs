@@ -73,12 +73,14 @@ fn checked_add_overflow_deoptimizes_and_cleans_up() {
         Tiering::Lir,
     );
     result.unwrap();
-    assert!(
-        vm.call(
+    let large = vm
+        .call(
             vm.get_global("add").unwrap(),
-            &[Value::Int(i64::MAX), Value::Int(1)]
+            &[Value::Int(i64::MAX), Value::Int(1)],
         )
-        .is_err()
+        .unwrap();
+    assert!(
+        matches!(vm.heap.get(large),Ok(tis::Object::BigInt(n)) if n.to_string()=="9223372036854775808")
     );
     assert!(vm.tier_stats.deoptimizations > 0);
     assert_eq!(vm.stack_len(), 0);

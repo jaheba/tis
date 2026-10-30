@@ -46,9 +46,11 @@ fn overflow_exits_the_specialization_and_releases_the_frame() {
         vm.run(&mut function, &[Value::Int(1), Value::Int(2)])
             .unwrap();
     }
-    assert_eq!(
-        vm.run(&mut function, &[Value::Int(i64::MAX), Value::Int(1)]),
-        Err(Error::IntegerOverflow)
+    let result = vm
+        .run(&mut function, &[Value::Int(i64::MAX), Value::Int(1)])
+        .unwrap();
+    assert!(
+        matches!(vm.heap.get(result),Ok(Object::BigInt(n)) if n.to_string()=="9223372036854775808")
     );
     assert_eq!(function.feedback(addition).unwrap().guard_failures, 1);
     assert_eq!(

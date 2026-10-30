@@ -20,9 +20,37 @@ Bytes literals and immutable heap objects work through HIR runtime operations in
 
 Common search, split, replacement, case conversion, hex, join and strip methods are implemented. String encoding and bytes decoding support UTF-8 and ASCII with strict, ignore and replace error handling. This is not the complete bytes API: other codecs, some method options, formatting and exact diagnostic compatibility remain open.
 
+## Integer milestone
+
+Integers that fit in `i64` remain inline. Overflow and larger literals use immutable `BigInt` heap objects;
+results return to inline storage when they fit.
+JIT code retains its checked small-integer operations and resumes the generic operation on overflow.
+Profiles distinguish heap integers from inline integers so large values cannot be mistaken for an unboxed `i64`.
+
+Core arithmetic, shifts, integer bit operations, exact comparisons with floats, floor division and modulo,
+integer hashing, JSON numbers, `int()` conversions, `bit_length` and `bit_count` support large values.
+`divmod`, `pow` (including modular inverses), `hex`, `oct` and `bin` use the same integer service.
+Integer true division rounds the exact quotient instead of converting each input to a float first.
+Dictionary keys retain their original heap integer owner across collection.
+
+Range iteration and native integer registers still use `i64`.
+Integer byte conversions, Unicode decimal parsing, numeric formatting and some diagnostic messages remain incomplete.
+Python’s decimal-string digit limit is not yet enforced.
+There is no claim of full Python or Monty integer parity.
+
+## Sorting
+
+`sorted()` and `list.sort()` share a stable merge sort and accept keyword-only `key` and `reverse` arguments.
+The key runs once per input value; detached items and callback results remain rooted through comparisons and GC.
+`sorted()` consumes its iterable before validating sort keywords, and leaves the original container intact.
+Reverse conversion follows the Python 3.14+ truth protocol and can invoke user code before an in-place list is detached.
+
+String slicing uses byte offsets for contiguous ASCII results and streams Unicode code points for other slices.
+It copies only the selected result, without building a character array for the full source.
+
 ## Remaining work
 
-1. Arbitrary-precision integers and complex numbers.
+1. Complex numbers and the remaining integer methods.
 2. Remaining bytes/string/container methods and formatting behavior.
 3. Pattern matching and other syntax gaps identified by the audit.
 4. Bundled modules, including collections, dataclasses, itertools, decimal and codecs.

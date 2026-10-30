@@ -25,6 +25,8 @@ for i in range(30):
 assert json_loads('"\\u0000"') == chr(0)
 assert json.loads('9223372036854775807') == 9223372036854775807
 assert json_loads('-9223372036854775808') == -9223372036854775808
+assert json.loads('9223372036854775808') == 9223372036854775808
+assert json_loads('18446744073709551615') == 18446744073709551615
 assert json_loads('{"x":1,"x":2}') == {'x': 2}
 assert json_loads(' [ 1, 2 ] \n') == [1, 2]
 shared = [1]
@@ -65,7 +67,6 @@ fn both_decoders_reject_invalid_input() {
         "1.",
         "1e",
         "1e999",
-        "9223372036854775808",
         "\"\\ud800\"",
         "\"\n\"",
         "NaN",
@@ -152,7 +153,6 @@ assert json.loads('[1e2,-1.5,0.0]') == [100.0,-1.5,0.0]
         "{\"x\":1,}",
         "Infinity",
         "-Infinity",
-        "18446744073709551615",
     ] {
         let value = vm.heap.string(text);
         assert!(vm.call(parse, &[value]).is_err(), "{text}");

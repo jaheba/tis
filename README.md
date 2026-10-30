@@ -79,7 +79,9 @@ They do not reparse source or delegate execution to another interpreter.
 The language remains a subset: metaclasses, `__slots__`, `__del__` finalizers,
 builtin-type subclassing (except exceptions), general `yield`,
 async constructs, `except*`, arbitrary module imports and most of the standard library are unsupported.
-Integers remain signed 64-bit values.
+Integers that fit in signed 64 bits stay inline; larger literals and overflow results use immutable heap integers.
+Native integer guards resume the generic operation on overflow.
+Core bytes and integer compatibility, audit commands and remaining gaps are documented in [docs/monty-parity.md](docs/monty-parity.md).
 Tracebacks retain raise/unwind identity and chains, including context-manager callbacks;
 Python frame objects, source-line traceback formatting and traceback frame inspection are not implemented.
 

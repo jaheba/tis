@@ -57,6 +57,7 @@ impl Vm {
             Value::Ref(_) => match self.heap.get(value)? {
                 Object::String(_) => "str",
                 Object::Bytes(_) => "bytes",
+                Object::BigInt(_) => "int",
                 Object::List(_) => "list",
                 Object::Tuple(_) => "tuple",
                 Object::Dict(_) => "dict",

@@ -541,14 +541,21 @@ impl Builder {
             Expr::Name(expr) => self.runtime(block, CoreOp::LoadName(expr.id.to_string()), vec![]),
             Expr::NoneLiteral(_) => self.none(block),
             Expr::BooleanLiteral(expr) => self.constant(block, Constant::Bool(expr.value)),
-            Expr::NumberLiteral(expr) => self.constant(
-                block,
-                match &expr.value {
-                    ast::Number::Int(n) => Constant::Int(n.as_i64().ok_or(Error::IntegerOverflow)?),
-                    ast::Number::Float(n) => Constant::Float(*n),
-                    _ => return Err(Error::Unsupported("complex numbers")),
+            Expr::NumberLiteral(expr) => match &expr.value {
+                ast::Number::Int(n) => match n.as_i64() {
+                    Some(n) => self.constant(block, Constant::Int(n)),
+                    None => self.runtime(
+                        block,
+                        CoreOp::IntegerLiteral(
+                            crate::integer::parse(&n.to_string(), 0)
+                                .map_err(|_| Error::InvalidIr("integer literal"))?,
+                        ),
+                        vec![],
+                    ),
                 },
-            ),
+                ast::Number::Float(n) => self.constant(block, Constant::Float(*n)),
+                _ => return Err(Error::Unsupported("complex numbers")),
+            },
             Expr::BytesLiteral(expr) => {
                 let bytes: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::from(&expr.value);
                 self.runtime(block, CoreOp::BytesLiteral(bytes.into_owned()), vec![])
@@ -923,6 +930,8 @@ impl Builder {
                         ast::Operator::BitAnd => "&",
                         ast::Operator::BitOr => "|",
                         ast::Operator::BitXor => "^",
+                        ast::Operator::LShift => "<<",
+                        ast::Operator::RShift => ">>",
                         _ => return Err(Error::Unsupported("binary operator")),
                     }
                     .into(),
@@ -1448,6 +1457,8 @@ fn operator_name(op: ast::Operator) -> Result<&'static str> {
         ast::Operator::BitAnd => "&",
         ast::Operator::BitOr => "|",
         ast::Operator::BitXor => "^",
+        ast::Operator::LShift => "<<",
+        ast::Operator::RShift => ">>",
         _ => return Err(Error::Unsupported("binary operator")),
     })
 }

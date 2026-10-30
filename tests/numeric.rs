@@ -115,10 +115,16 @@ fn arithmetic_failures_fall_back_once_without_replaying_effects() {
         warm(&mut vm, f, a, b);
         let before = vm.get_global("count").unwrap();
         let (mut generic, g) = setup(&source, NumericMode::Disabled);
-        assert_eq!(
-            vm.call(f, &[bad_a, bad_b]).unwrap_err().to_string(),
-            generic.call(g, &[bad_a, bad_b]).unwrap_err().to_string()
-        );
+        match (
+            vm.call(f, &[bad_a, bad_b]),
+            generic.call(g, &[bad_a, bad_b]),
+        ) {
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+            (Ok(a), Ok(b)) => assert!(
+                matches!((vm.heap.get(a),generic.heap.get(b)),(Ok(tis::Object::BigInt(a)),Ok(tis::Object::BigInt(b))) if a==b)
+            ),
+            other => panic!("numeric fallback mismatch: {other:?}"),
+        }
         let Value::Int(before) = before else { panic!() };
         assert_eq!(vm.get_global("count").unwrap(), Value::Int(before + 1));
         assert_eq!(vm.tier_stats.numeric_arithmetic_fallbacks, 1);

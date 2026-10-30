@@ -6,6 +6,7 @@ pub(super) fn key_hash(key: &Key) -> i64 {
     let hash = match key {
         Key::Protocol(_, hash) => *hash,
         Key::Bool(value) => i64::from(*value),
+        Key::BigInt(value) => crate::integer::python_hash(&value.1),
         Key::Int(value) => {
             let modulus = (1i128 << 61) - 1;
             ((*value as i128) % modulus) as i64
@@ -16,6 +17,14 @@ pub(super) fn key_hash(key: &Key) -> i64 {
                 && f64::from_bits(*bits) < -(i64::MIN as f64) =>
         {
             key_hash(&Key::Int(f64::from_bits(*bits) as i64))
+        }
+        Key::Float(bits)
+            if f64::from_bits(*bits).is_finite() && f64::from_bits(*bits).fract() == 0.0 =>
+        {
+            use num_traits::FromPrimitive;
+            crate::integer::python_hash(
+                &num_bigint::BigInt::from_f64(f64::from_bits(*bits)).unwrap(),
+            )
         }
         Key::Tuple(keys) => {
             let mut state = DefaultHasher::new();

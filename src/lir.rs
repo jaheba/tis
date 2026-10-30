@@ -2747,7 +2747,8 @@ impl Helper {
                 | CoreOp::Class(..)
                 | CoreOp::Set
                 | CoreOp::Join
-                | CoreOp::BytesLiteral(_) => true,
+                | CoreOp::BytesLiteral(_)
+                | CoreOp::IntegerLiteral(_) => true,
             },
         }
     }

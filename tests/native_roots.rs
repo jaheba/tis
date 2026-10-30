@@ -60,9 +60,12 @@ enabled=True
         vm.heap.get_item(result, Value::Int(1)).unwrap(),
         Value::Int(6)
     );
+    let result = vm
+        .call(probe, &[Value::Int(i64::MAX), Value::Bool(true)])
+        .unwrap();
+    let large = vm.heap.get_item(result, Value::Int(1)).unwrap();
     assert!(
-        vm.call(probe, &[Value::Int(i64::MAX), Value::Bool(true)])
-            .is_err()
+        matches!(vm.heap.get(large),Ok(tis::Object::BigInt(n)) if n.to_string()=="18446744073709551614")
     );
     vm.collect_garbage(&[]).unwrap();
     assert!(vm.heap.get(list).is_err());

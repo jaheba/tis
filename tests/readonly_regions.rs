@@ -166,6 +166,9 @@ fn numeric_guards_preserve_integer_tags_overflow_and_float_errors() {
                     let b = reference.heap.get_item(b, index).unwrap();
                     match (a, b) {
                         (Float(a), Float(b)) if a.is_nan() && b.is_nan() => {}
+                        (tis::Value::Ref(_), tis::Value::Ref(_)) => {
+                            assert_eq!(native.heap.get(a).unwrap(), reference.heap.get(b).unwrap())
+                        }
                         (a, b) => assert_eq!(a, b),
                     }
                 }

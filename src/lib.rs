@@ -11,6 +11,7 @@ pub use shape::{Attribute, Attributes, Shape};
 pub mod bytecode;
 mod dict;
 mod error;
+mod integer;
 mod json;
 mod unicode;
 pub use dict::Dict;

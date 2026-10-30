@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+num-bigint = "=0.4.6"
+num-traits = "=0.2.19"
+num-integer = "=0.1.46"
 compact_str = "=0.10.0"
 ruff_python_parser = "=0.0.14"
 ruff_python_ast = "=0.0.14"

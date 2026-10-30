@@ -281,7 +281,10 @@ fn side_exits_reconstruct_slots_and_resume_without_replaying_effects() {
             })
         })
         .unwrap();
-    assert!(vm.resume_hir(&mut f, frame).is_err());
+    let large = vm.resume_hir(&mut f, frame).unwrap();
+    assert!(
+        matches!(vm.heap.get(large),Ok(Object::BigInt(n)) if n.to_string()=="9223372036854775808")
+    );
     assert_eq!(vm.stack_len(), 0);
     assert_eq!(f.profile().deoptimizations, 2);
     vm.unpin(pin);

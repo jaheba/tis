@@ -36,6 +36,7 @@ pub enum Key {
     None,
     Bool(bool),
     Int(i64),
+    BigInt(std::rc::Rc<(Value, num_bigint::BigInt)>),
     String(compact_str::CompactString),
     Bytes(std::rc::Rc<(Value, Vec<u8>)>),
     Float(u64),
@@ -52,6 +53,7 @@ impl Key {
         match self {
             Self::Protocol(value, _) => f(*value),
             Self::Bytes(value) => f(value.0),
+            Self::BigInt(value) => f(value.0),
             Self::Tuple(keys) => {
                 for key in keys {
                     key.visit_values(f);
@@ -66,6 +68,7 @@ impl Key {
 pub enum Object {
     String(String),
     Bytes(Vec<u8>),
+    BigInt(num_bigint::BigInt),
     List(crate::List),
     Tuple(Vec<Value>),
     Dict(crate::Dict),
@@ -485,6 +488,7 @@ impl Heap {
             Value::Int(value) => Ok(Key::Int(value)),
             Value::Ref(_) => match self.get(value)? {
                 Object::String(value) => Ok(Key::String(value.as_str().into())),
+                Object::BigInt(n) => Ok(Key::BigInt(std::rc::Rc::new((value, n.clone())))),
                 Object::Bytes(bytes) => Ok(Key::Bytes(std::rc::Rc::new((value, bytes.clone())))),
                 Object::Tuple(values) => values
                     .iter()
@@ -716,6 +720,7 @@ impl PartialEq for Object {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::String(a), Self::String(b)) => a == b,
+            (Self::BigInt(a), Self::BigInt(b)) => a == b,
             (Self::Bytes(a), Self::Bytes(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
@@ -727,6 +732,12 @@ impl PartialEq for Object {
 
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
+        if let Self::BigInt(a) = self {
+            return crate::integer::key_equal(&a.1, other);
+        }
+        if let Self::BigInt(b) = other {
+            return crate::integer::key_equal(&b.1, self);
+        }
         let numeric = |key: &Key| match key {
             Key::Bool(value) => Some(Value::Bool(*value)),
             Key::Int(value) => Some(Value::Int(*value)),

@@ -146,9 +146,17 @@ impl Vm {
         }
         match op {
             "+" => runtime::add(&mut self.heap, a, b),
-            "-" => runtime::subtract(a, b),
+            "-" => runtime::subtract(&self.heap, a, b),
             _ => binary(&self.heap, op, a, b),
         }
+    }
+
+    pub(super) fn py_divmod(&mut self, a: Value, b: Value) -> Result<Value> {
+        if let Some(value) = self.binary_special(a, b, "__divmod__", "__rdivmod__")? {
+            return Ok(value);
+        }
+        let (q, r) = crate::integer::divmod(&self.heap, a, b)?;
+        Ok(self.heap.allocate(Object::Tuple(vec![q, r])))
     }
 
     pub(crate) fn py_inplace(&mut self, op: &str, a: Value, b: Value) -> Result<Value> {
@@ -189,6 +197,9 @@ impl Vm {
         };
         if let Some(result) = self.call_special(value, name, &[])? {
             return Ok(result);
+        }
+        if crate::integer::is_integer(&self.heap, value) {
+            return crate::integer::unary(&self.heap, op, value);
         }
         match op {
             "+" => {
@@ -242,14 +253,36 @@ impl Vm {
         runtime::truth(&self.heap, value)
     }
 
+    pub(crate) fn py_index_value(&mut self, value: Value) -> Result<Value> {
+        if crate::integer::is_integer(&self.heap, value) {
+            return Ok(value);
+        }
+        match self.call_special(value, "__index__", &[])? {
+            Some(v) if crate::integer::is_integer(&self.heap, v) => Ok(v),
+            Some(_) => Err(Error::Type("__index__ must return an integer")),
+            None => Err(Error::Type("index must be an integer")),
+        }
+    }
+
     pub(crate) fn py_index(&mut self, value: Value) -> Result<i64> {
         if let Ok(n) = integer(value) {
             return Ok(n);
         }
-        match self.call_special(value, "__index__", &[])? {
-            Some(v) => integer(v).map_err(|_| Error::Type("__index__ must return an integer")),
-            None => Err(Error::Type("index must be an integer")),
+        let value = self.py_index_value(value)?;
+        crate::integer::index(&self.heap, value)
+    }
+
+    pub(super) fn clamped_index(&mut self, value: Value) -> Result<i64> {
+        let value = self.py_index_value(value)?;
+        if let Ok(n) = integer(value) {
+            return Ok(n);
         }
+        let n = crate::integer::get(&self.heap, value)?;
+        Ok(if n < num_bigint::BigInt::from(0) {
+            i64::MIN
+        } else {
+            i64::MAX
+        })
     }
 
     pub(crate) fn py_get_item(&mut self, object: Value, key: Value) -> Result<Value> {
@@ -273,6 +306,9 @@ impl Vm {
                 | Object::Bytes(_)
                 | Object::Range { .. })
         ) || matches!(object, Value::InlineString(_));
+        if sequence && crate::integer::is_big(&self.heap, key) {
+            return Err(Error::Index);
+        }
         let key = if sequence && self.instance_class(key).is_some() {
             Value::Int(self.protocol_roots(&[object, key], |vm| vm.py_index(key))?)
         } else {
@@ -305,6 +341,11 @@ impl Vm {
             && matches!(self.heap.get(key), Ok(Object::Slice { .. }))
         {
             return self.assign_slice(object, key, value);
+        }
+        if matches!(self.heap.get(object), Ok(Object::List(_)))
+            && crate::integer::is_big(&self.heap, key)
+        {
+            return Err(Error::Index);
         }
         let key = if matches!(self.heap.get(object), Ok(Object::List(_)))
             && self.instance_class(key).is_some()

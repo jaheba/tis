@@ -4,10 +4,13 @@ use crate::{Error, Heap, Object, Result, Value};
 
 pub(crate) fn add(heap: &mut Heap, lhs: Value, rhs: Value) -> Result<Value> {
     if let (Some(lhs), Some(rhs)) = (integer(lhs), integer(rhs)) {
-        return lhs
-            .checked_add(rhs)
-            .map(Value::Int)
-            .ok_or(Error::IntegerOverflow);
+        return match lhs.checked_add(rhs) {
+            Some(n) => Ok(Value::Int(n)),
+            None => crate::integer::binary(heap, "+", Value::Int(lhs), Value::Int(rhs)),
+        };
+    }
+    if crate::integer::is_big(heap, lhs) || crate::integer::is_big(heap, rhs) {
+        return crate::integer::binary(heap, "+", lhs, rhs);
     }
     if let (Some(lhs), Some(rhs)) = (number(lhs), number(rhs)) {
         return Ok(Value::Float(lhs + rhs));
@@ -34,19 +37,27 @@ pub(crate) fn add(heap: &mut Heap, lhs: Value, rhs: Value) -> Result<Value> {
     Err(Error::Type("unsupported addition operands"))
 }
 
-pub(crate) fn subtract(lhs: Value, rhs: Value) -> Result<Value> {
-    if let (Some(lhs), Some(rhs)) = (integer(lhs), integer(rhs)) {
-        lhs.checked_sub(rhs)
-            .map(Value::Int)
-            .ok_or(Error::IntegerOverflow)
-    } else if let (Some(lhs), Some(rhs)) = (number(lhs), number(rhs)) {
+pub(crate) fn subtract(heap: &Heap, lhs: Value, rhs: Value) -> Result<Value> {
+    if let (Some(a), Some(b)) = (integer(lhs), integer(rhs)) {
+        return match a.checked_sub(b) {
+            Some(n) => Ok(Value::Int(n)),
+            None => crate::integer::binary(heap, "-", lhs, rhs),
+        };
+    }
+    if crate::integer::is_big(heap, lhs) || crate::integer::is_big(heap, rhs) {
+        return crate::integer::binary(heap, "-", lhs, rhs);
+    }
+    if let (Some(lhs), Some(rhs)) = (number(lhs), number(rhs)) {
         Ok(Value::Float(lhs - rhs))
     } else {
         Err(Error::Type("subtraction requires numbers"))
     }
 }
 
-pub(crate) fn less(lhs: Value, rhs: Value) -> Result<Value> {
+pub(crate) fn less(heap: &Heap, lhs: Value, rhs: Value) -> Result<Value> {
+    if let Some(order) = crate::integer::order(heap, lhs, rhs) {
+        return Ok(Value::Bool(order == Some(std::cmp::Ordering::Less)));
+    }
     if let (Some(lhs), Some(rhs)) = (integer(lhs), integer(rhs)) {
         Ok(Value::Bool(lhs < rhs))
     } else if let (Some(lhs), Some(rhs)) = (number(lhs), number(rhs)) {
@@ -65,6 +76,7 @@ pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
         Value::Int(value) => value != 0,
         Value::Float(value) => value != 0.0,
         Value::Ref(_) => match heap.get(value)? {
+            Object::BigInt(n) => n != &num_bigint::BigInt::from(0),
             Object::String(_)
             | Object::Bytes(_)
             | Object::List(_)

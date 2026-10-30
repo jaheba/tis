@@ -83,7 +83,10 @@ fn native_module_lifetimes_survive_recompilation_and_retirement() {
     for _ in 0..12 {
         let mut vm = warm("def f(a,b):\n    return a + b\nfor i in range(20):\n    f(1,2)\n");
         let f = vm.get_global("f").unwrap();
-        assert!(vm.call(f, &[Value::Int(i64::MAX), Value::Int(1)]).is_err());
+        let large = vm.call(f, &[Value::Int(i64::MAX), Value::Int(1)]).unwrap();
+        assert!(
+            matches!(vm.heap.get(large),Ok(Object::BigInt(n)) if n.to_string()=="9223372036854775808")
+        );
         let hir = vm.function_hir(f).unwrap();
         vm.compile_lir(&hir).unwrap();
         assert_eq!(

@@ -153,11 +153,15 @@ impl Hash for Key {
                 // i64 lower boundary. The upper boundary is exclusive: i64::MAX rounds upward.
                 if value.fract() == 0.0 && value >= i64::MIN as f64 && value < -(i64::MIN as f64) {
                     Key::Int(value as i64).hash(state);
+                } else if value.is_finite() && value.fract() == 0.0 {
+                    use num_traits::FromPrimitive;
+                    crate::integer::hash_key(&num_bigint::BigInt::from_f64(value).unwrap(), state);
                 } else {
                     3u8.hash(state);
                     bits.hash(state);
                 }
             }
+            Self::BigInt(v) => crate::integer::hash_key(&v.1, state),
             Self::Int(v) => {
                 2u8.hash(state);
                 v.hash(state);

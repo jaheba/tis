@@ -161,7 +161,9 @@ impl Vm {
             }
             return Err(Error::Type("__bytes__ returned non-bytes"));
         }
-        if integer(source).is_ok() || self.special(source, "__index__")?.is_some() {
+        if crate::integer::is_integer(&self.heap, source)
+            || self.special(source, "__index__")?.is_some()
+        {
             let count = self.py_index(source)?;
             if count < 0 {
                 return Err(error("ValueError: negative count"));

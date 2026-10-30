@@ -64,7 +64,10 @@ fn decode(heap: &Heap, parser: &mut Jiter<'_>, peek: Peek, depth: usize) -> Resu
             let bytes = parser.known_number_bytes(peek).map_err(invalid)?;
             let token = std::str::from_utf8(bytes).map_err(invalid)?;
             if !bytes.iter().any(|b| matches!(b, b'.' | b'e' | b'E')) {
-                Value::Int(token.parse().map_err(|_| Error::IntegerOverflow)?)
+                match token.parse::<i64>() {
+                    Ok(n) => Value::Int(n),
+                    Err(_) => crate::integer::value(heap, token.parse().map_err(invalid)?),
+                }
             } else {
                 let value: f64 = token.parse().map_err(invalid)?;
                 if !value.is_finite() {
@@ -149,6 +152,7 @@ fn encode(
             active.push(value);
             match heap.get(value)? {
                 Object::String(value) => quoted(value, text, options.ensure_ascii),
+                Object::BigInt(value) => write!(text, "{value}").unwrap(),
                 Object::List(_) | Object::Tuple(_) => {
                     let values = heap.get(value)?.values().unwrap();
                     text.push('[');

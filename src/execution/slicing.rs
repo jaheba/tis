@@ -10,7 +10,7 @@ impl Vm {
         // Python converts step before start and stop.
         for (index, value) in [step, start, stop].into_iter().enumerate() {
             if value != Value::None {
-                normalized[index] = Value::Int(self.py_index(value)?);
+                normalized[index] = Value::Int(self.clamped_index(value)?);
             }
         }
         if normalized[0] == Value::Int(0) {

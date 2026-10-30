@@ -43,9 +43,10 @@ pub enum ValueKind {
     Slice,
     Environment,
     Internal,
+    BigInt,
 }
 impl ValueKind {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::None,
         Self::Bool,
         Self::Int,
@@ -65,6 +66,7 @@ impl ValueKind {
         Self::Slice,
         Self::Environment,
         Self::Internal,
+        Self::BigInt,
     ];
     pub(crate) fn of(heap: &Heap, value: Value) -> Self {
         match value {
@@ -75,6 +77,7 @@ impl ValueKind {
             Value::Float(_) => Self::Float,
             Value::InlineString(_) => Self::String,
             Value::Ref(_) => match heap.get(value) {
+                Ok(Object::BigInt(_)) => Self::BigInt,
                 Ok(Object::String(_)) => Self::String,
                 Ok(Object::List(_)) => Self::List,
                 Ok(Object::Tuple(_)) => Self::Tuple,
@@ -103,7 +106,7 @@ impl ValueKind {
 
 #[derive(Debug, Clone, Default)]
 pub struct TypeProfile {
-    counts: [u64; 19],
+    counts: [u64; 20],
 }
 impl TypeProfile {
     pub fn count(&self, kind: ValueKind) -> u64 {

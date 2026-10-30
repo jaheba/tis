@@ -130,9 +130,11 @@ fn copied_integer_overflow_resumes_after_prior_writes() {
         let caller = vm.get_global("caller").unwrap();
         let boxed = vm.get_global("box").unwrap();
         let exits = vm.tier_stats.deoptimizations;
+        let large = vm
+            .call(caller, &[boxed, Value::Int(i64::MAX), Value::Int(1)])
+            .unwrap();
         assert!(
-            vm.call(caller, &[boxed, Value::Int(i64::MAX), Value::Int(1)])
-                .is_err()
+            matches!(vm.heap.get(large),Ok(tis::Object::BigInt(n)) if n.to_string()=="9223372036854775808")
         );
         assert!(vm.tier_stats.deoptimizations > exits);
         vm.run_program(&mut compile("assert box.count==501\n").unwrap())

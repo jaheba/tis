@@ -46,9 +46,11 @@ fn type_and_overflow_exits_do_not_repeat_effects() {
     );
     let hir = vm.function_hir(add).unwrap();
     vm.compile_lir(&hir).unwrap();
+    let large = vm
+        .call(add, &[Value::Int(i64::MAX), Value::Int(1)])
+        .unwrap();
     assert!(
-        vm.call(add, &[Value::Int(i64::MAX), Value::Int(1)])
-            .is_err()
+        matches!(vm.heap.get(large),Ok(tis::Object::BigInt(n)) if n.to_string()=="9223372036854775808")
     );
     assert_eq!(
         vm.heap.get_item(calls, Value::Int(0)).unwrap(),
