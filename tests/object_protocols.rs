@@ -380,3 +380,98 @@ assert calls == []
 "#,
     );
 }
+
+#[test]
+fn fused_slice_reads_preserve_bounds_hooks_and_assignment_identity() {
+    check(
+        r#"
+log = []
+class Index:
+    def __init__(self, name, value): self.name, self.value = name, value
+    def __index__(self):
+        log.append(self.name)
+        return self.value
+class Custom:
+    def __getitem__(self, key):
+        self.key = key
+        return 10
+    def __setitem__(self, key, value):
+        assert key is self.key
+        self.result = value
+start, stop, step = Index('start', 1), Index('stop', 5), Index('step', 2)
+for _ in range(10):
+    log.clear()
+    assert 'abcdef'[start:stop:step] == 'bd'
+    assert log == ['step', 'start', 'stop']
+    assert [0,1,2,3,4,5][1:5:2] == [1,3]
+    assert (0,1,2,3)[::-1] == (3,2,1,0)
+    assert 'aé😀z'[::-1] == 'z😀éa'
+    obj = Custom()
+    log.clear()
+    assert obj[start:stop:step] == 10
+    assert log == []
+    assert obj.key.start is start and obj.key.stop is stop and obj.key.step is step
+    obj[1:3] += 2
+    assert obj.result == 12
+    assert obj[1:3, 4] == 10
+    assert obj.key[0].start == 1 and obj.key[1] == 4
+    log.clear()
+    try:
+        'abc'[start:stop:0]
+        assert False
+    except ValueError:
+        pass
+    assert log == []
+items = [0,1,2,3]
+class MutatingIndex:
+    def __index__(self):
+        items.clear()
+        return 0
+assert items[MutatingIndex():] == []
+"#,
+    );
+}
+
+#[test]
+fn builtin_mapping_probes_keep_numeric_identity_and_custom_callbacks() {
+    check(
+        r#"
+for _ in range(10):
+    d = {True: 3, 'abcdefghijklmnopqrstuvwxyz': 4, (1, 'x'): 5}
+    d[1.0] += 2
+    assert d[True] == 5 and list(d)[0] is True
+    d['abcdefghijklmnopqrstuvwxyz'] += 1
+    d[(True, 'x')] += 2
+    assert d[(1.0, 'x')] == 7
+    assert list(d) == [True, 'abcdefghijklmnopqrstuvwxyz', (1, 'x')]
+    d[2] = 8
+    del d[True]
+    d[True] = 9
+    assert list(d) == ['abcdefghijklmnopqrstuvwxyz', (1, 'x'), 2, True]
+    log = []
+    class Key:
+        def __hash__(self):
+            log.append('hash')
+            return hash('x')
+        def __eq__(self, other):
+            log.append('eq')
+            return other == 'x'
+    key = Key()
+    mixed = {key: 1}
+    log.clear()
+    mixed['x'] = 2
+    assert log == ['eq']
+    assert list(mixed)[0] is key
+    log.clear()
+    assert mixed['x'] == 2
+    assert log == ['eq']
+    log.clear()
+    mixed[key] += 1
+    assert log == ['hash', 'hash']
+    assert mixed[key] == 3
+    values = {True, 1.0}
+    values.add(1)
+    assert len(values) == 1 and list(values)[0] is True
+"#,
+    );
+}

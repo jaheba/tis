@@ -109,12 +109,6 @@ impl Vm {
         }
     }
 
-    pub(super) fn mapping_needs_protocol(&self, object: Value, key: Value) -> bool {
-        self.mapping(object)
-            .is_ok_and(crate::Dict::has_protocol_keys)
-            || self.heap.key(key).is_err()
-    }
-
     pub(super) fn mapping_find(&mut self, object: Value, key: &Key) -> Result<Option<Key>> {
         if !key.has_protocol() && !self.mapping(object)?.has_protocol_keys() {
             return Ok(self.mapping(object)?.get(key).map(|_| key.clone()));
@@ -156,8 +150,15 @@ impl Vm {
 
     pub(super) fn mapping_get(&mut self, object: Value, key: Value) -> Result<Option<Value>> {
         self.protocol_roots(&[object, key], |vm| {
-            if !vm.mapping_needs_protocol(object, key) {
-                return vm.heap.dict_get(vm.mapping(object)?, key);
+            let items = vm.mapping(object)?;
+            if !items.has_protocol_keys() {
+                // Borrow string storage and convert other builtin keys only once.
+                if let Some(text) = vm.heap.as_str(&key) {
+                    return Ok(items.get_str(text).copied());
+                }
+                if let Ok(key) = vm.heap.key(key) {
+                    return Ok(items.get(&key).copied());
+                }
             }
             let key = vm.py_key(key)?;
             let found = vm.mapping_find(object, &key)?;
@@ -173,7 +174,21 @@ impl Vm {
         set: bool,
     ) -> Result<()> {
         self.protocol_roots(&[object, key, value], |vm| {
-            let key = vm.py_key(key)?;
+            let key = match vm.heap.key(key) {
+                Ok(key) => key,
+                Err(_) => vm.py_key(key)?,
+            };
+            if !key.has_protocol() && !vm.mapping(object)?.has_protocol_keys() {
+                let mut guard = vm.heap.get_mut(object)?;
+                let (Object::Dict(items) | Object::Set(items)) = &mut *guard else {
+                    return Err(Error::Type("mapping required"));
+                };
+                // Insertion already probes and preserves an equal key's original identity.
+                if !set || items.get(&key).is_none() {
+                    items.insert(key, value);
+                }
+                return Ok(());
+            }
             let found = vm.mapping_find(object, &key)?;
             if set && found.is_some() {
                 return Ok(());

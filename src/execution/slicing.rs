@@ -2,20 +2,37 @@
 use super::*;
 
 impl Vm {
+    pub(super) fn py_get_slice(
+        &mut self,
+        object: Value,
+        start: Value,
+        stop: Value,
+        step: Value,
+    ) -> Result<Value> {
+        self.protocol_roots(&[object, start, stop, step], |vm| {
+            if matches!(object, Value::InlineString(_))
+                || matches!(
+                    vm.heap.get(object),
+                    Ok(Object::String(_) | Object::List(_) | Object::Tuple(_) | Object::Bytes(_))
+                )
+            {
+                let [start, stop, step] = vm.normalized_slice_parts(start, stop, step)?;
+                slice_parts(&vm.heap, object, start, stop, step)
+            } else {
+                // Custom indexing receives the original bounds without __index__ conversion.
+                let key = vm.heap.allocate(Object::Slice { start, stop, step });
+                vm.py_get_item(object, key)
+            }
+        })
+    }
+
     pub(super) fn normalized_slice(&mut self, key: Value) -> Result<Value> {
         let Object::Slice { start, stop, step } = *self.heap.get(key)? else {
             return Err(Error::Type("expected slice"));
         };
-        let mut normalized = [Value::None; 3];
-        // Python converts step before start and stop.
-        for (index, value) in [step, start, stop].into_iter().enumerate() {
-            if value != Value::None {
-                normalized[index] = Value::Int(self.clamped_index(value)?);
-            }
-        }
-        if normalized[0] == Value::Int(0) {
-            return Err(error("ValueError: slice step cannot be zero"));
-        }
+        let [start_value, stop_value, step_value] =
+            self.normalized_slice_parts(start, stop, step)?;
+        let normalized = [step_value, start_value, stop_value];
         if normalized == [step, start, stop] {
             return Ok(key);
         }
@@ -24,6 +41,25 @@ impl Vm {
             start: normalized[1],
             stop: normalized[2],
         }))
+    }
+
+    fn normalized_slice_parts(
+        &mut self,
+        start: Value,
+        stop: Value,
+        step: Value,
+    ) -> Result<[Value; 3]> {
+        let mut normalized = [Value::None; 3];
+        // Python converts step first and rejects zero before evaluating either bound's index.
+        for (index, value) in [step, start, stop].into_iter().enumerate() {
+            if value != Value::None {
+                normalized[index] = Value::Int(self.clamped_index(value)?);
+            }
+            if index == 0 && normalized[0] == Value::Int(0) {
+                return Err(error("ValueError: slice step cannot be zero"));
+            }
+        }
+        Ok([normalized[1], normalized[2], normalized[0]])
     }
 
     pub(super) fn assign_slice(&mut self, object: Value, key: Value, value: Value) -> Result<()> {

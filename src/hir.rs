@@ -168,6 +168,7 @@ pub enum CoreOp {
     Unpack(usize),
     UnpackItem(usize),
     Slice,
+    GetSlice,
     Set,
     Format(String, bool),
     Join,

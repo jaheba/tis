@@ -1209,6 +1209,7 @@ impl Vm {
             CoreOp::UnpackItem(index) => {
                 self.heap.get_item(values[0], Value::Int(*index as i64))?
             }
+            CoreOp::GetSlice => self.py_get_slice(values[0], values[1], values[2], values[3])?,
             CoreOp::Slice => self.heap.allocate(Object::Slice {
                 start: values[0],
                 stop: values[1],
@@ -3134,6 +3135,14 @@ fn slice_limits(heap: &Heap, key: Value, len: usize) -> Result<(i128, i128, i128
     let Object::Slice { start, stop, step } = *heap.get(key)? else {
         return Err(Error::Type("expected slice"));
     };
+    slice_limits_parts(start, stop, step, len)
+}
+fn slice_limits_parts(
+    start: Value,
+    stop: Value,
+    step: Value,
+    len: usize,
+) -> Result<(i128, i128, i128)> {
     let len = len as i128;
     let step = if step == Value::None {
         1
@@ -3168,6 +3177,18 @@ fn slice_positions(mut start: i128, stop: i128, step: i128) -> Vec<usize> {
     indices
 }
 pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
+    let Object::Slice { start, stop, step } = *heap.get(key)? else {
+        return Err(Error::Type("expected slice"));
+    };
+    slice_parts(heap, object, start, stop, step)
+}
+fn slice_parts(
+    heap: &Heap,
+    object: Value,
+    start: Value,
+    stop: Value,
+    step: Value,
+) -> Result<Value> {
     if let Some(text) = heap.as_str(&object) {
         let ascii = heap.string_is_ascii(object)?;
         let len = if ascii {
@@ -3175,7 +3196,7 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
         } else {
             text.chars().count()
         };
-        let (start, stop, step) = slice_limits(heap, key, len)?;
+        let (start, stop, step) = slice_limits_parts(start, stop, step, len)?;
         if (step > 0 && start >= stop) || (step < 0 && start <= stop) {
             return Ok(heap.string(""));
         }
@@ -3217,7 +3238,7 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
         };
         return Ok(heap.string_owned(result));
     }
-    let (start, stop, step) = slice_limits(heap, key, heap.len(object)?)?;
+    let (start, stop, step) = slice_limits_parts(start, stop, step, heap.len(object)?)?;
     let indices = slice_positions(start, stop, step);
     Ok(match heap.get(object)? {
         Object::List(items) => heap.allocate(Object::List(

@@ -2742,6 +2742,7 @@ impl Helper {
                 | CoreOp::Compare(_)
                 | CoreOp::SetAttr(_) => count == 2,
                 CoreOp::Slice => count == 3,
+                CoreOp::GetSlice => count == 4,
                 CoreOp::Call(names) => count == names.len() + 1,
                 CoreOp::Function(_)
                 | CoreOp::Class(..)

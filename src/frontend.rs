@@ -729,9 +729,25 @@ impl Builder {
             }
             Expr::Subscript(expr) => {
                 let (next, object) = self.expression(&expr.value, block)?;
-                let (next, key) = self.expression(&expr.slice, next)?;
                 block = next;
-                self.function.append(block, Op::GetItem(object, key))
+                if let Expr::Slice(slice) = &*expr.slice {
+                    let mut values = vec![object];
+                    for part in [&slice.lower, &slice.upper, &slice.step] {
+                        let value = if let Some(expr) = part {
+                            let (next, value) = self.expression(expr, block)?;
+                            block = next;
+                            value
+                        } else {
+                            self.none(block)
+                        };
+                        values.push(value);
+                    }
+                    self.runtime(block, CoreOp::GetSlice, values)
+                } else {
+                    let (next, key) = self.expression(&expr.slice, block)?;
+                    block = next;
+                    self.function.append(block, Op::GetItem(object, key))
+                }
             }
             Expr::Slice(expr) => {
                 let mut values = vec![];
