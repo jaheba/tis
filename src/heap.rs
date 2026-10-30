@@ -319,7 +319,11 @@ pub(crate) struct NativeFieldDirectory {
 struct Generation {
     version: u32,
     live: bool,
+    ascii: Option<bool>,
 }
+
+// The cached string property fits in padding beside the live bit.
+const _: () = assert!(std::mem::size_of::<Generation>() == 8);
 
 /// Monty's stable paged arena, with generation-checked handles and explicit-root collection.
 #[derive(Debug)]
@@ -350,6 +354,10 @@ impl Heap {
 
     /// Stable pages permit allocation while another object's shared reference is alive.
     pub fn allocate(&self, object: Object) -> Value {
+        let ascii = match &object {
+            Object::String(text) => Some(text.is_ascii()),
+            _ => None,
+        };
         let id = self.entries.allocate(Entry { object });
         self.live.set(self.live.get() + 1);
         let mut generations = self.generations.borrow_mut();
@@ -358,6 +366,7 @@ impl Heap {
             generations.push(Generation {
                 version: 1,
                 live: true,
+                ascii,
             });
         } else {
             let slot = &mut generations[id.index()];
@@ -368,6 +377,7 @@ impl Heap {
                 .checked_add(1)
                 .expect("heap slot generation exhausted");
             slot.live = true;
+            slot.ascii = ascii;
         }
         let generation = generations[id.index()].version;
         if self.native_fields.get().heap != 0 {
@@ -413,6 +423,22 @@ impl Heap {
         }
     }
 
+    pub(crate) fn string_is_ascii(&self, value: Value) -> Result<bool> {
+        if let Value::InlineString(text) = value {
+            return Ok(text.as_str().is_ascii());
+        }
+        let id = self.checked_id(value)?;
+        if let Some(ascii) = self.generations.borrow()[id.index()].ascii {
+            return Ok(ascii);
+        }
+        let Object::String(text) = &self.entries.get(id).object else {
+            return Err(Error::Type("expected string"));
+        };
+        let ascii = text.is_ascii();
+        self.generations.borrow_mut()[id.index()].ascii = Some(ascii);
+        Ok(ascii)
+    }
+
     pub fn get(&self, value: Value) -> Result<&Object> {
         let id = self.checked_id(value)?;
         Ok(&self.entries.get(id).object)
@@ -420,6 +446,9 @@ impl Heap {
 
     pub fn get_mut(&mut self, value: Value) -> Result<impl DerefMut<Target = Object> + '_> {
         let id = self.checked_id(value)?;
+        // A host may replace an object or edit a String through this borrow, even if it
+        // forgets the guard. Recompute string metadata on the next read in that case.
+        self.generations.get_mut()[id.index()].ascii = None;
         let fields = if self.native_fields.get().heap != 0 {
             let rows = self.field_rows.get_mut();
             let generation = self.generations.get_mut()[id.index()].version;
@@ -511,7 +540,13 @@ impl Heap {
             return Ok(text.as_str().chars().count());
         }
         Ok(match self.get(value)? {
-            Object::String(value) => value.chars().count(),
+            Object::String(text) => {
+                if self.string_is_ascii(value)? {
+                    text.len()
+                } else {
+                    text.chars().count()
+                }
+            }
             Object::Bytes(value) => value.len(),
             Object::List(value) => value.len(),
             Object::Tuple(value) => value.len(),
@@ -782,5 +817,67 @@ mod native_field_tests {
         let rows = heap.field_rows.borrow();
         assert_eq!(rows[id.index as usize].generation, 0);
         assert!(rows[id.index as usize].values.is_null());
+    }
+}
+
+#[cfg(test)]
+mod string_property_tests {
+    use super::*;
+
+    #[test]
+    fn string_metadata_is_invalidated_before_exposing_mutable_access() {
+        let mut heap = Heap::new();
+        let text = heap.allocate(Object::String("abcdefghijklmnop".into()));
+        assert!(heap.string_is_ascii(text).unwrap());
+        {
+            let mut guard = heap.get_mut(text).unwrap();
+            let Object::String(value) = &mut *guard else {
+                unreachable!()
+            };
+            // Keep the byte length unchanged while changing the Python character count.
+            value.replace_range(..2, "é");
+            std::mem::forget(guard);
+        }
+        assert!(!heap.string_is_ascii(text).unwrap());
+        assert_eq!(heap.len(text).unwrap(), 15);
+        let key = heap.allocate(Object::Slice {
+            start: Value::Int(1),
+            stop: Value::Int(3),
+            step: Value::None,
+        });
+        let sliced = heap.get_item(text, key).unwrap();
+        assert_eq!(heap.as_str(&sliced), Some("cd"));
+        if let Object::String(value) = &mut *heap.get_mut(text).unwrap() {
+            *value = "abcdefghijklmnop".into();
+        }
+        assert!(heap.string_is_ascii(text).unwrap());
+        assert_eq!(heap.len(text).unwrap(), 16);
+    }
+
+    #[test]
+    fn string_metadata_checks_identity_and_resets_on_slot_reuse() {
+        let mut heap = Heap::new();
+        let old = heap.allocate(Object::String("abcdefghijklmnop".into()));
+        assert!(heap.string_is_ascii(old).unwrap());
+        assert!(Heap::new().string_is_ascii(old).is_err());
+        heap.collect(&[]).unwrap();
+        let new = heap.allocate(Object::String("éabcdefghijklmnop".into()));
+        let (Value::Ref(a), Value::Ref(b)) = (old, new) else {
+            unreachable!()
+        };
+        assert_eq!(a.index, b.index);
+        assert_ne!(a.generation, b.generation);
+        assert!(heap.string_is_ascii(old).is_err());
+        assert!(!heap.string_is_ascii(new).unwrap());
+        assert_eq!(heap.len(new).unwrap(), 17);
+    }
+
+    #[test]
+    fn replacing_a_non_string_object_recomputes_its_metadata() {
+        let mut heap = Heap::new();
+        let value = heap.allocate(Object::List(Vec::new().into()));
+        *heap.get_mut(value).unwrap() = Object::String("aé😀z".into());
+        assert!(!heap.string_is_ascii(value).unwrap());
+        assert_eq!(heap.len(value).unwrap(), 4);
     }
 }

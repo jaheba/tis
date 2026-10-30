@@ -3169,7 +3169,7 @@ fn slice_positions(mut start: i128, stop: i128, step: i128) -> Vec<usize> {
 }
 pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
     if let Some(text) = heap.as_str(&object) {
-        let ascii = text.is_ascii();
+        let ascii = heap.string_is_ascii(object)?;
         let len = if ascii {
             text.len()
         } else {
