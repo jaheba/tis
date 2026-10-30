@@ -2,6 +2,17 @@
 use super::*;
 
 impl Vm {
+    pub(crate) fn check_type_attribute_mutation(&self, object: Value, name: &str) -> Result<()> {
+        // Stable type identities let execution caches retain their class and inheritance guards.
+        let class_bases = name == "__bases__"
+            && (matches!(self.heap.get(object), Ok(Object::Class { .. }))
+                || matches!(self.heap.get(object), Ok(Object::Native(kind)) if types::builtin_type_name(kind)));
+        if name == "__class__" || class_bases {
+            return Err(Error::Type("class identity and class bases are read-only"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn descriptor_get(
         &mut self,
         descriptor: Value,
@@ -191,6 +202,7 @@ impl Vm {
         name: &str,
         value: Value,
     ) -> Result<Value> {
+        self.check_type_attribute_mutation(object, name)?;
         if let Some(class) = self.instance_class(object)
             && let Some(descriptor) = self.class_attribute(class, name)?
         {
@@ -227,6 +239,7 @@ impl Vm {
         attribute: &crate::Attribute,
         value: Value,
     ) -> Result<Value> {
+        self.check_type_attribute_mutation(object, &attribute.text)?;
         if !self.attribute_protocols
             && matches!(self.heap.get(object), Ok(Object::Instance { .. }))
             && !matches!(
@@ -248,6 +261,7 @@ impl Vm {
     }
 
     pub(crate) fn delete_attribute(&mut self, object: Value, name: &str) -> Result<Value> {
+        self.check_type_attribute_mutation(object, name)?;
         if self.special(object, "__delattr__")?.is_some() {
             let name = self.heap.string(name);
             self.call_special(object, "__delattr__", &[name])?;
@@ -257,6 +271,7 @@ impl Vm {
     }
 
     fn default_delete_attribute(&mut self, object: Value, name: &str) -> Result<Value> {
+        self.check_type_attribute_mutation(object, name)?;
         if let Some(class) = self.instance_class(object)
             && let Some(descriptor) = self.class_attribute(class, name)?
         {

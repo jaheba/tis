@@ -60,6 +60,9 @@ Equal inline strings share identity under `is`, including independently construc
 - Lazy single-clause generator expressions; list slice assignment/deletion and `__index__` conversions.
 - Core builtins, container methods, lazy `range`, `enumerate` and `zip`, and basic f-string formatting.
 
+Class bases and object classes are fixed at creation: assigning or deleting `C.__bases__` or `obj.__class__`
+raises `TypeError`, including through `setattr`, `delattr` and the `object` attribute bypass methods.
+
 Object protocols use class lookup, independently of instance attributes.
 Generic operations may reenter Python, allocate and mutate; their LIR effects retain full GC/deoptimization state.
 Guarded builtin operations keep non-reentrant fast paths.

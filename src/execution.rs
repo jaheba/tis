@@ -1418,6 +1418,7 @@ impl Vm {
         attribute: &crate::Attribute,
         value: Value,
     ) -> Result<Value> {
+        self.check_type_attribute_mutation(object, &attribute.text)?;
         let mut target = self.heap.get_mut(object)?;
         match &mut *target {
             Object::Instance { attributes, .. } => {

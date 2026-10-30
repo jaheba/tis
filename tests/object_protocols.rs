@@ -307,3 +307,76 @@ assert Sequence()[1:3:2] == (1,3,2)
 "#,
     );
 }
+
+#[test]
+fn class_identity_and_bases_are_read_only_across_tiers() {
+    check(
+        r#"
+class A:
+    def value(self): return 1
+class B:
+    def value(self): return 2
+class C(A): pass
+c = C()
+def store(obj, name, value):
+    setattr(obj, name, value)
+def direct(obj, change):
+    if change:
+        obj.__class__ = B
+    else:
+        obj.x = 1
+for i in range(20):
+    store(c, 'x', i)
+    direct(c, False)
+    assert c.value() == 1
+failures = 0
+for action in range(12):
+    try:
+        if action == 0: c.__class__ = B
+        elif action == 1: C.__bases__ = (B,)
+        elif action == 2: store(c, '__class__', B)
+        elif action == 3: store(C, '__bases__', (B,))
+        elif action == 4: object.__setattr__(c, '__class__', B)
+        elif action == 5: object.__setattr__(C, '__bases__', (B,))
+        elif action == 6: del c.__class__
+        elif action == 7: del C.__bases__
+        elif action == 8: delattr(c, '__class__')
+        elif action == 9: delattr(C, '__bases__')
+        elif action == 10: object.__delattr__(c, '__class__')
+        else: object.__delattr__(C, '__bases__')
+    except TypeError:
+        failures += 1
+assert failures == 12
+try:
+    direct(c, True)
+except TypeError:
+    failures += 1
+assert failures == 13
+assert type(c) is C and c.__class__ is C
+assert C.__bases__ == (A,) and c.value() == 1
+# Ordinary attributes and method replacement remain supported.
+store(c, 'x', 42)
+assert c.x == 42
+C.value = B.value
+assert c.value() == 2
+calls = []
+class Hook:
+    def __setattr__(self, name, value): calls.append(name)
+    def __delattr__(self, name): calls.append(name)
+h = Hook()
+try:
+    h.__class__ = A
+except TypeError:
+    pass
+else:
+    assert False
+try:
+    del h.__class__
+except TypeError:
+    pass
+else:
+    assert False
+assert calls == []
+"#,
+    );
+}
