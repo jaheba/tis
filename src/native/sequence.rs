@@ -222,6 +222,36 @@ pub(super) fn range_next(
         row,
         offset_of!(NativeFields, kind) as i32,
     );
+    let cached = b.ins().icmp_imm_s(IntCC::Equal, kind, 7);
+    let cached_block = b.create_block();
+    let source_block = b.create_block();
+    let ready = b.create_block();
+    for _ in 0..3 {
+        b.append_block_param(ready, types::I64);
+    }
+    b.ins().brif(cached, cached_block, &[], source_block, &[]);
+    b.switch_to_block(cached_block);
+    let start = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, class_tag) as i32,
+    );
+    let step = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, class_payload) as i32,
+    );
+    let len = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, len) as i32,
+    );
+    b.ins()
+        .jump(ready, &[start.into(), step.into(), len.into()]);
+    b.switch_to_block(source_block);
     let is_iterator = b.ins().icmp_imm_s(IntCC::Equal, kind, 6);
     guard!(is_iterator);
     let source_tag = b.ins().load(
@@ -245,21 +275,6 @@ pub(super) fn range_next(
     );
     let range = b.ins().icmp_imm_s(IntCC::Equal, kind, 5);
     guard!(range);
-    let cursor = b.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        row,
-        offset_of!(NativeFields, shape) as i32,
-    );
-    let index = b.ins().load(types::I64, MemFlagsData::new(), cursor, 0);
-    let len = b.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        source,
-        offset_of!(NativeFields, len) as i32,
-    );
-    let valid = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-    guard!(valid);
     let start = b.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -272,6 +287,26 @@ pub(super) fn range_next(
         source,
         offset_of!(NativeFields, class_payload) as i32,
     );
+    let len = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        source,
+        offset_of!(NativeFields, len) as i32,
+    );
+    b.ins()
+        .jump(ready, &[start.into(), step.into(), len.into()]);
+    b.switch_to_block(ready);
+    let values = b.block_params(ready).to_vec();
+    let (start, step, len) = (values[0], values[1], values[2]);
+    let cursor = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, shape) as i32,
+    );
+    let index = b.ins().load(types::I64, MemFlagsData::new(), cursor, 0);
+    let valid = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
+    guard!(valid);
     // Valid range members fit i64; modular intermediates preserve even extreme negative steps.
     let scaled = b.ins().imul(index, step);
     let value = b.ins().iadd(start, scaled);

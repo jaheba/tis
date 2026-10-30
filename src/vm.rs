@@ -39,8 +39,23 @@ enum FrameInput<'a> {
     },
 }
 
+/// Shared bytecode can run in different VMs, but request completion belongs to one VM.
+#[derive(Debug)]
+struct ReadyCacheIdentity(u64);
+impl Default for ReadyCacheIdentity {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(
+            NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("request cache identity exhausted"),
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Vm {
+    ready_cache_identity: ReadyCacheIdentity,
     pub heap: Heap,
     pub(crate) stack: Vec<Option<Value>>,
     pub tiering: crate::Tiering,
@@ -705,6 +720,23 @@ impl Vm {
             });
     }
 
+    pub(crate) fn bytecode_phase(
+        &self,
+        function: &Rc<RefCell<Function>>,
+    ) -> (bool, Option<crate::bytecode::ReadyWindow>) {
+        let f = function.borrow();
+        let p = f.profile.borrow();
+        let collecting = self.profiling.collecting(p.phase);
+        let quiet = (self.tiering == crate::Tiering::Bytecode
+            && self.profiling.mode == crate::profile::ProfileMode::Staged
+            && matches!(
+                p.phase,
+                crate::profile::ProfilePhase::Ready | crate::profile::ProfilePhase::Compiled
+            ))
+        .then_some((self.ready_cache_identity.0, p.windows, self.numeric));
+        (collecting, quiet)
+    }
+
     pub(crate) fn collecting(&self, function: &Rc<RefCell<Function>>) -> bool {
         self.profiling
             .collecting(function.borrow().profile.borrow().phase)
@@ -1106,12 +1138,24 @@ impl Vm {
         block: usize,
         previous: Option<usize>,
     ) -> Result<(bool, bool)> {
+        self.record_block_and_phase_batched(function, code, block, previous, None)
+    }
+
+    pub(crate) fn record_block_and_phase_batched(
+        &mut self,
+        function: &Rc<RefCell<Function>>,
+        code: &Code,
+        block: usize,
+        previous: Option<usize>,
+        mut pending: Option<&mut [u64]>,
+    ) -> Result<(bool, bool)> {
         let backedge = previous.is_some_and(|from| {
             code.backedge_sources
                 .get(block)
                 .is_some_and(|sources| sources.contains(&from))
         });
         let mut collecting;
+        let completed;
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
@@ -1127,16 +1171,56 @@ impl Vm {
                     *count = count.saturating_add(1);
                 }
             }
+            completed = self.tiering == crate::Tiering::Bytecode
+                && self.profiling.mode == crate::profile::ProfileMode::Staged
+                && matches!(
+                    profile.phase,
+                    crate::profile::ProfilePhase::Ready | crate::profile::ProfilePhase::Compiled
+                )
+                && code.ready_windows[block].get()
+                    == Some((self.ready_cache_identity.0, profile.windows, self.numeric));
+
+            if let Some(counts) = pending.as_deref_mut()
+                && (collecting || (backedge && !completed))
+            {
+                code.flush_backedges(&mut profile, counts);
+            }
             if let Some(previous) = previous
                 && backedge
             {
-                let count = profile.backedges.entry((previous, block)).or_default();
-                *count = count.saturating_add(1);
+                if completed && let Some(counts) = pending {
+                    let slot = code.backedge_sources[block]
+                        .iter()
+                        .position(|from| *from == previous)
+                        .unwrap();
+                    let count = &mut counts[code.backedge_offsets[block] + slot];
+                    *count = count.saturating_add(1);
+                } else {
+                    let count = profile.backedges.entry((previous, block)).or_default();
+                    *count = count.saturating_add(1);
+                }
             }
         }
-        if backedge {
+        if backedge && !completed {
             self.consider_compilation(function, crate::profile::Hotspot::Loop { header: block });
-            collecting = self.collecting(function);
+            let f = function.borrow();
+            let p = f.profile.borrow();
+            if self.tiering == crate::Tiering::Bytecode
+                && self.profiling.mode == crate::profile::ProfileMode::Staged
+                && self.thresholds.loop_backedges != 0
+                && p.loop_count(crate::hir::BlockId(block)) >= self.thresholds.loop_backedges
+                && matches!(
+                    p.phase,
+                    crate::profile::ProfilePhase::Ready | crate::profile::ProfilePhase::Compiled
+                )
+            {
+                code.ready_windows[block].set(Some((
+                    self.ready_cache_identity.0,
+                    p.windows,
+                    self.numeric,
+                )));
+            }
+            collecting = self.profiling.collecting(p.phase);
         }
         Ok((backedge, collecting))
     }

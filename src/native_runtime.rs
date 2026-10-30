@@ -805,6 +805,7 @@ impl Context<'_> {
             let size = vm.heap.len(source)?;
             let iterator = vm.heap.allocate(crate::Object::Iterator {
                 source,
+                range: None,
                 index: 0.into(),
                 size,
                 exhausted: false,

@@ -16,7 +16,7 @@ fn resolve(mut value: ValueId, aliases: &[Option<ValueId>]) -> ValueId {
     }
     value
 }
-fn rewrite(op: &mut Op, map: impl Fn(ValueId) -> ValueId) {
+pub(super) fn rewrite(op: &mut Op, map: impl Fn(ValueId) -> ValueId) {
     let remap = |v: &mut ValueId| *v = map(*v);
     match op {
         Op::Constant(_) => {}

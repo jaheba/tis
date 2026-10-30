@@ -1,5 +1,6 @@
 mod analysis;
 mod builtins;
+mod comprehension;
 mod promote;
 mod view;
 pub use analysis::Analysis;

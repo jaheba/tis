@@ -55,6 +55,13 @@ pub(crate) struct Transfer {
     pub target: usize,
     pub pairs: Vec<(ValueId, ValueId)>,
 }
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IteratorBranch {
+    pub done: ValueId,
+    pub yes: usize,
+    pub no: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RegisterCode {
     pub body: Vec<Instruction>,
@@ -63,6 +70,7 @@ pub(crate) struct RegisterCode {
     pub fields: Vec<crate::Attribute>,
     // Cells allow recursive frames to share quickening without retaining a mutable code borrow.
     pub numeric: Vec<Cell<Option<Plan>>>,
+    pub iterator_branches: Vec<Option<IteratorBranch>>,
     quickened_window: Cell<Option<u32>>,
     pub max_arguments: usize,
     pub max_transfer: usize,
@@ -184,6 +192,18 @@ impl RegisterCode {
                     Op::Runtime(CoreOp::Iter, inputs) => (Opcode::Iter, inputs[0].0, 0, 0),
                     Op::Runtime(CoreOp::Next, inputs) => (Opcode::Next, inputs[0].0, 0, 0),
                     Op::Runtime(CoreOp::IsDone, inputs) => (Opcode::IsDone, inputs[0].0, 0, 0),
+                    Op::Runtime(CoreOp::UnpackItem(index), inputs)
+                        if u32::try_from(*index).is_ok()
+                            && site.runtime.is_some_and(|r| r < u32::MAX as usize) =>
+                    {
+                        // GetItem c=0 reads a register index; c>0 keeps an unpack runtime pool id + 1.
+                        (
+                            Opcode::GetItem,
+                            inputs[0].0,
+                            *index,
+                            site.runtime.unwrap() + 1,
+                        )
+                    }
                     Op::Runtime(CoreOp::LoadLocal(slot), _) => (Opcode::LoadLocal, *slot, 0, 0),
                     Op::Runtime(CoreOp::StoreLocal(slot), inputs) => {
                         (Opcode::StoreLocal, *slot, inputs[0].0, 0)
@@ -259,6 +279,24 @@ impl RegisterCode {
                 .blocks
                 .get(edge.target)
                 .ok_or(Error::InvalidIr("register edge target"))?;
+        }
+        output.iterator_branches.resize(output.body.len(), None);
+        for (index, instructions) in output.body.windows(3).enumerate() {
+            let [next, done, branch] = instructions else {
+                unreachable!()
+            };
+            if matches!(next.op, Opcode::Next)
+                && matches!(done.op, Opcode::IsDone)
+                && done.a == next.dst
+                && matches!(branch.op, Opcode::Branch)
+                && branch.a == done.dst
+            {
+                output.iterator_branches[index] = Some(IteratorBranch {
+                    done: ValueId(done.dst as usize),
+                    yes: branch.b as usize,
+                    no: branch.c as usize,
+                });
+            }
         }
         Ok(output)
     }

@@ -115,6 +115,7 @@ fn length_failure_preserves_iterator_progress_and_prior_effects() {
     let input = rows(&vm, vec![good, wrong, good]);
     let it = vm.heap.allocate(Object::Iterator {
         source: input,
+        range: None,
         index: 0.into(),
         size: 3,
         exhausted: false,
@@ -261,6 +262,7 @@ fn float_iteration_reads_updates_and_exhaustion_remains_sticky() {
     let source = floats(&other, &[1.0, 2.0, 3.0]);
     let iter = other.heap.allocate(Object::Iterator {
         source,
+        range: None,
         index: 0.into(),
         size: 3,
         exhausted: false,
@@ -621,6 +623,7 @@ fn closed_nest_failure_preserves_partial_writes_and_consumed_outer_item() {
         .unwrap();
     let steps = vm.heap.allocate(Object::Iterator {
         source: steps,
+        range: None,
         index: 0.into(),
         size: 7,
         exhausted: false,
@@ -683,6 +686,7 @@ fn inner_iterator_alias_preserves_shared_exhaustion() {
         .unwrap();
     let iterator = vm.heap.allocate(Object::Iterator {
         source: input,
+        range: None,
         index: 0.into(),
         size: 3,
         exhausted: false,

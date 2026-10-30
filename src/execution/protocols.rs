@@ -198,6 +198,9 @@ impl Vm {
     }
 
     pub(crate) fn py_truth(&mut self, value: Value) -> Result<bool> {
+        if !matches!(value, Value::Ref(_)) {
+            return runtime::truth(&self.heap, value);
+        }
         if self.not_implemented(value) {
             return Err(Error::Type("NotImplemented has no truth value"));
         }
@@ -226,6 +229,9 @@ impl Vm {
     }
 
     pub(crate) fn py_get_item(&mut self, object: Value, key: Value) -> Result<Value> {
+        if let Some(value) = crate::sequence::get_builtin(&self.heap, object, key)? {
+            return Ok(value);
+        }
         if !matches!(object, Value::Ref(_) | Value::InlineString(_)) {
             return Err(Error::Type("object is not subscriptable"));
         }
@@ -254,6 +260,9 @@ impl Vm {
     }
 
     pub(crate) fn py_set_item(&mut self, object: Value, key: Value, value: Value) -> Result<()> {
+        if crate::sequence::set(&mut self.heap, object, key, value)? {
+            return Ok(());
+        }
         if !matches!(object, Value::Ref(_)) {
             return Err(Error::Type("object does not support item assignment"));
         }

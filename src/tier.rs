@@ -72,6 +72,7 @@ pub struct TierStats {
     pub native_inline_field_hits: u64,
     pub native_inline_blocks: u64,
     pub native_body_inlines: u64,
+    pub bytecode_fused_iterations: u64,
     pub bytecode_positional_calls: u64,
     pub bytecode_leaf_calls: u64,
     pub bytecode_method_calls: u64,

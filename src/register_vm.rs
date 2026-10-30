@@ -11,6 +11,7 @@ pub(crate) struct RegisterScratch {
     arguments: Vec<Value>,
     transfers: Vec<Value>,
     methods: Vec<(ValueId, Value, &'static str)>,
+    backedges: Vec<u64>,
 }
 
 impl Vm {
@@ -31,6 +32,9 @@ impl Vm {
             self.tier_stats.register_scratch_creations += 1;
             RegisterScratch::default()
         };
+        scratch
+            .backedges
+            .resize(*code.backedge_offsets.last().unwrap(), 0);
         let result = self.execute_register_inner(
             function,
             code,
@@ -40,6 +44,13 @@ impl Vm {
             previous,
             &mut scratch,
         );
+        if !scratch.backedges.is_empty() {
+            code.flush_backedges(
+                &mut function.borrow().profile.borrow_mut(),
+                &mut scratch.backedges,
+            );
+        }
+        scratch.backedges.clear();
         scratch.arguments.clear();
         scratch.transfers.clear();
         scratch.methods.clear();
@@ -59,14 +70,18 @@ impl Vm {
         scratch: &mut RegisterScratch,
     ) -> Result<Value> {
         let register = &code.register;
-        let mut collecting = self.collecting(function);
+        let (mut collecting, mut quiet_window) = self.bytecode_phase(function);
         let RegisterScratch {
             arguments,
             transfers,
             methods,
+            backedges,
         } = scratch;
         arguments.reserve(register.max_arguments.min(8));
         transfers.reserve(register.max_transfer);
+        // Frame setup may allocate. Thereafter only allocating/reentrant instructions and
+        // deferred method materialization need collection polls; pure dispatch cannot add pressure.
+        self.maybe_collect()?;
         // Prepared receivers remain rooted in their caller's register window.
         loop {
             let instruction = *register
@@ -81,10 +96,34 @@ impl Vm {
             let op = instruction.op;
             match op {
                 Opcode::EnterBlock => {
-                    self.materialize_methods(base, methods)?;
-                    let (backedge, phase) =
-                        self.record_block_and_phase(function, code, a, previous)?;
+                    if !methods.is_empty() {
+                        self.materialize_methods(base, methods)?;
+                        self.maybe_collect()?;
+                    }
+                    if let Some(window) = quiet_window {
+                        let sources = &code.backedge_sources[a];
+                        let slot = previous
+                            .and_then(|from| sources.iter().position(|source| *source == from));
+                        // Pure blocks cannot reopen feedback. New hot headers retain the original
+                        // admission path; completed headers accumulate exact frame-local counts.
+                        if slot.is_none() || code.ready_windows[a].get() == Some(window) {
+                            if let Some(slot) = slot {
+                                let count = &mut backedges[code.backedge_offsets[a] + slot];
+                                *count = count.saturating_add(1);
+                            }
+                            previous = Some(a);
+                            continue;
+                        }
+                    }
+                    let (backedge, phase) = self.record_block_and_phase_batched(
+                        function,
+                        code,
+                        a,
+                        previous,
+                        Some(backedges),
+                    )?;
                     collecting = phase;
+                    quiet_window = self.bytecode_phase(function).1;
                     previous = Some(a);
                     if backedge
                         && let Some(lir) = self.artifact(code.function, code.revision)
@@ -102,16 +141,19 @@ impl Vm {
                         )?;
                         return self.finish_lir(function, code, base, frame_end, outcome);
                     }
-                    self.maybe_collect()?;
                     continue;
                 }
                 Opcode::Jump | Opcode::Branch => {
                     let edge = if matches!(op, Opcode::Jump) {
                         a
-                    } else if self.py_truth(self.read(base, ValueId(a))?)? {
-                        b
                     } else {
-                        c
+                        let value = self.read(base, ValueId(a))?;
+                        let truth = self.py_truth(value)?;
+                        if matches!(value, Value::Ref(_)) {
+                            self.maybe_collect()?;
+                            (collecting, quiet_window) = self.bytecode_phase(function);
+                        }
+                        if truth { b } else { c }
                     };
                     let edge = register
                         .edges
@@ -131,6 +173,46 @@ impl Vm {
                 Opcode::Return => return self.read(base, ValueId(a)),
                 _ => {}
             }
+            if !collecting && let Some(branch) = register.iterator_branches[instruction_index] {
+                // Keep both HIR results and the original instruction offsets. Active feedback and
+                // reconstruction after Next still use the unfused body; no iterator call is repeated.
+                let iterator = self.read(base, ValueId(a))?;
+                let (value, entered_runtime) = if let Some(value) = self.try_range_next(iterator)? {
+                    (value, false)
+                } else {
+                    (self.next(iterator)?, true)
+                };
+                self.write(base, ValueId(instruction.dst as usize), value)?;
+                if entered_runtime {
+                    self.maybe_collect()?;
+                    (collecting, quiet_window) = self.bytecode_phase(function);
+                    if collecting {
+                        continue;
+                    }
+                }
+                self.tier_stats.bytecode_fused_iterations += 1;
+                let done = self.is_done(value);
+                self.write(base, branch.done, Value::Bool(done))?;
+                let edge = &register.edges[if done { branch.yes } else { branch.no }];
+                transfers.clear();
+                for (_, source) in &edge.pairs {
+                    transfers.push(self.read(base, *source)?);
+                }
+                for ((destination, _), value) in edge.pairs.iter().zip(transfers.iter()) {
+                    self.write(base, *destination, *value)?;
+                }
+                ip = edge.target;
+                continue;
+            }
+            let mut checkpoint = !matches!(
+                op,
+                Opcode::IsDone
+                    | Opcode::LoadLocal
+                    | Opcode::StoreLocal
+                    | Opcode::CheckLocal
+                    | Opcode::LoadName
+                    | Opcode::StoreName
+            );
             if collecting && !methods.is_empty() {
                 self.materialize_methods(base, methods)?;
             }
@@ -152,7 +234,7 @@ impl Vm {
                             self.tier_stats.numeric_type_misses =
                                 self.tier_stats.numeric_type_misses.saturating_add(1);
                             self.numeric_miss(function, destination, left, right, observed);
-                            collecting = self.collecting(function);
+                            (collecting, quiet_window) = self.bytecode_phase(function);
                             observed = true;
                             None
                         }
@@ -171,6 +253,7 @@ impl Vm {
                 None
             };
             let result = if let Some(value) = specialized {
+                checkpoint = false;
                 value
             } else {
                 match op {
@@ -179,7 +262,10 @@ impl Vm {
                         .get(a)
                         .ok_or(Error::InvalidIr("register constant"))?
                     {
-                        crate::bytecode::EncodedConstant::Immediate(value) => *value,
+                        crate::bytecode::EncodedConstant::Immediate(value) => {
+                            checkpoint = false;
+                            *value
+                        }
                         crate::bytecode::EncodedConstant::String(value) => {
                             self.intern_literal(value, &code.literal_cache[a])
                         }
@@ -189,7 +275,7 @@ impl Vm {
                         let rhs = self.read(base, ValueId(b))?;
                         let (result, force) = self.adaptive_add(function, destination, lhs, rhs)?;
                         if force {
-                            collecting = self.collecting(function);
+                            (collecting, quiet_window) = self.bytecode_phase(function);
                             observed = true;
                         }
                         result
@@ -215,14 +301,36 @@ impl Vm {
                             self.py_compare(if c == 0 { "==" } else { "!=" }, left, right)?
                         }
                     }
-                    Opcode::GetItem => self
-                        .py_get_item(self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)?,
+                    Opcode::GetItem => {
+                        let object = self.read(base, ValueId(a))?;
+                        let key = if c == 0 {
+                            self.read(base, ValueId(b))?
+                        } else {
+                            Value::Int(b as i64)
+                        };
+                        if let Some(value) = crate::sequence::get_builtin(&self.heap, object, key)?
+                        {
+                            checkpoint = false;
+                            value
+                        } else {
+                            if c == 0 {
+                                self.py_get_item(object, key)?
+                            } else {
+                                self.operation(&code.operations[c - 1].0, &[object])?
+                            }
+                        }
+                    }
                     Opcode::SetItem => {
-                        self.py_set_item(
+                        let (object, key, value) = (
                             self.read(base, ValueId(a))?,
                             self.read(base, ValueId(b))?,
                             self.read(base, ValueId(c))?,
-                        )?;
+                        );
+                        if crate::sequence::set(&mut self.heap, object, key, value)? {
+                            checkpoint = false;
+                        } else {
+                            self.py_set_item(object, key, value)?;
+                        }
                         Value::None
                     }
                     Opcode::Len => Value::Int(self.py_len(self.read(base, ValueId(a))?)?),
@@ -244,7 +352,15 @@ impl Vm {
                         Value::None
                     }
                     Opcode::Iter => self.iter(self.read(base, ValueId(a))?)?,
-                    Opcode::Next => self.next(self.read(base, ValueId(a))?)?,
+                    Opcode::Next => {
+                        let iterator = self.read(base, ValueId(a))?;
+                        if let Some(value) = self.try_range_next(iterator)? {
+                            checkpoint = false;
+                            value
+                        } else {
+                            self.next(iterator)?
+                        }
+                    }
                     Opcode::IsDone => Value::Bool(self.is_done(self.read(base, ValueId(a))?)),
                     Opcode::LoadLocal => self.load_local(a)?,
                     Opcode::StoreLocal => {
@@ -257,13 +373,39 @@ impl Vm {
                         value
                     }
                     Opcode::GetAttr => {
-                        self.get_attribute(self.read(base, ValueId(b))?, &register.fields[a])?
+                        let object = self.read(base, ValueId(b))?;
+                        let field = &register.fields[a];
+                        if let Some(value) =
+                            self.try_plain_attribute(object, &field.text, Some(field))
+                        {
+                            checkpoint = false;
+                            value
+                        } else {
+                            self.get_attribute(object, field)?
+                        }
                     }
-                    Opcode::SetAttr => self.set_attribute(
-                        self.read(base, ValueId(b))?,
-                        &register.fields[a],
-                        self.read(base, ValueId(c))?,
-                    )?,
+                    Opcode::SetAttr => {
+                        let object = self.read(base, ValueId(b))?;
+                        let field = &register.fields[a];
+                        // Exception attributes may normalize an iterable through Python callbacks.
+                        if !self.attribute_protocols
+                            && matches!(self.heap.get(object), Ok(Object::Instance { .. }))
+                            && !matches!(
+                                field.text.as_str(),
+                                "args"
+                                    | "__cause__"
+                                    | "__context__"
+                                    | "__suppress_context__"
+                                    | "__traceback__"
+                                    | "__class__"
+                            )
+                        {
+                            checkpoint = false;
+                            self.raw_set_attribute(object, field, self.read(base, ValueId(c))?)?
+                        } else {
+                            self.set_attribute(object, field, self.read(base, ValueId(c))?)?
+                        }
+                    }
                     Opcode::PrepareMethod => {
                         let receiver = self.read(base, ValueId(a))?;
                         let (operation, _) = &code.operations[b];
@@ -357,7 +499,10 @@ impl Vm {
                     .result
                     .observe(crate::profile::ValueKind::of(&self.heap, result));
             }
-            self.maybe_collect()?;
+            if checkpoint {
+                self.maybe_collect()?;
+                (collecting, quiet_window) = self.bytecode_phase(function);
+            }
         }
     }
 }

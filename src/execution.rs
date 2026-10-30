@@ -1593,6 +1593,7 @@ impl Vm {
         if let Value::InlineString(text) = source {
             return Ok(self.heap.allocate(Object::Iterator {
                 source,
+                range: None,
                 index: 0.into(),
                 size: text.as_str().chars().count(),
                 exhausted: false,
@@ -1624,6 +1625,7 @@ impl Vm {
             if self.special(source, "__getitem__")?.is_some() {
                 return Ok(self.heap.allocate(Object::Iterator {
                     source,
+                    range: None,
                     index: 0.into(),
                     size: 0,
                     exhausted: false,
@@ -1632,8 +1634,13 @@ impl Vm {
             return Err(Error::Type("object is not iterable"));
         }
         let size = self.heap.len(source)?;
+        let range = match self.heap.get(source)? {
+            Object::Range { start, step, .. } => Some((*start, *step)),
+            _ => None,
+        };
         Ok(self.heap.allocate(Object::Iterator {
             source,
+            range,
             index: 0.into(),
             size,
             exhausted: false,
@@ -1670,9 +1677,10 @@ impl Vm {
     }
 
     /// Probe an unfinished builtin range iterator without allocating the end sentinel.
-    pub(crate) fn try_range_next(&mut self, iterator: Value) -> Result<Option<Value>> {
+    pub(crate) fn try_range_next(&self, iterator: Value) -> Result<Option<Value>> {
         let Ok(Object::Iterator {
             source,
+            range,
             index,
             size,
             exhausted: false,
@@ -1680,25 +1688,29 @@ impl Vm {
         else {
             return Ok(None);
         };
-        let (source, index, size) = (*source, index.get(), *size);
-        if index >= size {
+        let position = index.get();
+        if position >= *size {
             return Ok(None);
         }
-        let Object::Range { start, step, .. } = self.heap.get(source)? else {
+        let (start, step) = if let Some(range) = range {
+            *range
+        } else if let Ok(Object::Range { start, step, .. }) = self.heap.get(*source) {
+            (*start, *step)
+        } else {
             return Ok(None);
         };
-        let Some(value) =
-            i64::try_from(i128::from(*start) + index as i128 * i128::from(*step)).ok()
+        let Ok(value) = i64::try_from(i128::from(start) + position as i128 * i128::from(step))
         else {
             return Ok(None);
         };
-        if let Object::Iterator { index, .. } = &mut *self.heap.get_mut(iterator)? {
-            index.set(index.get() + 1);
-        }
+        index.set(position + 1);
         Ok(Some(Value::Int(value)))
     }
 
     pub(crate) fn next(&mut self, iterator: Value) -> Result<Value> {
+        if let Some(value) = self.try_range_next(iterator)? {
+            return Ok(value);
+        }
         self.next_at(iterator, 0)
     }
 
@@ -1713,6 +1725,7 @@ impl Vm {
                 index,
                 size,
                 exhausted,
+                ..
             } => Some((*source, index.get(), *size, *exhausted)),
             _ => None,
         };
@@ -1781,6 +1794,7 @@ impl Vm {
         if index >= len {
             *self.heap.get_mut(iterator)? = Object::Iterator {
                 source,
+                range: None,
                 index: index.into(),
                 size,
                 exhausted: true,

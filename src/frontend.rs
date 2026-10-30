@@ -94,6 +94,7 @@ struct Builder {
     except_depth: usize,
     control: bool,
     external_loop: bool,
+    class_scope: bool,
     super_parameter: Option<String>,
 }
 impl Builder {
@@ -120,6 +121,7 @@ impl Builder {
             except_depth: 0,
             control: false,
             external_loop: false,
+            class_scope: false,
             super_parameter: None,
         })
     }
@@ -351,6 +353,7 @@ impl Builder {
                     }
                 }
                 let mut body = Self::new(&stmt.body, false)?;
+                body.class_scope = true;
                 body.function.name = format!("<class {}>", stmt.name);
                 let end = body.statements(&stmt.body, Some(body.function.entry()))?;
                 body.finish(end)?;
@@ -1235,6 +1238,15 @@ impl Builder {
         };
         let end = body.comp_loop(generators, 0, element, value, kind, result, entry)?;
         body.function.terminate(end, Terminator::Return(result));
+        if !self.function.module
+            && !self.control
+            && !self.class_scope
+            && let Some(result) = self
+                .function
+                .inline_comprehension(&body.function, block, source)
+        {
+            return Ok(result);
+        }
         let function = self.runtime(block, CoreOp::Function(Box::new(body.function)), vec![]);
         let value = self.runtime(block, CoreOp::Call(vec![None]), vec![function, source]);
         Ok((block, value))

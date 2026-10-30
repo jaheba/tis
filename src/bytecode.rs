@@ -17,6 +17,8 @@ pub enum BytecodeMode {
     Register,
 }
 
+pub(crate) type ReadyWindow = (u64, u32, crate::NumericMode);
+
 #[derive(Debug, Clone)]
 pub struct Code {
     pub(crate) register: register::RegisterCode,
@@ -24,6 +26,8 @@ pub struct Code {
     pub function: crate::profile::FunctionId,
     pub revision: u64,
     pub(crate) backedge_sources: Vec<Vec<usize>>,
+    pub(crate) backedge_offsets: Vec<usize>,
+    pub(crate) ready_windows: Vec<std::cell::Cell<Option<ReadyWindow>>>,
     pub(crate) sites: Vec<Option<Site>>,
     offsets: Vec<Vec<usize>>,
     block_offsets: Vec<usize>,
@@ -122,11 +126,32 @@ impl Opcode {
 }
 
 impl Code {
+    /// Merge invocation-owned quiet counts without changing detailed observation windows.
+    pub(crate) fn flush_backedges(
+        &self,
+        profile: &mut crate::profile::FunctionProfile,
+        pending: &mut [u64],
+    ) {
+        for (to, sources) in self.backedge_sources.iter().enumerate() {
+            for (slot, &from) in sources.iter().enumerate() {
+                let count = std::mem::take(&mut pending[self.backedge_offsets[to] + slot]);
+                if count != 0 {
+                    let edge = profile.backedges.entry((from, to)).or_default();
+                    *edge = edge.saturating_add(count);
+                }
+            }
+        }
+    }
+
     pub fn lower(function: &Function) -> Result<Self> {
         // Bytecode roots its register window; liveness snapshots are needed only by LIR.
         let mut backedge_sources = vec![Vec::new(); function.blocks.len()];
         for (from, to) in function.validated_backedges()? {
             backedge_sources[to].push(from);
+        }
+        let mut backedge_offsets = vec![0];
+        for sources in &backedge_sources {
+            backedge_offsets.push(backedge_offsets.last().unwrap() + sources.len());
         }
         let mut sites = vec![None; function.value_count];
         for block in &function.blocks {
@@ -146,6 +171,8 @@ impl Code {
                 function: function.id(),
                 revision: function.revision(),
                 backedge_sources,
+                backedge_offsets,
+                ready_windows: vec![std::cell::Cell::new(None); function.blocks.len()],
                 sites,
                 offsets: Vec::new(),
                 block_offsets: Vec::new(),

@@ -111,6 +111,35 @@ An internal unbound marker crosses joins without becoming Python `None`.
 Names referenced anywhere in a nested scope conservatively stay in shared environments, even when shadowed there.
 Module/class namespaces and global/nonlocal bindings retain their named lookup rules.
 
+## Eager comprehension lowering
+
+Eligible list, set and dict comprehensions that capture an enclosing function local share its HIR control flow.
+Their targets become SSA values within the comprehension blocks, so shadowing does not leak into the caller.
+The first iterable is evaluated before entering the private scope. Ordinary local promotion then keeps
+uncaptured outer values in SSA, including a sieve's flag list used by its result comprehension.
+
+Comprehensions without that capture benefit keep smaller separately compiled functions.
+Comprehensions that create escaping callables or generators, inspect frame state, or may read an unbound target
+retain separate frames. Module/class scopes and exception-control fragments also retain the original path.
+Callbacks that mutate an outer cell still read the live environment binding; lowering does not snapshot captures.
+
+## Register bytecode dispatch
+
+Exact list/tuple indexing and checked unpack reads, boxed-list stores, primitive truth tests and builtin range stepping
+use guarded runtime services. Custom protocols and unsupported operand kinds retain ordinary Python dispatch.
+Range iterators cache immutable start/step parameters while retaining their real shared cursor.
+Ordinary instance-field reads and writes skip collection/profile polls while the descriptor/hook guard holds.
+
+Quiet iterator headers combine Next, exhaustion checking and branching without changing HIR result identities
+or instruction offsets. Eager/active feedback uses the unfused path; reconstruction after Next resumes at its original offset.
+Register frames batch completed-window backedge counters and merge them before new admission or on return/error.
+New loop headers still reach their thresholds independently. Completion caches include VM identity, window and numeric mode;
+new feedback windows and tier changes retain normal admission.
+
+Collection polls remain at frame entry, after allocating/reentrant instructions, custom truth callbacks and deferred
+method materialization. Exact scalar and builtin operations cannot add allocation pressure between those checkpoints.
+`TierStats::bytecode_fused_iterations` reports quiet iterator-header executions.
+
 ## Values and heap lifetimes
 
 `Value` and `Option<Value>` are 16 bytes, including full-width `i64` and `f64` payloads.

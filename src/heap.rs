@@ -90,6 +90,8 @@ pub enum Object {
     },
     Iterator {
         source: Value,
+        /// Builtin ranges are immutable in Python; cache their numeric parameters at construction.
+        range: Option<(i64, i64)>,
         // UTF-8 byte offset for strings; element index for other sequences.
         index: Cell<usize>,
         size: usize,
@@ -171,7 +173,7 @@ struct Entry {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NativeFields {
-    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = float list, 5 = range, 6 = iterator.
+    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = float list, 5 = range, 6 = iterator, 7 = cached range iterator.
     pub(crate) kind: u64,
     pub(crate) class_tag: u64,
     pub(crate) class_payload: u64,
@@ -230,10 +232,26 @@ impl NativeFields {
                 }
             }
             Object::Iterator {
+                range: Some((start, step)),
+                index,
+                size,
+                exhausted: false,
+                ..
+            } => Self {
+                kind: 7,
+                generation: generation as u64,
+                class_tag: *start as u64,
+                class_payload: *step as u64,
+                shape: index.as_ptr() as u64,
+                len: *size,
+                ..Self::default()
+            },
+            Object::Iterator {
                 source,
                 index,
                 size,
                 exhausted: false,
+                ..
             } => {
                 let source = crate::native_abi::Slot::boxed(*source);
                 Self {

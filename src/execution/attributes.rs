@@ -148,12 +148,12 @@ impl Vm {
         self.builtin_attribute(object, name, cached)
     }
 
-    pub(crate) fn protocol_get_attribute(
+    pub(crate) fn try_plain_attribute(
         &mut self,
         object: Value,
         name: &str,
         cached: Option<&crate::Attribute>,
-    ) -> Result<Value> {
+    ) -> Option<Value> {
         // No descriptor or hook can precede an instance field until this guard is invalidated.
         if !self.attribute_protocols
             && name != "__class__"
@@ -168,8 +168,20 @@ impl Vm {
                 if hit {
                     self.tier_stats.shape_read_hits += 1;
                 }
-                return Ok(value);
+                return Some(value);
             }
+        }
+        None
+    }
+
+    pub(crate) fn protocol_get_attribute(
+        &mut self,
+        object: Value,
+        name: &str,
+        cached: Option<&crate::Attribute>,
+    ) -> Result<Value> {
+        if let Some(value) = self.try_plain_attribute(object, name, cached) {
+            return Ok(value);
         }
         if self.instance_class(object).is_none() {
             return self.default_get_attribute(object, name, cached);

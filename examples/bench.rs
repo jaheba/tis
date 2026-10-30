@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run_ns = sample(&mut vm)?;
         let stats = &vm.tier_stats;
         println!(
-            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"sequence_loads\":{},\"list_stores\":{},\"range_steps\":{},\"inline_field_hits\":{},\"inline_blocks\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{},\"positional_frames\":{},\"scratch_creations\":{},\"scratch_reuses\":{},\"shape_reads\":{},\"shape_writes\":{},\"body_inlines\":{},\"leaf_body_inlines\":{},\"native_leaf_entry_batches\":{},\"virtual_tuple_returns\":{},\"readonly_entries\":{},\"readonly_misses\":{},\"mutation_entries\":{},\"mutation_writes\":{},\"mutation_guard_exits\":{},\"mutation_cold_misses\":{},\"compilation_errors_total\":{}}}",
+            "{{\"run_ns\":{run_ns},\"validated\":true,\"backend_compile_ns\":{},\"deoptimizations\":{},\"runtime_calls\":{},\"root_syncs\":{},\"field_hits\":{},\"sequence_loads\":{},\"list_stores\":{},\"range_steps\":{},\"inline_field_hits\":{},\"inline_blocks\":{},\"fused_iterations\":{},\"positional_calls\":{},\"leaf_calls\":{},\"method_calls\":{},\"literal_hits\":{},\"interned_literals\":{},\"name_hits\":{},\"positional_frames\":{},\"scratch_creations\":{},\"scratch_reuses\":{},\"shape_reads\":{},\"shape_writes\":{},\"body_inlines\":{},\"leaf_body_inlines\":{},\"native_leaf_entry_batches\":{},\"virtual_tuple_returns\":{},\"readonly_entries\":{},\"readonly_misses\":{},\"mutation_entries\":{},\"mutation_writes\":{},\"mutation_guard_exits\":{},\"mutation_cold_misses\":{},\"compilation_errors_total\":{}}}",
             stats.native_compile_ns + stats.copy_patch_compile_ns
                 - before.native_compile_ns
                 - before.copy_patch_compile_ns,
@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats.native_range_steps - before.native_range_steps,
             stats.native_inline_field_hits - before.native_inline_field_hits,
             stats.native_inline_blocks - before.native_inline_blocks,
+            stats.bytecode_fused_iterations - before.bytecode_fused_iterations,
             stats.bytecode_positional_calls - before.bytecode_positional_calls,
             stats.bytecode_leaf_calls - before.bytecode_leaf_calls,
             stats.bytecode_method_calls - before.bytecode_method_calls,
