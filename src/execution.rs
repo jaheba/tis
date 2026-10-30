@@ -1,5 +1,6 @@
 //! Lexical environments and Python object operations shared by execution backends.
 mod attributes;
+mod bytes;
 mod exceptions;
 use exceptions::exception_parent;
 mod context;
@@ -110,6 +111,7 @@ fn error(message: impl Into<String>) -> Error {
 
 fn builtin_method_name(name: &str) -> Result<&'static str> {
     Ok(match name {
+        "encode" => "encode",
         "append" => "append",
         "extend" => "extend",
         "pop" => "pop",
@@ -151,7 +153,11 @@ pub(crate) fn visit_children(object: &Object, mut visit: impl FnMut(Value)) {
         }
     };
     match object {
-        Object::List(values) if !values.is_float() => values.iter().copied().for_each(edge),
+        Object::List(values) => {
+            if let Some(values) = values.native_values() {
+                values.iter().copied().for_each(edge);
+            }
+        }
         Object::Property {
             get,
             set,
@@ -252,6 +258,9 @@ impl Vm {
             "BaseException",
             "Exception",
             "ValueError",
+            "UnicodeError",
+            "UnicodeDecodeError",
+            "UnicodeEncodeError",
             "TypeError",
             "RuntimeError",
             "StopIteration",
@@ -272,6 +281,7 @@ impl Vm {
             "str",
             "repr",
             "bool",
+            "bytes",
             "abs",
             "sum",
             "min",
@@ -779,6 +789,12 @@ impl Vm {
                     return self.sort_list(receiver, arguments, keywords);
                 }
                 if !keywords.is_empty() {
+                    if (name == "decode" && matches!(self.heap.get(receiver), Ok(Object::Bytes(_))))
+                        || (name == "encode" && self.heap.as_str(&receiver).is_some())
+                    {
+                        let bound = self.bytes_keywords(arguments, keywords, false)?;
+                        return self.method(receiver, &name, &bound);
+                    }
                     return Err(error("method keyword arguments unsupported"));
                 }
                 self.method(receiver, &name, arguments)
@@ -843,6 +859,7 @@ impl Vm {
             .last()
             .ok_or(Error::InvalidIr("missing frame environment"))?;
         Ok(match operation {
+            CoreOp::BytesLiteral(data) => self.intern_bytes(data),
             CoreOp::Missing => self.heap.allocate(Object::Done),
             CoreOp::UnpackStar(before, after) => {
                 let items = self.collect_iter(values[0])?;
@@ -1305,6 +1322,7 @@ impl Vm {
         if matches!(object, Value::InlineString(_)) {
             return Ok(
                 if [
+                    "encode",
                     "join",
                     "split",
                     "splitlines",
@@ -1324,6 +1342,9 @@ impl Vm {
                     None
                 },
             );
+        }
+        if matches!(self.heap.get(object)?, Object::Bytes(_)) {
+            return Ok(bytes::method_name(name));
         }
         let supported = match self.heap.get(object)? {
             Object::List(_)
@@ -1354,6 +1375,7 @@ impl Vm {
             Object::Set(_) if ["add", "discard", "remove", "copy", "clear"].contains(&name) => true,
             Object::String(_)
                 if [
+                    "encode",
                     "join",
                     "split",
                     "splitlines",
@@ -1503,6 +1525,9 @@ impl Vm {
                 };
             }
 
+            Object::Native(module) if module == "bytes" && name == "fromhex" => {
+                return Ok(self.heap.allocate(Object::Native("bytes.fromhex".into())));
+            }
             Object::Native(module) if module == "bisect" => {
                 let key = match name {
                     "bisect_left" => "bisect.bisect_left",
@@ -2007,6 +2032,10 @@ impl Vm {
             }
             return Ok(value);
         }
+        if name == "bytes" && !keywords.is_empty() {
+            let bound = self.bytes_keywords(args, keywords, true)?;
+            return self.construct_bytes(&bound);
+        }
         if name != "print"
             && name != "dict"
             && name != "json.dumps"
@@ -2212,6 +2241,8 @@ impl Vm {
                     value
                 }
             }
+            "bytes" => self.construct_bytes(args)?,
+            "bytes.fromhex" => self.bytes_fromhex(args)?,
             "int" => {
                 arity(args, 0, 1)?;
                 if let Some(&value) = args.first()
@@ -2883,6 +2914,15 @@ impl Vm {
     }
 
     fn method(&mut self, receiver: Value, name: &str, args: &[Value]) -> Result<Value> {
+        if matches!(self.heap.get(receiver), Ok(Object::Bytes(_))) {
+            return self.bytes_method(receiver, name, args);
+        }
+        if name == "encode"
+            && let Some(text) = self.heap.as_str(&receiver)
+        {
+            let text = text.to_owned();
+            return self.encode_bytes(&text, args);
+        }
         if let Ok(Object::Property {
             get,
             set,
@@ -3123,6 +3163,7 @@ fn key_value(heap: &Heap, key: &Key) -> Value {
         Key::Bool(value) => Value::Bool(*value),
         Key::Int(n) => Value::Int(*n),
         Key::String(s) => heap.string(s),
+        Key::Bytes(data) => data.0,
         Key::Float(bits) => Value::Float(f64::from_bits(*bits)),
         Key::Tuple(keys) => stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
             heap.allocate(Object::Tuple(
@@ -3208,6 +3249,9 @@ pub(crate) fn slice(heap: &Heap, object: Value, key: Value) -> Result<Value> {
         )),
         Object::Tuple(items) => {
             heap.allocate(Object::Tuple(indices.iter().map(|&i| items[i]).collect()))
+        }
+        Object::Bytes(data) => {
+            heap.allocate(Object::Bytes(indices.iter().map(|&i| data[i]).collect()))
         }
         Object::String(text) => {
             let chars = text.chars().collect::<Vec<_>>();
@@ -3313,8 +3357,9 @@ fn repeat(heap: &Heap, value: Value, n: i64) -> Result<Value> {
     }
     Ok(match heap.get(value)? {
         Object::String(s) => text_heap(heap, s.repeat(n)),
-        Object::List(items) => heap.allocate(Object::List(items.repeat(n).into())),
+        Object::List(items) => heap.allocate(Object::List(items.repeat(n))),
         Object::Tuple(items) => heap.allocate(Object::Tuple(items.repeat(n))),
+        Object::Bytes(items) => heap.allocate(Object::Bytes(items.repeat(n))),
         _ => return Err(Error::Type("unsupported multiplication")),
     })
 }
@@ -3351,6 +3396,7 @@ fn equal(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<bool> {
                 }
                 return Ok(true);
             }
+            (Object::Bytes(a), Object::Bytes(b)) => return Ok(a == b),
             (Object::Set(a), Object::Set(b)) => {
                 return Ok(a.len() == b.len() && a.iter().all(|(key, _)| b.get(key).is_some()));
             }
@@ -3398,6 +3444,17 @@ pub(crate) fn compare(heap: &Heap, op: &str, a: Value, b: Value) -> Result<bool>
                         }
                     }
                     found
+                }
+                Object::Bytes(data) => {
+                    if let Ok(n) = integer(a) {
+                        let byte = u8::try_from(n)
+                            .map_err(|_| error("ValueError: byte must be in range(0, 256)"))?;
+                        data.contains(&byte)
+                    } else if let Ok(Object::Bytes(part)) = heap.get(a) {
+                        part.is_empty() || data.windows(part.len()).any(|v| v == part)
+                    } else {
+                        return Err(Error::Type("a bytes-like object is required"));
+                    }
                 }
                 Object::String(text) => {
                     let Object::String(part) = heap.get(a)? else {
@@ -3485,6 +3542,7 @@ fn render_inner(heap: &Heap, value: Value, quote: bool, active: &mut Vec<Value>)
             }
             active.push(value);
             let result = match heap.get(value)? {
+                Object::Bytes(data) => bytes::repr(data),
                 Object::String(s) => {
                     if quote {
                         format!(
@@ -3621,6 +3679,7 @@ fn order(heap: &Heap, a: Value, b: Value, depth: usize) -> Result<Option<std::cm
     }
     match (heap.get(a), heap.get(b)) {
         (Ok(Object::String(a)), Ok(Object::String(b))) => Ok(Some(a.cmp(b))),
+        (Ok(Object::Bytes(a)), Ok(Object::Bytes(b))) => Ok(Some(a.cmp(b))),
         (Ok(a @ Object::List(_)), Ok(b @ Object::List(_)))
         | (Ok(a @ Object::Tuple(_)), Ok(b @ Object::Tuple(_))) => {
             let (a, b) = (a.values().unwrap(), b.values().unwrap());

@@ -2743,7 +2743,11 @@ impl Helper {
                 | CoreOp::SetAttr(_) => count == 2,
                 CoreOp::Slice => count == 3,
                 CoreOp::Call(names) => count == names.len() + 1,
-                CoreOp::Function(_) | CoreOp::Class(..) | CoreOp::Set | CoreOp::Join => true,
+                CoreOp::Function(_)
+                | CoreOp::Class(..)
+                | CoreOp::Set
+                | CoreOp::Join
+                | CoreOp::BytesLiteral(_) => true,
             },
         }
     }

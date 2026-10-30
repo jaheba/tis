@@ -91,6 +91,7 @@ pub struct Vm {
     pub(crate) attribute_protocols: bool,
     pub(crate) protocol_depth: usize,
     pub(crate) modules: std::collections::BTreeMap<String, Value>,
+    pub(crate) bytes_pool: std::collections::HashMap<Vec<u8>, Value>,
     pub(crate) literal_pool: std::collections::HashMap<String, Value>,
     pub output: String,
     pub(crate) depth: usize,
@@ -604,6 +605,7 @@ impl Vm {
             .chain(self.pinned.values().copied())
             .chain(self.modules.values().copied())
             .chain(self.literal_pool.values().copied())
+            .chain(self.bytes_pool.values().copied())
             .chain(self.globals)
             .chain(external_roots.iter().copied())
             .filter(|value| matches!(value, Value::Ref(_)))

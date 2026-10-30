@@ -118,6 +118,30 @@ impl Vm {
             {
                 return Ok(value);
             }
+            if op == "*" {
+                let sequence = |value| {
+                    self.heap.as_str(&value).is_some()
+                        || matches!(
+                            self.heap.get(value),
+                            Ok(Object::List(_) | Object::Tuple(_) | Object::Bytes(_))
+                        )
+                };
+                let operands = if sequence(a) {
+                    Some((a, b))
+                } else if sequence(b) {
+                    Some((b, a))
+                } else {
+                    None
+                };
+                if let Some((sequence, index)) = operands
+                    && self.special(index, "__index__")?.is_some()
+                {
+                    return self.protocol_roots(&[sequence, index], |vm| {
+                        let count = vm.py_index(index)?;
+                        repeat(&vm.heap, sequence, count)
+                    });
+                }
+            }
             return Err(Error::Type("unsupported binary operands"));
         }
         match op {
@@ -243,7 +267,11 @@ impl Vm {
         }
         let sequence = matches!(
             self.heap.get(object),
-            Ok(Object::List(_) | Object::Tuple(_) | Object::String(_) | Object::Range { .. })
+            Ok(Object::List(_)
+                | Object::Tuple(_)
+                | Object::String(_)
+                | Object::Bytes(_)
+                | Object::Range { .. })
         ) || matches!(object, Value::InlineString(_));
         let key = if sequence && self.instance_class(key).is_some() {
             Value::Int(self.protocol_roots(&[object, key], |vm| vm.py_index(key))?)
@@ -316,7 +344,21 @@ impl Vm {
             return compare(&self.heap, op, a, b).map(Value::Bool);
         }
         if op == "in" || op == "not in" {
-            let found = if let Some(value) = self.call_special(b, "__contains__", &[a])? {
+            let found = if matches!(self.heap.get(b), Ok(Object::Bytes(_))) {
+                let probe = if integer(a).is_ok() || self.special(a, "__index__")?.is_some() {
+                    Value::Int(self.py_index(a)?)
+                } else {
+                    a
+                };
+                if integer(probe).is_err() && !matches!(self.heap.get(probe), Ok(Object::Bytes(_)))
+                {
+                    return Err(error(format!(
+                        "TypeError: a bytes-like object is required, not '{}'",
+                        self.value_type_name(a)?
+                    )));
+                }
+                compare(&self.heap, "in", probe, b)?
+            } else if let Some(value) = self.call_special(b, "__contains__", &[a])? {
                 self.protocol_roots(&[value], |vm| vm.py_truth(value))?
             } else if matches!(self.heap.get(b), Ok(Object::Dict(_) | Object::Set(_))) {
                 self.mapping_get(b, a)?.is_some()

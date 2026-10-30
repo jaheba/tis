@@ -1,7 +1,7 @@
-//! Python lists keep float storage compact; generic borrows materialize a read-only value snapshot.
+//! Python lists keep float and boolean storage compact; generic borrows cache a boxed snapshot.
 use crate::Value;
 use std::{
-    cell::OnceCell,
+    cell::{Cell, OnceCell},
     ops::{Deref, DerefMut},
 };
 
@@ -9,11 +9,13 @@ use std::{
 enum Storage {
     Values(Vec<Value>),
     Floats(Vec<f64>),
+    Bools(Vec<u8>),
 }
 #[derive(Debug)]
 pub struct List {
     storage: Storage,
     snapshot: OnceCell<Vec<Value>>,
+    native_bool_writes: Cell<u8>,
 }
 impl From<Vec<Value>> for List {
     fn from(values: Vec<Value>) -> Self {
@@ -27,20 +29,39 @@ impl From<Vec<Value>> for List {
                     })
                     .collect(),
             )
+        } else if !values.is_empty() && values.iter().all(|v| matches!(v, Value::Bool(_))) {
+            Storage::Bools(
+                values
+                    .into_iter()
+                    .map(|v| {
+                        let Value::Bool(v) = v else { unreachable!() };
+                        u8::from(v)
+                    })
+                    .collect(),
+            )
         } else {
             Storage::Values(values)
         };
         Self {
             storage,
             snapshot: OnceCell::new(),
+            native_bool_writes: Cell::new(0),
         }
     }
 }
+// Keep the short Bool payload separate from whole-Value copies. Combining both in one
+// return path causes LLVM to scalarize boxed list/tuple copies into individual padding bytes.
+#[inline(never)]
+pub(crate) fn bool_item(values: &[u8], index: usize) -> Option<Value> {
+    values.get(index).map(|value| Value::Bool(*value != 0))
+}
+
 impl List {
     pub fn len(&self) -> usize {
         match &self.storage {
             Storage::Values(v) => v.len(),
             Storage::Floats(v) => v.len(),
+            Storage::Bools(v) => v.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -50,6 +71,7 @@ impl List {
         match &self.storage {
             Storage::Values(v) => v.clone(),
             Storage::Floats(v) => v.iter().copied().map(Value::Float).collect(),
+            Storage::Bools(v) => v.iter().map(|v| Value::Bool(*v != 0)).collect(),
         }
     }
     pub fn is_float(&self) -> bool {
@@ -59,12 +81,13 @@ impl List {
         match &self.storage {
             Storage::Values(v) => v.get(index).copied(),
             Storage::Floats(v) => v.get(index).copied().map(Value::Float),
+            Storage::Bools(v) => bool_item(v, index),
         }
     }
     pub(crate) fn native_values(&self) -> Option<&[Value]> {
         match &self.storage {
             Storage::Values(values) => Some(values),
-            Storage::Floats(_) => None,
+            _ => None,
         }
     }
 
@@ -73,10 +96,42 @@ impl List {
         self.snapshot.take();
         match &mut self.storage {
             Storage::Values(values) => Some(values.as_mut_ptr()),
-            Storage::Floats(_) => None,
+            _ => None,
         }
     }
 
+    pub(crate) fn bools(&self) -> Option<&[u8]> {
+        match &self.storage {
+            Storage::Bools(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub(crate) fn bool_write_token(&self) -> *mut u8 {
+        self.native_bool_writes.as_ptr()
+    }
+    /// The native writer checks this token because a later shared borrow can cache a snapshot.
+    pub(crate) fn native_bools_mut(&mut self) -> Option<*mut u8> {
+        self.snapshot.take();
+        match &mut self.storage {
+            Storage::Bools(v) => {
+                self.native_bool_writes.set(1);
+                Some(v.as_mut_ptr())
+            }
+            _ => None,
+        }
+    }
+    pub fn repeat(&self, count: usize) -> Self {
+        let storage = match &self.storage {
+            Storage::Values(v) => return v.repeat(count).into(),
+            Storage::Floats(v) => Storage::Floats(v.repeat(count)),
+            Storage::Bools(v) => Storage::Bools(v.repeat(count)),
+        };
+        Self {
+            storage,
+            snapshot: OnceCell::new(),
+            native_bool_writes: Cell::new(0),
+        }
+    }
     pub fn floats(&self) -> Option<&[f64]> {
         match &self.storage {
             Storage::Floats(v) => Some(v),
@@ -105,11 +160,21 @@ impl List {
             _ => None,
         }
     }
-    /// Preserve compact float storage until a non-float requires the general representation.
+    /// Preserve homogeneous primitive storage until a different type requires boxed values.
     pub fn push(&mut self, value: Value) {
         self.snapshot.take();
         if let (Storage::Floats(values), Value::Float(value)) = (&mut self.storage, value) {
             values.push(value);
+            return;
+        }
+        if let (Storage::Bools(values), Value::Bool(value)) = (&mut self.storage, value) {
+            values.push(u8::from(value));
+            return;
+        }
+        if let (Storage::Values(values), Value::Bool(value)) = (&self.storage, value)
+            && values.is_empty()
+        {
+            self.storage = Storage::Bools(vec![u8::from(value)]);
             return;
         }
         if let (Storage::Values(values), Value::Float(value)) = (&self.storage, value)
@@ -125,6 +190,7 @@ impl List {
         match &mut self.storage {
             Storage::Values(values) => values.remove(index),
             Storage::Floats(values) => Value::Float(values.remove(index)),
+            Storage::Bools(values) => Value::Bool(values.remove(index) != 0),
         }
     }
     pub fn clear(&mut self) {
@@ -132,6 +198,7 @@ impl List {
         match &mut self.storage {
             Storage::Values(values) => values.clear(),
             Storage::Floats(values) => values.clear(),
+            Storage::Bools(values) => values.clear(),
         }
     }
     pub fn reverse(&mut self) {
@@ -139,6 +206,7 @@ impl List {
         match &mut self.storage {
             Storage::Values(values) => values.reverse(),
             Storage::Floats(values) => values.reverse(),
+            Storage::Bools(values) => values.reverse(),
         }
     }
     pub fn insert(&mut self, index: usize, value: Value) {
@@ -147,12 +215,18 @@ impl List {
             values.insert(index, value);
             return;
         }
+        if let (Storage::Bools(values), Value::Bool(value)) = (&mut self.storage, value) {
+            values.insert(index, u8::from(value));
+            return;
+        }
         self.deref_mut().insert(index, value);
     }
     pub fn set(&mut self, index: usize, value: Value) {
         self.snapshot.take();
         if let (Storage::Floats(values), Value::Float(value)) = (&mut self.storage, value) {
             values[index] = value;
+        } else if let (Storage::Bools(values), Value::Bool(value)) = (&mut self.storage, value) {
+            values[index] = u8::from(value);
         } else {
             self.deref_mut()[index] = value;
         }
@@ -169,6 +243,16 @@ impl List {
             }
             return;
         }
+        if let Storage::Bools(bools) = &mut self.storage
+            && values.iter().all(|v| matches!(v, Value::Bool(_)))
+        {
+            self.snapshot.take();
+            for (dst, src) in bools.iter_mut().zip(values) {
+                let Value::Bool(v) = src else { unreachable!() };
+                *dst = u8::from(*v);
+            }
+            return;
+        }
         self.deref_mut().copy_from_slice(values);
     }
 }
@@ -177,6 +261,12 @@ impl Deref for List {
     fn deref(&self) -> &Vec<Value> {
         match &self.storage {
             Storage::Values(v) => v,
+            Storage::Bools(v) => {
+                // A native store must miss until an exclusive borrow discards this snapshot.
+                self.native_bool_writes.set(0);
+                self.snapshot
+                    .get_or_init(|| v.iter().map(|v| Value::Bool(*v != 0)).collect())
+            }
             Storage::Floats(v) => self
                 .snapshot
                 .get_or_init(|| v.iter().copied().map(Value::Float).collect()),
@@ -185,12 +275,10 @@ impl Deref for List {
 }
 impl DerefMut for List {
     fn deref_mut(&mut self) -> &mut Vec<Value> {
-        if let Storage::Floats(v) = &self.storage {
-            let values = self
-                .snapshot
-                .take()
-                .unwrap_or_else(|| v.iter().copied().map(Value::Float).collect());
+        if !matches!(self.storage, Storage::Values(_)) {
+            let values = self.snapshot.take().unwrap_or_else(|| self.to_vec());
             self.storage = Storage::Values(values);
+            self.native_bool_writes.set(0);
         }
         let Storage::Values(v) = &mut self.storage else {
             unreachable!()
@@ -212,6 +300,7 @@ impl IntoIterator for List {
         match self.storage {
             Storage::Values(v) => v,
             Storage::Floats(v) => v.into_iter().map(Value::Float).collect(),
+            Storage::Bools(v) => v.into_iter().map(|v| Value::Bool(v != 0)).collect(),
         }
         .into_iter()
     }
@@ -243,6 +332,27 @@ impl Clone for List {
         Self {
             storage: self.storage.clone(),
             snapshot: OnceCell::new(),
+            native_bool_writes: Cell::new(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeat_and_gc_do_not_box_primitive_flags() {
+        let list = List::from(vec![Value::Bool(true)]).repeat(1_000_000);
+        assert_eq!(list.bools().unwrap().len(), 1_000_000);
+        let mut vm = crate::Vm::new();
+        let value = vm.heap.allocate(crate::Object::List(list));
+        vm.pin(value).unwrap();
+        vm.collect_garbage(&[]).unwrap();
+        let crate::Object::List(list) = vm.heap.get(value).unwrap() else {
+            unreachable!()
+        };
+        assert!(list.snapshot.get().is_none());
+        assert!(list.bools().is_some());
     }
 }

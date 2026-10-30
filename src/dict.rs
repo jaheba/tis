@@ -167,6 +167,10 @@ impl Hash for Key {
                 4u8.hash(state);
                 v.hash(state);
             }
+            Self::Bytes(v) => {
+                7u8.hash(state);
+                v.1.hash(state);
+            }
             Self::Tuple(v) => {
                 5u8.hash(state);
                 v.len().hash(state);

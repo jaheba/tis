@@ -365,6 +365,12 @@ Their complete deoptimization states are retained, while their GC maps are empty
 Allocating or calling helpers retain full GC maps and publish roots before execution and collection afterwards.
 Generic iteration, calls, attributes and formatting retain conservative effects.
 The verifier rejects effects that understate a helper's requirements and checks each GC map against its effects.
+Homogeneous boolean lists can use one byte per element. Repetition copies primitive buffers directly,
+and non-boolean writes convert the list to ordinary Values. Native loads/stores guard heap identity,
+generation, storage kind and bounds. A shared boxed snapshot revokes native boolean writes through
+an interior token; an exclusive mutation discards the snapshot before publishing a writable pointer again.
+GC skips primitive buffers instead of materializing their boxed snapshots.
+
 Homogeneous float lists use contiguous `f64` storage. Typed LIR guards their storage and bounds, then loads
 and stores elements directly. Views remain within one block and cannot survive calls, collection or shape mutation;
 the verifier enforces these boundaries. Generic mutations can widen a list back to mixed values.

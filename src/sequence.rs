@@ -10,18 +10,21 @@ pub enum SequenceKind {
 pub(crate) enum Items<'a> {
     Values(&'a [Value]),
     Floats(&'a [f64]),
+    Bools(&'a [u8]),
 }
 impl Items<'_> {
     pub fn len(&self) -> usize {
         match self {
             Self::Values(v) => v.len(),
             Self::Floats(v) => v.len(),
+            Self::Bools(v) => v.len(),
         }
     }
     pub fn get(&self, index: usize) -> Option<Value> {
         match self {
             Self::Values(v) => v.get(index).copied(),
             Self::Floats(v) => v.get(index).copied().map(Value::Float),
+            Self::Bools(v) => crate::list::bool_item(v, index),
         }
     }
 }
@@ -32,6 +35,8 @@ pub(crate) fn items(heap: &Heap, source: Value, kind: SequenceKind) -> Result<Op
     Ok(match (heap.get(source)?, kind) {
         (Object::List(v), SequenceKind::List) => Some(if let Some(f) = v.floats() {
             Items::Floats(f)
+        } else if let Some(bools) = v.bools() {
+            Items::Bools(bools)
         } else {
             Items::Values(v)
         }),
@@ -79,7 +84,9 @@ pub(crate) fn set(heap: &mut Heap, source: Value, key: Value, value: Value) -> R
     let Ok(Object::List(items)) = heap.get(source) else {
         return Ok(false);
     };
-    if items.native_values().is_none() {
+    if items.native_values().is_none()
+        && !(items.bools().is_some() && matches!(value, Value::Bool(_)))
+    {
         return Ok(false);
     }
     let index = if index < 0 {

@@ -549,6 +549,10 @@ impl Builder {
                     _ => return Err(Error::Unsupported("complex numbers")),
                 },
             ),
+            Expr::BytesLiteral(expr) => {
+                let bytes: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::from(&expr.value);
+                self.runtime(block, CoreOp::BytesLiteral(bytes.into_owned()), vec![])
+            }
             Expr::StringLiteral(expr) => {
                 self.constant(block, Constant::String(expr.value.to_string()))
             }

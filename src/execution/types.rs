@@ -10,6 +10,7 @@ pub(super) fn builtin_type_name(name: &str) -> bool {
                 | "float"
                 | "bool"
                 | "str"
+                | "bytes"
                 | "list"
                 | "tuple"
                 | "dict"
@@ -55,6 +56,7 @@ impl Vm {
             Value::Unbound => return Err(Error::InvalidIr("unbound type")),
             Value::Ref(_) => match self.heap.get(value)? {
                 Object::String(_) => "str",
+                Object::Bytes(_) => "bytes",
                 Object::List(_) => "list",
                 Object::Tuple(_) => "tuple",
                 Object::Dict(_) => "dict",

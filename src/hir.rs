@@ -131,6 +131,7 @@ pub struct Block {
 #[derive(Debug, Clone)]
 pub enum CoreOp {
     Missing,
+    BytesLiteral(Vec<u8>),
     Import(String),
     UnpackStar(usize, usize),
     LoadName(String),

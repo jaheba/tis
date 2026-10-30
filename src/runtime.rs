@@ -17,6 +17,9 @@ pub(crate) fn add(heap: &mut Heap, lhs: Value, rhs: Value) -> Result<Value> {
     }
     if let (Value::Ref(_), Value::Ref(_)) = (lhs, rhs) {
         let object = match (heap.get(lhs)?, heap.get(rhs)?) {
+            (Object::Bytes(lhs), Object::Bytes(rhs)) => {
+                Object::Bytes([lhs.as_slice(), rhs.as_slice()].concat())
+            }
             (Object::String(lhs), Object::String(rhs)) => Object::String(format!("{lhs}{rhs}")),
             (Object::List(lhs), Object::List(rhs)) => {
                 Object::List(lhs.iter().chain(rhs).copied().collect::<Vec<_>>().into())
@@ -63,6 +66,7 @@ pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
         Value::Float(value) => value != 0.0,
         Value::Ref(_) => match heap.get(value)? {
             Object::String(_)
+            | Object::Bytes(_)
             | Object::List(_)
             | Object::Tuple(_)
             | Object::Dict(_)

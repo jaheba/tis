@@ -38,11 +38,19 @@ pub(super) fn load(
             lir::SequenceKind::List => 2,
             lir::SequenceKind::Tuple => 3,
         };
-        b.ins().icmp_imm_s(IntCC::Equal, actual, expected)
+        let same = b.ins().icmp_imm_s(IntCC::Equal, actual, expected);
+        if kind == lir::SequenceKind::List {
+            let compact = b.ins().icmp_imm_s(IntCC::Equal, actual, 8);
+            b.ins().bor(same, compact)
+        } else {
+            same
+        }
     } else {
         let list = b.ins().icmp_imm_s(IntCC::Equal, actual, 2);
         let tuple = b.ins().icmp_imm_s(IntCC::Equal, actual, 3);
-        b.ins().bor(list, tuple)
+        let ordinary = b.ins().bor(list, tuple);
+        let compact = b.ins().icmp_imm_s(IntCC::Equal, actual, 8);
+        b.ins().bor(ordinary, compact)
     };
     guard!(same);
     let index = match index {
@@ -71,9 +79,23 @@ pub(super) fn load(
         row,
         offset_of!(NativeFields, values) as i32,
     );
+    let compact = b.ins().icmp_imm_s(IntCC::Equal, actual, 8);
+    let bool_block = b.create_block();
+    let boxed = b.create_block();
+    let loaded = b.create_block();
+    b.ins().brif(compact, bool_block, &[], boxed, &[]);
+    b.switch_to_block(bool_block);
+    let pointer = b.ins().iadd(values, index);
+    let byte = b.ins().load(types::I8, MemFlagsData::new(), pointer, 0);
+    let bits = b.ins().uextend(types::I64, byte);
+    store_scalar_cached(b, scalars, registers, destination, BOOL, bits)?;
+    b.ins().jump(loaded, &[]);
+    b.switch_to_block(boxed);
     let offset = b.ins().imul_imm_s(index, size_of::<Value>() as i64);
     let value = b.ins().iadd(values, offset);
     fields::decode(b, scalars, registers, value, destination, miss)?;
+    b.ins().jump(loaded, &[]);
+    b.switch_to_block(loaded);
     let offset =
         (offset_of!(Vm, tier_stats) + offset_of!(crate::TierStats, native_sequence_loads)) as i32;
     let count = b.ins().load(types::I64, MemFlagsData::new(), vm, offset);
@@ -84,7 +106,7 @@ pub(super) fn load(
     Ok(())
 }
 
-/// Write only through a pointer published by an exclusive boxed-list borrow. This path is used
+/// Write only through a pointer published by an exclusive boxed/boolean-list borrow. This path is used
 /// only in artifacts without cached heap views, so no detached sequence snapshot can become stale.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn store(
@@ -117,7 +139,9 @@ pub(super) fn store(
         offset_of!(NativeFields, kind) as i32,
     );
     let list = b.ins().icmp_imm_s(IntCC::Equal, kind, 2);
-    guard!(list);
+    let compact = b.ins().icmp_imm_s(IntCC::Equal, kind, 8);
+    let valid = b.ins().bor(list, compact);
+    guard!(valid);
     let values = b.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -142,6 +166,30 @@ pub(super) fn store(
     let valid = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
     guard!(valid);
     let tag = load_cached(b, scalars, registers, input, 0, types::I64)?;
+    let bool_store = b.create_block();
+    let boxed_store = b.create_block();
+    let complete = b.create_block();
+    b.ins().brif(compact, bool_store, &[], boxed_store, &[]);
+    b.switch_to_block(bool_store);
+    let boolean = b.ins().icmp_imm_s(IntCC::Equal, tag, BOOL as i64);
+    guard!(boolean);
+    // Shared list iteration may have cached a boxed snapshot after pointer publication.
+    // Only the exclusive fallback may clear that snapshot and re-enable native writes.
+    let token = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, shape) as i32,
+    );
+    let permitted = b.ins().load(types::I8, MemFlagsData::new(), token, 0);
+    let permitted = b.ins().icmp_imm_s(IntCC::NotEqual, permitted, 0);
+    guard!(permitted);
+    let bits = load_cached(b, scalars, registers, input, 8, types::I64)?;
+    let byte = b.ins().icmp_imm_s(IntCC::NotEqual, bits, 0);
+    let pointer = b.ins().iadd(values, index);
+    b.ins().store(MemFlagsData::new(), byte, pointer, 0);
+    b.ins().jump(complete, &[]);
+    b.switch_to_block(boxed_store);
     let kind = b.ins().band_imm_s(tag, KIND_MASK as i64);
     let ordinary = b
         .ins()
@@ -186,6 +234,8 @@ pub(super) fn store(
     b.ins().store(MemFlagsData::new(), bits, pointer, 8);
     b.ins().jump(ready, &[]);
     b.switch_to_block(ready);
+    b.ins().jump(complete, &[]);
+    b.switch_to_block(complete);
     store_constant_cached(b, scalars, registers, destination, Slot::boxed(Value::None))?;
     count(b, vm, offset_of!(crate::TierStats, native_list_stores));
     b.ins().jump(done, &[]);

@@ -3,6 +3,8 @@ use super::*;
 
 pub(super) fn exception_parent(name: &str) -> Option<&'static str> {
     Some(match name {
+        "UnicodeError" => "ValueError",
+        "UnicodeDecodeError" | "UnicodeEncodeError" => "UnicodeError",
         "BaseException" => "object",
         "Exception" => "BaseException",
         "UnboundLocalError" => "NameError",

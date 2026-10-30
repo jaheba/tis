@@ -37,6 +37,7 @@ pub enum Key {
     Bool(bool),
     Int(i64),
     String(compact_str::CompactString),
+    Bytes(std::rc::Rc<(Value, Vec<u8>)>),
     Float(u64),
     Tuple(Vec<Key>),
     Protocol(Value, i64),
@@ -50,6 +51,7 @@ impl Key {
     pub(crate) fn visit_values(&self, f: &mut impl FnMut(Value)) {
         match self {
             Self::Protocol(value, _) => f(*value),
+            Self::Bytes(value) => f(value.0),
             Self::Tuple(keys) => {
                 for key in keys {
                     key.visit_values(f);
@@ -63,6 +65,7 @@ impl Key {
 #[derive(Debug, Clone)]
 pub enum Object {
     String(String),
+    Bytes(Vec<u8>),
     List(crate::List),
     Tuple(Vec<Value>),
     Dict(crate::Dict),
@@ -173,12 +176,13 @@ struct Entry {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NativeFields {
-    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = float list, 5 = range, 6 = iterator, 7 = cached range iterator.
+    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = float list, 5 = range, 6 = iterator, 7 = cached range iterator, 8 = byte boolean list.
     pub(crate) kind: u64,
     pub(crate) class_tag: u64,
     pub(crate) class_payload: u64,
     pub(crate) generation: u64,
     pub(crate) shape: u64,
+    /// Kind 8 addresses bytes; other sequence kinds address Values. Kind guards precede decoding.
     pub(crate) values: *const Value,
     /// Mutable provenance is published only after an exclusive boxed-list borrow.
     pub(crate) writable_values: *mut Value,
@@ -203,11 +207,28 @@ impl NativeFields {
                 }
             }
             Object::List(values) => Self {
-                kind: if values.is_float() { 4 } else { 2 },
+                kind: if values.is_float() {
+                    4
+                } else if values.bools().is_some() {
+                    8
+                } else {
+                    2
+                },
                 generation: generation as u64,
-                values: values
-                    .native_values()
-                    .map_or(std::ptr::null(), |v| v.as_ptr()),
+                // Kind 8 interprets this address as u8 storage; never decode it as a Value.
+                values: values.bools().map_or_else(
+                    || {
+                        values
+                            .native_values()
+                            .map_or(std::ptr::null(), |v| v.as_ptr())
+                    },
+                    |v| v.as_ptr().cast(),
+                ),
+                shape: if values.bools().is_some() {
+                    values.bool_write_token() as u64
+                } else {
+                    0
+                },
                 len: values.len(),
                 ..Self::default()
             },
@@ -270,11 +291,14 @@ impl NativeFields {
 
     fn of_mut(object: &mut Object, generation: u32) -> Self {
         let mut row = Self::of(object, generation);
-        if let Object::List(list) = object
-            && let Some(values) = list.native_values_mut()
-        {
-            row.values = values;
-            row.writable_values = values;
+        if let Object::List(list) = object {
+            if let Some(values) = list.native_values_mut() {
+                row.values = values;
+                row.writable_values = values;
+            } else if let Some(values) = list.native_bools_mut() {
+                row.values = values.cast();
+                row.writable_values = values.cast();
+            }
         }
         row
     }
@@ -461,6 +485,7 @@ impl Heap {
             Value::Int(value) => Ok(Key::Int(value)),
             Value::Ref(_) => match self.get(value)? {
                 Object::String(value) => Ok(Key::String(value.as_str().into())),
+                Object::Bytes(bytes) => Ok(Key::Bytes(std::rc::Rc::new((value, bytes.clone())))),
                 Object::Tuple(values) => values
                     .iter()
                     .map(|&value| self.key_at(value, depth + 1))
@@ -483,6 +508,7 @@ impl Heap {
         }
         Ok(match self.get(value)? {
             Object::String(value) => value.chars().count(),
+            Object::Bytes(value) => value.len(),
             Object::List(value) => value.len(),
             Object::Tuple(value) => value.len(),
             Object::Dict(value) => value.len(),
@@ -505,6 +531,7 @@ impl Heap {
         match self.get(object)? {
             Object::List(items) => items.value(index(key, items.len())?).ok_or(Error::Index),
             Object::Tuple(items) => Ok(items[index(key, items.len())?]),
+            Object::Bytes(items) => Ok(Value::Int(i64::from(items[index(key, items.len())?]))),
             Object::String(text) => self.string_item(text, key),
             Object::Dict(items) => self.dict_get(items, key)?.ok_or(Error::MissingKey),
             _ => Err(Error::Type("object is not subscriptable")),
@@ -689,6 +716,7 @@ impl PartialEq for Object {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::String(a), Self::String(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
             (Self::Dict(a), Self::Dict(b)) => a == b,
@@ -711,6 +739,7 @@ impl PartialEq for Key {
         match (self, other) {
             (Self::None, Self::None) => true,
             (Self::String(a), Self::String(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a.1 == b.1,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
             (Self::Protocol(a, _), Self::Protocol(b, _)) => a == b,
             _ => false,
