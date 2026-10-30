@@ -1593,7 +1593,7 @@ impl Vm {
         if let Value::InlineString(text) = source {
             return Ok(self.heap.allocate(Object::Iterator {
                 source,
-                index: 0,
+                index: 0.into(),
                 size: text.as_str().chars().count(),
                 exhausted: false,
             }));
@@ -1624,7 +1624,7 @@ impl Vm {
             if self.special(source, "__getitem__")?.is_some() {
                 return Ok(self.heap.allocate(Object::Iterator {
                     source,
-                    index: 0,
+                    index: 0.into(),
                     size: 0,
                     exhausted: false,
                 }));
@@ -1634,7 +1634,7 @@ impl Vm {
         let size = self.heap.len(source)?;
         Ok(self.heap.allocate(Object::Iterator {
             source,
-            index: 0,
+            index: 0.into(),
             size,
             exhausted: false,
         }))
@@ -1654,7 +1654,10 @@ impl Vm {
         let Some(text) = self.heap.as_str(source) else {
             return Ok(None);
         };
-        let Some(character) = text.get(*index..).and_then(|suffix| suffix.chars().next()) else {
+        let Some(character) = text
+            .get(index.get()..)
+            .and_then(|suffix| suffix.chars().next())
+        else {
             return Ok(None);
         };
         let value = self.heap.string(character.encode_utf8(&mut [0; 4]));
@@ -1662,8 +1665,37 @@ impl Vm {
         let Object::Iterator { index, .. } = &mut *guard else {
             unreachable!()
         };
-        *index += character.len_utf8();
+        index.set(index.get() + character.len_utf8());
         Ok(Some(value))
+    }
+
+    /// Probe an unfinished builtin range iterator without allocating the end sentinel.
+    pub(crate) fn try_range_next(&mut self, iterator: Value) -> Result<Option<Value>> {
+        let Ok(Object::Iterator {
+            source,
+            index,
+            size,
+            exhausted: false,
+        }) = self.heap.get(iterator)
+        else {
+            return Ok(None);
+        };
+        let (source, index, size) = (*source, index.get(), *size);
+        if index >= size {
+            return Ok(None);
+        }
+        let Object::Range { start, step, .. } = self.heap.get(source)? else {
+            return Ok(None);
+        };
+        let Some(value) =
+            i64::try_from(i128::from(*start) + index as i128 * i128::from(*step)).ok()
+        else {
+            return Ok(None);
+        };
+        if let Object::Iterator { index, .. } = &mut *self.heap.get_mut(iterator)? {
+            index.set(index.get() + 1);
+        }
+        Ok(Some(Value::Int(value)))
     }
 
     pub(crate) fn next(&mut self, iterator: Value) -> Result<Value> {
@@ -1681,7 +1713,7 @@ impl Vm {
                 index,
                 size,
                 exhausted,
-            } => Some((*source, *index, *size, *exhausted)),
+            } => Some((*source, index.get(), *size, *exhausted)),
             _ => None,
         };
         let Some((source, index, size, exhausted)) = state else {
@@ -1694,7 +1726,7 @@ impl Vm {
             return match value {
                 Ok(value) => {
                     if let Object::Iterator { index, .. } = &mut *self.heap.get_mut(iterator)? {
-                        *index += 1;
+                        index.set(index.get() + 1);
                     }
                     Ok(value)
                 }
@@ -1730,7 +1762,7 @@ impl Vm {
                 unreachable!()
             };
             if let Some(character) = character {
-                *index += character.len_utf8();
+                index.set(index.get() + character.len_utf8());
             } else {
                 *exhausted = true;
             }
@@ -1749,7 +1781,7 @@ impl Vm {
         if index >= len {
             *self.heap.get_mut(iterator)? = Object::Iterator {
                 source,
-                index,
+                index: index.into(),
                 size,
                 exhausted: true,
             };
@@ -1781,7 +1813,7 @@ impl Vm {
         let Object::Iterator { index, .. } = &mut *guard else {
             unreachable!()
         };
-        *index += 1;
+        index.set(index.get() + 1);
         Ok(value)
     }
 

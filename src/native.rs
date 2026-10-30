@@ -3,6 +3,7 @@ mod fields;
 mod locals;
 mod readonly;
 mod region;
+mod sequence;
 mod virtual_iter;
 use crate::{
     Error, Result, Value, Vm,
@@ -40,6 +41,7 @@ pub(crate) struct NativeCode {
     pub bytes: usize,
     pub feedback: bool,
     inline_fields: bool,
+    quiet_edges: Vec<(usize, usize)>,
     entry_locals: Vec<(Register, usize)>,
     inline_scratch: usize,
     pub diagnostics: Option<NativeDiagnostics>,
@@ -131,11 +133,25 @@ impl NativeCode {
             root_states,
             bytes: 0,
             feedback,
+            quiet_edges: if feedback {
+                vec![]
+            } else {
+                quiet_loop_edges(&lir)
+            },
             inline_fields: !feedback
                 && cfg!(target_endian = "little")
                 && lir.blocks.iter().any(|block| {
                     block.instructions.iter().any(|instruction| {
                         matches!(
+                            instruction.operation,
+                            Operation::SequenceGet { .. }
+                                | Operation::Call {
+                                    helper: lir::Helper::GetItem
+                                        | lir::Helper::SetItem
+                                        | lir::Helper::Python(crate::hir::CoreOp::Next),
+                                    ..
+                                }
+                        ) || matches!(
                             instruction.operation,
                             Operation::Call {
                                 helper: lir::Helper::GetAttr(ref attribute),
@@ -462,6 +478,52 @@ impl NativeCode {
                     );
                     b.ins().jump(ready, &[]);
                     b.switch_to_block(quiet);
+                    for (index, &(from, to)) in owner.quiet_edges.iter().enumerate() {
+                        if to != block_index {
+                            continue;
+                        }
+                        let previous = b.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            host,
+                            std::mem::offset_of!(crate::native_runtime::Context<'_>, previous)
+                                as i32,
+                        );
+                        let edge = b.ins().icmp_imm_s(IntCC::Equal, previous, from as i64);
+                        let skip = b.ins().load(
+                            types::I8,
+                            MemFlagsData::new(),
+                            host,
+                            std::mem::offset_of!(crate::native_runtime::Context<'_>, skip_probe)
+                                as i32,
+                        );
+                        let enabled = b.ins().icmp_imm_s(IntCC::Equal, skip, 0);
+                        let edge = b.ins().band(edge, enabled);
+                        let increment = b.create_block();
+                        let counted = b.create_block();
+                        b.ins().brif(edge, increment, &[], counted, &[]);
+                        b.switch_to_block(increment);
+                        let counts = b.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            host,
+                            std::mem::offset_of!(crate::native_runtime::Context<'_>, quiet_counts)
+                                as i32,
+                        );
+                        let count = b.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            counts,
+                            (index * 8) as i32,
+                        );
+                        let full = b.ins().icmp_imm_s(IntCC::Equal, count, -1);
+                        let next = b.ins().iadd_imm_s(count, 1);
+                        let next = b.ins().select(full, count, next);
+                        b.ins()
+                            .store(MemFlagsData::new(), next, counts, (index * 8) as i32);
+                        b.ins().jump(counted, &[]);
+                        b.switch_to_block(counted);
+                    }
                     let block = b.ins().iconst(types::I64, block_index as i64);
                     b.ins().store(
                         MemFlagsData::new(),
@@ -653,6 +715,124 @@ impl NativeCode {
                                 location,
                                 failed,
                             );
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::SetItem,
+                            arguments,
+                            ..
+                        } if !feedback
+                            && owner.lir.regions.is_empty()
+                            && owner.nest.is_none()
+                            && !owner.lir.blocks.iter().flat_map(|b| &b.instructions).any(
+                                |i| matches!(i.operation, Operation::FloatListView { .. }),
+                            ) =>
+                        {
+                            let done = b.create_block();
+                            sequence::store(
+                                &mut b,
+                                &scalars,
+                                host,
+                                registers,
+                                arguments[0],
+                                arguments[1],
+                                arguments[2],
+                                destination.unwrap(),
+                                done,
+                            )?;
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::Python(crate::hir::CoreOp::Next),
+                            arguments,
+                            ..
+                        } if !feedback && !in_nest && region_index.is_none() => {
+                            let done = b.create_block();
+                            sequence::range_next(
+                                &mut b,
+                                &scalars,
+                                host,
+                                registers,
+                                arguments[0],
+                                destination.unwrap(),
+                                done,
+                            )?;
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call {
+                            helper: lir::Helper::GetItem,
+                            arguments,
+                            ..
+                        } if !feedback => {
+                            let done = b.create_block();
+                            sequence::load(
+                                &mut b,
+                                &scalars,
+                                host,
+                                registers,
+                                arguments[0],
+                                None,
+                                lir::SequenceIndex::Value(arguments[1]),
+                                destination.unwrap(),
+                                done,
+                            )?;
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::SequenceGet {
+                            value, kind, index, ..
+                        } if !feedback => {
+                            let done = b.create_block();
+                            sequence::load(
+                                &mut b,
+                                &scalars,
+                                host,
+                                registers,
+                                *value,
+                                Some(*kind),
+                                *index,
+                                destination.unwrap(),
+                                done,
+                            )?;
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                SEQUENCE,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
                         }
                         Operation::SequenceUnpack { .. } | Operation::SequenceGet { .. } => {
                             runtime_call!(
@@ -1350,6 +1530,8 @@ impl NativeCode {
                                         | lir::Helper::LoadName(_)
                                         | lir::Helper::StoreName(_)
                                         | lir::Helper::StringNext
+                                        | lir::Helper::SetItem
+                                        | lir::Helper::Python(crate::hir::CoreOp::Next)
                                 ) || matches!(helper, lir::Helper::Scoped(inner) if matches!(inner.as_ref(), lir::Helper::ScalarCall(_)))) =>
                         {
                             // Closed probes cannot collect or call Python; stores only replace an existing
@@ -1359,6 +1541,8 @@ impl NativeCode {
                                 lir::Helper::LoadName(_) => NAME_LOAD,
                                 lir::Helper::StoreName(_) => NAME_STORE,
                                 lir::Helper::StringNext => STRING_NEXT,
+                                lir::Helper::SetItem => LIST_SET,
+                                lir::Helper::Python(crate::hir::CoreOp::Next) => RANGE_NEXT,
                                 _ => SCALAR_CALL,
                             };
                             scalars.materialize(
@@ -1653,6 +1837,7 @@ impl NativeCode {
         crate::native_runtime::execute(
             &self.lir,
             &self.locations,
+            &self.quiet_edges,
             Some(&self.root_states),
             !self.feedback,
             &self.entry_locals,
@@ -1942,6 +2127,9 @@ impl ScalarVars {
                 | NAME_LOAD
                 | NAME_STORE
                 | LEAF_ENTER
+                | STRING_NEXT
+                | RANGE_NEXT
+                | LIST_SET
         ) {
             return Ok(());
         }
@@ -2217,17 +2405,46 @@ fn callback_failure_values(
     })
 }
 
+/// Quiet loops accumulate incoming edges without borrowing Python profile maps per iteration.
+fn quiet_loop_edges(lir: &lir::Function) -> Vec<(usize, usize)> {
+    if lir.block_origins.iter().any(Option::is_none) {
+        return vec![];
+    }
+    let headers = lir
+        .osr_entries
+        .iter()
+        .map(|e| e.header.0)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut edges = std::collections::BTreeSet::new();
+    for (from, block) in lir.blocks.iter().enumerate() {
+        let mut add = |to| {
+            if headers.contains(&to) {
+                edges.insert((from, to));
+            }
+        };
+        match &block.terminator {
+            Terminator::Jump(e) => add(e.block.0),
+            Terminator::Branch { yes, no, .. } => {
+                add(yes.block.0);
+                add(no.block.0);
+            }
+            Terminator::Return(_) => {}
+        }
+    }
+    edges.into_iter().collect()
+}
+
 /// OSR entries name every HIR backedge target, including forward-layout backedges.
 /// A region exit must flush its deferred iterator/profile state before ordinary blocks run.
 fn block_callback_targets(
     lir: &lir::Function,
     nest: Option<&crate::region::nest::LoopNest>,
 ) -> std::collections::BTreeSet<usize> {
-    let mut targets = lir
-        .osr_entries
-        .iter()
-        .map(|entry| entry.header.0)
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut targets = if lir.block_origins.iter().any(Option::is_none) {
+        lir.osr_entries.iter().map(|entry| entry.header.0).collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
     for (index, block) in lir.blocks.iter().enumerate() {
         if !lir
             .regions

@@ -289,7 +289,7 @@ impl HeapViews {
                     };
                     // Stable arena payloads cannot move or be collected while the verified region runs.
                     // Refresh iterator field pointers after each boundary; generic next may replace the payload.
-                    d.index = index as *mut usize as u64;
+                    d.index = index.as_ptr() as u64;
                     d.exhausted = exhausted as *mut bool as u64;
                 }
                 Object::Range { start, stop, step } => {

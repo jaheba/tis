@@ -22,3 +22,8 @@ Only the generator expression passed to the final `join` becomes a list comprehe
 The complete upstream source is retained in `tests/vendor/flying-circus/ticket_search.py`.
 The default indexes 1,600 deterministic tickets and ranks five queries.
 The `.out` files are captured from CPython and validated on every benchmark sample.
+
+`sieve.py` is an original Sieve of Eratosthenes workload with an inclusive bound of 1,000,000.
+It allocates a boolean list, marks composites from each prime's square, and scans for a count, sum and last prime.
+CPython produces `78498 37550402023 999983`; `sieve.out` retains that checksum.
+Every invocation allocates a fresh sieve. The marking loop uses scalar indexed stores rather than slice assignment.

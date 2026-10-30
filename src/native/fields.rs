@@ -27,28 +27,15 @@ pub(super) fn load(
             b.switch_to_block(next);
         }};
     }
-    // Recursion can reopen an observation window even in an artifact compiled without feedback.
-    let collecting = b.ins().load(
-        types::I8,
-        MemFlagsData::new(),
-        host,
-        offset_of!(crate::native_runtime::Context<'_>, collecting) as i32,
-    );
-    let quiet = b.ins().icmp_imm_s(IntCC::Equal, collecting, 0);
-    guard!(quiet);
-    let tag = load_cached(b, scalars, registers, receiver, 0, types::I64)?;
-    let kind = b.ins().band_imm_s(tag, KIND_MASK as i64);
-    let is_ref = b.ins().icmp_imm_s(IntCC::Equal, kind, REF as i64);
-    guard!(is_ref);
-
-    // Context owns the original VM borrow. Derive pointers afresh; recursive calls may move
-    // the directory, and any object mutation refreshes its row before returning to native code.
-    let vm = b.ins().load(
+    let (vm, row) = checked_row(b, scalars, host, registers, receiver, miss)?;
+    let kind = b.ins().load(
         types::I64,
         MemFlagsData::new(),
-        host,
-        offset_of!(crate::native_runtime::Context<'_>, vm) as i32,
+        row,
+        offset_of!(NativeFields, kind) as i32,
     );
+    let instance = b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
+    guard!(instance);
     let protocols = b.ins().load(
         types::I8,
         MemFlagsData::new(),
@@ -57,47 +44,6 @@ pub(super) fn load(
     );
     let plain = b.ins().icmp_imm_s(IntCC::Equal, protocols, 0);
     guard!(plain);
-    let directory = b.ins().iadd_imm_s(
-        vm,
-        (offset_of!(Vm, heap) + offset_of!(crate::Heap, native_fields)) as i64,
-    );
-    let heap = b.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        directory,
-        offset_of!(NativeFieldDirectory, heap) as i32,
-    );
-    let receiver_heap = b.ins().ushr_imm_u(tag, 32);
-    let same_heap = b.ins().icmp(IntCC::Equal, receiver_heap, heap);
-    guard!(same_heap);
-    let payload = load_cached(b, scalars, registers, receiver, 8, types::I64)?;
-    let index = b.ins().ireduce(types::I32, payload);
-    let index = b.ins().uextend(types::I64, index);
-    let len = b.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        directory,
-        offset_of!(NativeFieldDirectory, len) as i32,
-    );
-    let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
-    guard!(in_bounds);
-    let entries = b.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        directory,
-        offset_of!(NativeFieldDirectory, entries) as i32,
-    );
-    let offset = b.ins().imul_imm_s(index, size_of::<NativeFields>() as i64);
-    let row = b.ins().iadd(entries, offset);
-    let generation = b.ins().ushr_imm_u(payload, 32);
-    let actual = b.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        row,
-        offset_of!(NativeFields, generation) as i32,
-    );
-    let same_generation = b.ins().icmp(IntCC::Equal, generation, actual);
-    guard!(same_generation);
     // Attribute lives in the Rc-owned LIR for the entire compiled artifact lifetime.
     let cache = b
         .ins()
@@ -147,9 +93,112 @@ pub(super) fn load(
     Ok(())
 }
 
+/// Resolve a generation-checked row. Pointers are consumed before any runtime boundary.
+pub(super) fn checked_row(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    host: ir::Value,
+    registers: ir::Value,
+    receiver: Register,
+    miss: ir::Block,
+) -> Result<(ir::Value, ir::Value)> {
+    macro_rules! guard {
+        ($condition:expr) => {{
+            let next = b.create_block();
+            b.ins().brif($condition, next, &[], miss, &[]);
+            b.switch_to_block(next);
+        }};
+    }
+    // Recursion can reopen an observation window even in an artifact compiled without feedback.
+    let collecting = b.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        host,
+        offset_of!(crate::native_runtime::Context<'_>, collecting) as i32,
+    );
+    let quiet = b.ins().icmp_imm_s(IntCC::Equal, collecting, 0);
+    guard!(quiet);
+    let tag = load_cached(b, scalars, registers, receiver, 0, types::I64)?;
+    let kind = b.ins().band_imm_s(tag, KIND_MASK as i64);
+    let is_ref = b.ins().icmp_imm_s(IntCC::Equal, kind, REF as i64);
+    guard!(is_ref);
+
+    // Context owns the original VM borrow. Derive pointers afresh; recursive calls may move
+    // the directory, and any object mutation refreshes its row before returning to native code.
+    let vm = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        host,
+        offset_of!(crate::native_runtime::Context<'_>, vm) as i32,
+    );
+    let payload = load_cached(b, scalars, registers, receiver, 8, types::I64)?;
+    let row = identity_row(b, vm, tag, payload, miss)?;
+    Ok((vm, row))
+}
+
+pub(super) fn identity_row(
+    b: &mut FunctionBuilder<'_>,
+    vm: ir::Value,
+    tag: ir::Value,
+    payload: ir::Value,
+    miss: ir::Block,
+) -> Result<ir::Value> {
+    macro_rules! guard {
+        ($condition:expr) => {{
+            let next = b.create_block();
+            b.ins().brif($condition, next, &[], miss, &[]);
+            b.switch_to_block(next);
+        }};
+    }
+    let kind = b.ins().band_imm_s(tag, KIND_MASK as i64);
+    let reference = b.ins().icmp_imm_s(IntCC::Equal, kind, REF as i64);
+    guard!(reference);
+    let directory = b.ins().iadd_imm_s(
+        vm,
+        (offset_of!(Vm, heap) + offset_of!(crate::Heap, native_fields)) as i64,
+    );
+    let heap = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        directory,
+        offset_of!(NativeFieldDirectory, heap) as i32,
+    );
+    let receiver_heap = b.ins().ushr_imm_u(tag, 32);
+    let same_heap = b.ins().icmp(IntCC::Equal, receiver_heap, heap);
+    guard!(same_heap);
+    let index = b.ins().ireduce(types::I32, payload);
+    let index = b.ins().uextend(types::I64, index);
+    let len = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        directory,
+        offset_of!(NativeFieldDirectory, len) as i32,
+    );
+    let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, index, len);
+    guard!(in_bounds);
+    let entries = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        directory,
+        offset_of!(NativeFieldDirectory, entries) as i32,
+    );
+    let offset = b.ins().imul_imm_s(index, size_of::<NativeFields>() as i64);
+    let row = b.ins().iadd(entries, offset);
+    let generation = b.ins().ushr_imm_u(payload, 32);
+    let actual = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, generation) as i32,
+    );
+    let same_generation = b.ins().icmp(IntCC::Equal, generation, actual);
+    guard!(same_generation);
+    Ok(row)
+}
+
 /// `repr(u32)` Value has a C union of tagged C structs. Read only initialized payload
 /// bytes: bool and ObjectId begin at byte 4; aligned int/float payloads begin at byte 8.
-fn decode(
+pub(super) fn decode(
     b: &mut FunctionBuilder<'_>,
     scalars: &ScalarVars,
     registers: ir::Value,

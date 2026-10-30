@@ -537,6 +537,7 @@ impl CopyCode {
         native_runtime::execute(
             &self.lir,
             &self.locations,
+            &[],
             None,
             false,
             &[],

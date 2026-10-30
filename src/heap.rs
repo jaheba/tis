@@ -91,7 +91,7 @@ pub enum Object {
     Iterator {
         source: Value,
         // UTF-8 byte offset for strings; element index for other sequences.
-        index: usize,
+        index: Cell<usize>,
         size: usize,
         exhausted: bool,
     },
@@ -171,13 +171,15 @@ struct Entry {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NativeFields {
-    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = compact float list (length only).
+    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = float list, 5 = range, 6 = iterator.
     pub(crate) kind: u64,
     pub(crate) class_tag: u64,
     pub(crate) class_payload: u64,
     pub(crate) generation: u64,
     pub(crate) shape: u64,
     pub(crate) values: *const Value,
+    /// Mutable provenance is published only after an exclusive boxed-list borrow.
+    pub(crate) writable_values: *mut Value,
     pub(crate) len: usize,
 }
 
@@ -194,6 +196,7 @@ impl NativeFields {
                     generation: generation as u64,
                     shape,
                     values,
+                    writable_values: std::ptr::null_mut(),
                     len,
                 }
             }
@@ -213,8 +216,49 @@ impl NativeFields {
                 len: values.len(),
                 ..Self::default()
             },
+            Object::Range { start, stop, step } => {
+                match crate::execution::range_len(*start, *stop, *step) {
+                    Ok(len) => Self {
+                        kind: 5,
+                        generation: generation as u64,
+                        class_tag: *start as u64,
+                        class_payload: *step as u64,
+                        len,
+                        ..Self::default()
+                    },
+                    Err(_) => Self::default(),
+                }
+            }
+            Object::Iterator {
+                source,
+                index,
+                size,
+                exhausted: false,
+            } => {
+                let source = crate::native_abi::Slot::boxed(*source);
+                Self {
+                    kind: 6,
+                    generation: generation as u64,
+                    class_tag: source.tag,
+                    class_payload: source.a,
+                    shape: index.as_ptr() as u64,
+                    len: *size,
+                    ..Self::default()
+                }
+            }
             _ => Self::default(),
         }
+    }
+
+    fn of_mut(object: &mut Object, generation: u32) -> Self {
+        let mut row = Self::of(object, generation);
+        if let Object::List(list) = object
+            && let Some(values) = list.native_values_mut()
+        {
+            row.values = values;
+            row.writable_values = values;
+        }
+        row
     }
 }
 
@@ -354,7 +398,7 @@ impl Heap {
         ))
     }
 
-    /// The extra directory is needed only by Cranelift field loads, never by bytecode or stencils.
+    /// Cranelift heap probes use this directory; bytecode and stencils do not need it.
     pub(crate) fn enable_native_fields(&self) {
         if self.native_fields.get().heap != 0 {
             return;
@@ -574,14 +618,15 @@ struct FieldMutation<'a> {
     directory: &'a Cell<NativeFieldDirectory>,
 }
 
-struct ObjectMut<'a, G: Deref<Target = Entry>>(G, Option<FieldMutation<'a>>);
+struct ObjectMut<'a, G: DerefMut<Target = Entry>>(G, Option<FieldMutation<'a>>);
 
-impl<G: Deref<Target = Entry>> Drop for ObjectMut<'_, G> {
+impl<G: DerefMut<Target = Entry>> Drop for ObjectMut<'_, G> {
     fn drop(&mut self) {
         if let Some(fields) = &mut self.1 {
             // Mutation can replace the object, change shape, or reallocate the field vector.
-            // Derive a fresh shared pointer after the mutable object borrow has ended.
-            fields.rows[fields.index] = NativeFields::of(&self.0.object, fields.generation);
+            // Publish fresh pointers from this exclusive borrow; no Rust payload borrow may
+            // remain live when generated code uses the directory.
+            fields.rows[fields.index] = NativeFields::of_mut(&mut self.0.object, fields.generation);
             let mut directory = fields.directory.get();
             directory.entries = fields.rows.as_ptr();
             fields.directory.set(directory);
@@ -589,7 +634,7 @@ impl<G: Deref<Target = Entry>> Drop for ObjectMut<'_, G> {
     }
 }
 
-impl<G: Deref<Target = Entry>> Deref for ObjectMut<'_, G> {
+impl<G: DerefMut<Target = Entry>> Deref for ObjectMut<'_, G> {
     type Target = Object;
     fn deref(&self) -> &Self::Target {
         &self.0.object

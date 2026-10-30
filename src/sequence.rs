@@ -70,3 +70,31 @@ pub(crate) fn get(
         .ok()
         .and_then(|index| items.get(index)))
 }
+
+/// Store only into existing boxed list storage. No Python calls, VM allocation or collection.
+pub(crate) fn set(heap: &mut Heap, source: Value, key: Value, value: Value) -> Result<bool> {
+    let Value::Int(index) = key else {
+        return Ok(false);
+    };
+    let Ok(Object::List(items)) = heap.get(source) else {
+        return Ok(false);
+    };
+    if items.native_values().is_none() {
+        return Ok(false);
+    }
+    let index = if index < 0 {
+        i128::from(index) + items.len() as i128
+    } else {
+        i128::from(index)
+    };
+    let Ok(index) = usize::try_from(index) else {
+        return Ok(false);
+    };
+    if index >= items.len() {
+        return Ok(false);
+    }
+    if let Object::List(items) = &mut *heap.get_mut(source)? {
+        items.set(index, value);
+    }
+    Ok(true)
+}

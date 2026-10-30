@@ -129,3 +129,19 @@ fn slot_only_calls_keep_recursion_defaults_and_closure_environments_distinct() {
         run(source, tier);
     }
 }
+
+#[test]
+fn sieve_handles_boundaries_and_runs_in_every_tier() {
+    let source = include_str!("fixtures/sieve.py").replace("LIMIT = 1_000_000", "LIMIT = 100")
+        + "\nassert sieve(0)==(0,0,0)\nassert sieve(1)==(0,0,0)\nassert sieve(2)==(1,2,2)\nassert sieve(49)==(15,328,47)\n";
+    for tier in [
+        Tiering::Bytecode,
+        Tiering::Lir,
+        Tiering::Native,
+        Tiering::CopyPatch,
+    ] {
+        let vm = run(&source, tier);
+        assert_eq!(vm.output, "25 1060 97\n", "{tier:?}");
+        assert_eq!(vm.tier_stats.compilation_errors, 0, "{tier:?}");
+    }
+}

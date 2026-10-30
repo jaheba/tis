@@ -14,7 +14,8 @@ from bench_nbody import digest, summarize
 from compare_runtimes import runtime_info, checked_stderr
 
 FIXTURES = {'barnes-hut': ('barnes_hut', "\nprint(f'", 'bench_quadtree_nbody', (1, 200, 100, 0.5)),
-            'ticket-search': ('ticket_search', '\nsearch()', 'search', ())}
+            'ticket-search': ('ticket_search', '\nsearch()', 'search', ()),
+            'sieve': ('sieve', '\nbench_sieve(LIMIT)', 'bench_sieve', (1_000_000,))}
 
 
 def python_worker(benchmark, warmups):

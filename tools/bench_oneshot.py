@@ -13,7 +13,7 @@ import time
 from bench_nbody import EXPECTED, digest, summarize
 from compare_runtimes import checked_stderr, runtime_info
 
-FIXTURES = {'nbody': 'game_nbody', 'barnes-hut': 'barnes_hut', 'ticket-search': 'ticket_search'}
+FIXTURES = {'nbody': 'game_nbody', 'barnes-hut': 'barnes_hut', 'ticket-search': 'ticket_search', 'sieve': 'sieve'}
 
 
 def main():

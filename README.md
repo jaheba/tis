@@ -566,13 +566,39 @@ python3 tools/bench_suite.py --worker target/release/examples/bench \
   --python /path/to/python3 --pypy /path/to/pypy3 --output /tmp/tis-object-benchmarks
 ```
 
-The default runner warms each process twice, then collects ten serial, interleaved samples for
+The default runner warms each process once, then collects three serial, interleaved samples for
 bytecode, Cranelift, CPython and optional PyPy. Each call starts a fresh scene or index; input
 construction and Barnes–Hut energy calculations are included, matching the workload function.
 Compilation and module definitions precede timing. Complete output is validated against CPython
 on every sample; backend compilation and deoptimization are retained rather than assumed absent.
 Use `--tiers lir copy-patch` to measure the other execution tiers. The existing nbody harness remains
 separate so its reset-and-time-advance protocol does not change.
+
+## Sieve of Eratosthenes
+
+`sieve` marks primes through 1,000,000 using a boolean list and scalar indexed stores.
+Each invocation creates a fresh list and prints the prime count, sum and largest prime:
+`78498 37550402023 999983`.
+It exercises integer loops, indexing and mutable list elements without library calls.
+
+```sh
+tis tests/fixtures/sieve.py
+tis --tier native tests/fixtures/sieve.py
+python3 tools/bench_suite.py --worker target/release/examples/bench \
+  --benchmarks sieve --samples 3 --warmups 1 --output /tmp/tis-sieve-warmed
+python3 tools/bench_oneshot.py --run target/release/examples/run \
+  --benchmarks sieve --samples 3 --output /tmp/tis-sieve-oneshot
+```
+
+Both benchmark runners include sieve in their default selections.
+
+Cranelift probes exact boxed lists, tuples and builtin range iterators directly, including blocks
+without operand feedback. Guards check current heap identity, generation, representation, index and bounds.
+List stores use pointers published by exclusive heap borrows and fall back in artifacts with cached heap views.
+The iterator cursor is a `Cell<usize>` in the real heap object, so aliases observe each completed step immediately.
+Custom protocols, exhaustion, promotions, index conversions and active feedback retain the general runtime path.
+Quiet native loops accumulate backedge counts in invocation-owned scratch and merge them on return, error or deoptimization.
+Observing loops keep immediate profiling callbacks. CFG-expanded artifacts retain their existing bookkeeping.
 
 ## One-shot performance
 
@@ -583,8 +609,8 @@ python3 tools/bench_oneshot.py --run target/release/examples/run \
   --python /path/to/python3 --pypy /path/to/pypy3 --output /tmp/tis-oneshot
 ```
 
-The default is ten serial, interleaved fresh processes per runtime for nbody (20,000 steps),
-Barnes–Hut (200 particles / 100 steps) and ticket search (1,600 tickets). Timing includes process
+The default is three serial, interleaved fresh processes per runtime for nbody (20,000 steps),
+Barnes–Hut (200 particles / 100 steps), ticket search (1,600 tickets) and sieve (primes through 1,000,000). Timing includes process
 startup, source parsing, compilation, JIT work during that first execution, output and process exit.
 All stdout is validated. This is separate from the warmed worker protocol; OS file caches are not flushed.
 Use `--benchmarks` and `--tiers` to select workloads and tis execution tiers. Results retain commands,

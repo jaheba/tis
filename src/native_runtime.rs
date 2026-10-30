@@ -68,6 +68,7 @@ pub(crate) type Entry = unsafe extern "C" fn(*mut c_void, *mut Slot, u32) -> u64
 #[derive(Debug, Default)]
 pub(crate) struct Scratch {
     registers: Vec<Slot>,
+    quiet_counts: Vec<u64>,
     rooted: Vec<usize>,
     helper_arguments: Vec<Value>,
 }
@@ -76,6 +77,7 @@ pub(crate) struct Scratch {
 pub(crate) fn execute(
     lir: &lir::Function,
     locations: &[(usize, usize)],
+    quiet_edges: &[(usize, usize)],
     root_states: Option<&[lir::FrameState]>,
     lazy_slots: bool,
     entry_locals: &[(lir::Register, usize)],
@@ -101,6 +103,9 @@ pub(crate) fn execute(
     let mut scratch = vm.native_register_pool.pop().unwrap_or_default();
     let mut registers = std::mem::take(&mut scratch.registers);
     registers.resize(size, Slot::default());
+    let mut quiet_counts = std::mem::take(&mut scratch.quiet_counts);
+    quiet_counts.resize(quiet_edges.len(), 0);
+    quiet_counts.fill(0);
     let result = (|| {
         let mut rooted = std::mem::take(&mut scratch.rooted);
         // Copy the initial image and record its existing shadow roots in the same frame scan.
@@ -156,6 +161,7 @@ pub(crate) fn execute(
             vm: vm as *mut Vm,
             inline_field_hits: 0,
             inline_block_hits: 0,
+            quiet_counts: quiet_counts.as_mut_ptr(),
             function,
             code,
             lir,
@@ -194,6 +200,22 @@ pub(crate) fn execute(
             vm.tier_stats.native_field_hits += context.inline_field_hits;
             vm.tier_stats.shape_read_hits += context.inline_field_hits;
             context.flush_region()?;
+            // Quiet counts contain no Python handles. Merge even on guard/error exits, after
+            // native execution has stopped; observing blocks still use immediate bookkeeping.
+            if !quiet_edges.is_empty() {
+                let f = function.borrow();
+                let mut profile = f.profile.borrow_mut();
+                for (&(from, to), &count) in quiet_edges.iter().zip(&quiet_counts) {
+                    let (Some(from), Some(to)) = (lir.block_origins[from], lir.block_origins[to])
+                    else {
+                        continue;
+                    };
+                    if count != 0 && code.backedge_sources[to.0].contains(&from.0) {
+                        let edge = profile.backedges.entry((from.0, to.0)).or_default();
+                        *edge = edge.saturating_add(count);
+                    }
+                }
+            }
             if let Some(error) = context.error.take() {
                 return Err(error);
             }
@@ -230,6 +252,8 @@ pub(crate) fn execute(
     // stale references from being read when a later function uses fewer registers.
     registers.clear();
     scratch.registers = registers;
+    quiet_counts.clear();
+    scratch.quiet_counts = quiet_counts;
     scratch.rooted.clear();
     scratch.helper_arguments.clear();
     vm.native_register_pool.push(scratch);
@@ -244,6 +268,8 @@ pub(crate) struct Context<'a> {
     pub(crate) vm: *mut Vm,
     pub(crate) inline_field_hits: u64,
     pub(crate) inline_block_hits: u64,
+    /// Fixed invocation-owned array; never resized while native code runs.
+    pub(crate) quiet_counts: *mut u64,
     function: &'a Rc<RefCell<Function>>,
     code: &'a Code,
     lir: &'a lir::Function,
@@ -490,7 +516,13 @@ pub(crate) extern "C" fn guarded_helper_callback(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
         if !matches!(
             event,
-            SCALAR_CALL | TUPLE_ALLOC | NAME_LOAD | NAME_STORE | STRING_NEXT
+            SCALAR_CALL
+                | TUPLE_ALLOC
+                | NAME_LOAD
+                | NAME_STORE
+                | STRING_NEXT
+                | RANGE_NEXT
+                | LIST_SET
         ) || registers != context.registers
         {
             return Err(Error::InvalidIr("guarded helper gateway"));
@@ -543,6 +575,24 @@ pub(crate) extern "C" fn guarded_helper_callback(
                 let value = value?;
                 debug_assert!(matches!(value, Value::Int(_) | Value::Float(_)));
                 value
+            }
+            (RANGE_NEXT, lir::Helper::Python(crate::hir::CoreOp::Next)) => {
+                let Some(value) = vm.try_range_next(slots[arguments[0].0].value()?)? else {
+                    return Ok(false);
+                };
+                value
+            }
+            (LIST_SET, lir::Helper::SetItem) => {
+                if !crate::sequence::set(
+                    &mut vm.heap,
+                    slots[arguments[0].0].value()?,
+                    slots[arguments[1].0].value()?,
+                    slots[arguments[2].0].value()?,
+                )? {
+                    return Ok(false);
+                }
+                context.views.clear();
+                Value::None
             }
             (STRING_NEXT, lir::Helper::StringNext) => {
                 let [iterator] = arguments.as_slice() else {
@@ -755,7 +805,7 @@ impl Context<'_> {
             let size = vm.heap.len(source)?;
             let iterator = vm.heap.allocate(crate::Object::Iterator {
                 source,
-                index: 0,
+                index: 0.into(),
                 size,
                 exhausted: false,
             });
@@ -1078,6 +1128,45 @@ impl Context<'_> {
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
         let scoped = || SCOPED && self.lir.is_scoped_instruction(instruction);
+        if event == HELPER && !self.collecting && !scoped() {
+            // Exact builtin probes cannot allocate VM objects, call Python or collect. Misses retain
+            // the ordinary conservative helper path and its original deoptimization/root state.
+            let value = match &instruction.operation {
+                Operation::Call {
+                    helper: lir::Helper::Python(crate::hir::CoreOp::IsDone),
+                    arguments,
+                    ..
+                } => Some(Value::Bool(vm.is_done(registers[arguments[0].0].value()?))),
+                Operation::Call {
+                    helper: lir::Helper::Python(crate::hir::CoreOp::Next),
+                    arguments,
+                    ..
+                } => vm.try_range_next(registers[arguments[0].0].value()?)?,
+                Operation::Call {
+                    helper: lir::Helper::SetItem,
+                    arguments,
+                    ..
+                } => {
+                    let object = registers[arguments[0].0].value()?;
+                    let key = registers[arguments[1].0].value()?;
+                    let value = registers[arguments[2].0].value()?;
+                    if crate::sequence::set(&mut vm.heap, object, key, value)? {
+                        self.views.clear();
+                        Some(Value::None)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(value) = value {
+                registers[instruction
+                    .result
+                    .ok_or(Error::InvalidIr("builtin probe destination"))?
+                    .0] = Slot::boxed(value);
+                return Ok(());
+            }
+        }
         if event == HELPER
             && !self.collecting
             && !scoped()

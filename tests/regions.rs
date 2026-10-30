@@ -115,7 +115,7 @@ fn length_failure_preserves_iterator_progress_and_prior_effects() {
     let input = rows(&vm, vec![good, wrong, good]);
     let it = vm.heap.allocate(Object::Iterator {
         source: input,
-        index: 0,
+        index: 0.into(),
         size: 3,
         exhausted: false,
     });
@@ -136,10 +136,10 @@ fn length_failure_preserves_iterator_progress_and_prior_effects() {
     assert!(matches!(
         vm.heap.get(it).unwrap(),
         Object::Iterator {
-            index: 2,
+            index,
             exhausted: false,
             ..
-        }
+        } if index.get() == 2
     ));
     assert_eq!(vm.stack_len(), 0);
 }
@@ -261,7 +261,7 @@ fn float_iteration_reads_updates_and_exhaustion_remains_sticky() {
     let source = floats(&other, &[1.0, 2.0, 3.0]);
     let iter = other.heap.allocate(Object::Iterator {
         source,
-        index: 0,
+        index: 0.into(),
         size: 3,
         exhausted: false,
     });
@@ -621,7 +621,7 @@ fn closed_nest_failure_preserves_partial_writes_and_consumed_outer_item() {
         .unwrap();
     let steps = vm.heap.allocate(Object::Iterator {
         source: steps,
-        index: 0,
+        index: 0.into(),
         size: 7,
         exhausted: false,
     });
@@ -644,10 +644,10 @@ fn closed_nest_failure_preserves_partial_writes_and_consumed_outer_item() {
     assert!(matches!(
         vm.heap.get(steps).unwrap(),
         Object::Iterator {
-            index: 2,
+            index,
             exhausted: false,
             ..
-        }
+        } if index.get() == 2
     ));
     assert_eq!(vm.stack_len(), 0);
 }
@@ -683,7 +683,7 @@ fn inner_iterator_alias_preserves_shared_exhaustion() {
         .unwrap();
     let iterator = vm.heap.allocate(Object::Iterator {
         source: input,
-        index: 0,
+        index: 0.into(),
         size: 3,
         exhausted: false,
     });
@@ -695,10 +695,10 @@ fn inner_iterator_alias_preserves_shared_exhaustion() {
     assert!(matches!(
         vm.heap.get(iterator).unwrap(),
         Object::Iterator {
-            index: 3,
+            index,
             exhausted: true,
             ..
-        }
+        } if index.get() == 3
     ));
 }
 

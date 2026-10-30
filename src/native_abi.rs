@@ -44,3 +44,6 @@ pub(crate) const VIEW_FEEDBACK: u64 = 1 << 8;
 const _: () = assert!(std::mem::size_of::<Slot>() == 16);
 
 pub(crate) const STRING_NEXT: i32 = 14;
+
+pub(crate) const RANGE_NEXT: i32 = 15;
+pub(crate) const LIST_SET: i32 = 16;

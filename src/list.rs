@@ -68,6 +68,15 @@ impl List {
         }
     }
 
+    /// Only an exclusive heap borrow may publish a pointer for allocation-free native stores.
+    pub(crate) fn native_values_mut(&mut self) -> Option<*mut Value> {
+        self.snapshot.take();
+        match &mut self.storage {
+            Storage::Values(values) => Some(values.as_mut_ptr()),
+            Storage::Floats(_) => None,
+        }
+    }
+
     pub fn floats(&self) -> Option<&[f64]> {
         match &self.storage {
             Storage::Floats(v) => Some(v),
