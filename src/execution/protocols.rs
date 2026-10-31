@@ -145,6 +145,15 @@ impl Vm {
     }
 
     pub(crate) fn py_binary(&mut self, op: &str, a: Value, b: Value) -> Result<Value> {
+        if let Some(value) = self.decimal_binary(op, a, b) {
+            return value;
+        }
+        if op == "%" && self.heap.as_str(&a).is_some() {
+            return self.percent_format(a, b);
+        }
+        if let Some(value) = self.set_binary(op, a, b)? {
+            return Ok(value);
+        }
         if self.instance_class(a).is_some() || self.instance_class(b).is_some() {
             let stem = match op {
                 "+" => "add",
@@ -383,6 +392,9 @@ impl Vm {
             return Ok(());
         }
         if matches!(self.heap.get(object), Ok(Object::Dict(_))) {
+            if self.try_set_string_dict(object, key, value)? {
+                return Ok(());
+            }
             return self.mapping_set(object, key, value, false);
         }
         if matches!(self.heap.get(object), Ok(Object::List(_)))
@@ -429,6 +441,15 @@ impl Vm {
     }
 
     fn compare_protocol(&mut self, op: &str, a: Value, b: Value) -> Result<Value> {
+        if let Some(value) = self.date_comparison(op, a, b) {
+            return value;
+        }
+        if let Some(value) = self.decimal_comparison(op, a, b) {
+            return value;
+        }
+        if let Some(value) = self.set_comparison(op, a, b)? {
+            return Ok(Value::Bool(value));
+        }
         if op == "is" || op == "is not" {
             return compare(&self.heap, op, a, b).map(Value::Bool);
         }
@@ -449,7 +470,10 @@ impl Vm {
                 compare(&self.heap, "in", probe, b)?
             } else if let Some(value) = self.call_special(b, "__contains__", &[a])? {
                 self.protocol_roots(&[value], |vm| vm.py_truth(value))?
-            } else if matches!(self.heap.get(b), Ok(Object::Dict(_) | Object::Set(_))) {
+            } else if matches!(
+                self.heap.get(b),
+                Ok(Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_))
+            ) {
                 self.mapping_get(b, a)?.is_some()
             } else if self.instance_class(b).is_some()
                 || matches!(

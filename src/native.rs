@@ -1,4 +1,5 @@
 //! Cranelift gateway with guarded heap views and explicit runtime materialization boundaries.
+mod boolean;
 mod fields;
 mod locals;
 mod readonly;
@@ -145,6 +146,7 @@ impl NativeCode {
                         matches!(
                             instruction.operation,
                             Operation::SequenceGet { .. }
+                                | Operation::FloatListView { .. }
                                 | Operation::Call {
                                     helper: lir::Helper::GetItem
                                         | lir::Helper::SetItem
@@ -178,6 +180,17 @@ impl NativeCode {
                 .then(|| lir.nest.clone())
                 .flatten(),
         };
+        let fills = if feedback {
+            vec![]
+        } else {
+            crate::region::fill::find(&lir)
+        };
+        let reductions = if feedback {
+            vec![]
+        } else {
+            crate::region::reduce::find(&lir)
+        };
+        owner.inline_fields |= !fills.is_empty() || !reductions.is_empty();
         let module = owner.module.as_mut().unwrap();
         let ptr = module.target_config().pointer_type();
         let mut callback_sig = module.make_signature();
@@ -595,6 +608,30 @@ impl NativeCode {
                         failed
                     );
                 }
+                if !feedback && !in_nest && region_index.is_none() {
+                    let mut emitter = boolean::Emitter {
+                        b: &mut b,
+                        scalars: &scalars,
+                        host,
+                        registers,
+                    };
+                    if let Some(plan) = fills.iter().find(|plan| plan.header.0 == block_index)
+                        && let Some(edge) = owner
+                            .quiet_edges
+                            .iter()
+                            .position(|&(from, to)| from == plan.body.0 && to == block_index)
+                    {
+                        emitter.fill(plan, edge)?;
+                    }
+                    if let Some(plan) = reductions.iter().find(|plan| plan.header.0 == block_index)
+                        && let Some(edge) = owner
+                            .quiet_edges
+                            .iter()
+                            .position(|&(from, to)| from == plan.backedge.0 && to == block_index)
+                    {
+                        emitter.reduce(plan, edge)?;
+                    }
+                }
                 let bootstrap_reads = if !feedback {
                     crate::leaf_inline::bootstrap_reads(&body.instructions)
                 } else {
@@ -663,6 +700,24 @@ impl NativeCode {
                         }
                     }
                     match &instruction.operation {
+                        Operation::FloatListView { value, length, .. } if !feedback => {
+                            let done = b.create_block();
+                            sequence::float_view(
+                                &mut b,
+                                &scalars,
+                                host,
+                                registers,
+                                *value,
+                                *length,
+                                destination.unwrap(),
+                                done,
+                            )?;
+                            runtime_call!(
+                                &mut b, view_ref, host, registers, FLOAT_VIEW, location, failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
                         Operation::FloatListView { .. } => runtime_call!(
                             &mut b, view_ref, host, registers, FLOAT_VIEW, location, failed,
                         ),

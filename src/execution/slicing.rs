@@ -13,7 +13,12 @@ impl Vm {
             if matches!(object, Value::InlineString(_))
                 || matches!(
                     vm.heap.get(object),
-                    Ok(Object::String(_) | Object::List(_) | Object::Tuple(_) | Object::Bytes(_))
+                    Ok(Object::String(_)
+                        | Object::List(_)
+                        | Object::Tuple(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                        | Object::Range { .. })
                 )
             {
                 let [start, stop, step] = vm.normalized_slice_parts(start, stop, step)?;

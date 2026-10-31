@@ -144,6 +144,12 @@ impl Slot {
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct RangeFill {
+    pub counter_limit: usize,
+    pub counter_add: i64,
+    pub counter_step: usize,
+    pub counter_update: usize,
+    pub inclusive: bool,
+    pub descending: bool,
     pub last: usize,
     pub constant: usize,
     pub result: usize,
@@ -167,4 +173,45 @@ pub(crate) struct RangeReduce {
     pub vm_offset: usize,
     pub entries_offset: usize,
     pub iterations_offset: usize,
+}
+
+/// Exact arithmetic span; every value including the final counter must stay inline.
+/// Empty, non-progressing and overflowing spans retain the original loop.
+#[inline(always)]
+#[allow(dead_code)] // Also compiled into the separate stencil crate.
+pub(crate) fn counter_span(
+    first: i64,
+    limit: i64,
+    step: i64,
+    inclusive: bool,
+    descending: bool,
+) -> Option<(usize, i64, i64)> {
+    let (first, limit, step) = (first as i128, limit as i128, step as i128);
+    let distance = if descending {
+        if step >= 0 {
+            return None;
+        }
+        first - limit
+    } else {
+        if step <= 0 {
+            return None;
+        }
+        limit - first
+    };
+    let distance = distance - i128::from(!inclusive);
+    if distance < 0 {
+        return None;
+    }
+    let distance = i64::try_from(distance).ok()? as u64;
+    let count = distance
+        .checked_div((step as i64).unsigned_abs())?
+        .checked_add(1)?;
+    let count = i64::try_from(count).ok()? as i128;
+    let end = first.checked_add(count.checked_mul(step)?)?;
+    let last = end - step;
+    Some((
+        usize::try_from(count).ok()?,
+        i64::try_from(last).ok()?,
+        i64::try_from(end).ok()?,
+    ))
 }

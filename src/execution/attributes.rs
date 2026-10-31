@@ -24,6 +24,16 @@ impl Vm {
             Some(Object::Function(_)) if receiver.is_some() => Ok(self
                 .heap
                 .allocate(Object::Method(descriptor, receiver.unwrap()))),
+            Some(Object::Native(name))
+                if receiver.is_some()
+                    && (name.starts_with("list.")
+                        || name.starts_with("dataclasses.")
+                        || name == "object.__init__") =>
+            {
+                Ok(self
+                    .heap
+                    .allocate(Object::Method(descriptor, receiver.unwrap())))
+            }
             Some(Object::StaticMethod(function)) => Ok(function),
             Some(Object::ClassMethod(function)) => {
                 Ok(self.heap.allocate(Object::Method(function, class)))
@@ -64,6 +74,14 @@ impl Vm {
         if let Ok(Object::Super { anchor, receiver }) = self.heap.get(object) {
             let (anchor, receiver) = (*anchor, *receiver);
             return self.super_attribute(anchor, receiver, name);
+        }
+        if name == "__dict__"
+            && matches!(
+                self.heap.get(object),
+                Ok(Object::Instance { .. } | Object::Function(_))
+            )
+        {
+            return self.attributes_dictionary(object);
         }
         if name == "__class__" {
             return self.python_type(object);
@@ -316,6 +334,7 @@ impl Vm {
         let mut guard = self.heap.get_mut(object)?;
         let removed = match &mut *guard {
             Object::Instance { attributes, .. } => attributes.remove(name),
+            Object::Function(closure) => closure.attributes.remove(name),
             Object::Exception(exception) => exception.attributes.remove(name),
             Object::Class { namespace, .. } => {
                 let namespace = *namespace;
@@ -531,6 +550,11 @@ impl Vm {
             .ok_or(Error::Type("super receiver is not a subtype"))?
             + 1;
         for class in &mro[start..] {
+            if let Object::Native(kind) = self.heap.get(*class)?
+                && let Some(value) = self.builtin_type_descriptor(kind, name)
+            {
+                return self.descriptor_get(value, Some(receiver), actual);
+            }
             let value = match self.heap.get(*class)? {
                 Object::Class { namespace, .. } => self.env(*namespace)?.values.get(name).copied(),
                 Object::Native(kind) if is_exception(kind) && name == "__init__" => Some(

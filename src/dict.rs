@@ -36,6 +36,14 @@ pub struct Dict {
     version: u64,
 }
 impl Dict {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            heads: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            next: Vec::with_capacity(capacity),
+            ..Self::default()
+        }
+    }
     pub(crate) fn has_protocol_keys(&self) -> bool {
         self.protocol_keys
     }
@@ -57,13 +65,23 @@ impl Dict {
             .map(|i| &self.entries[i].1)
     }
     pub fn get_str(&self, key: &str) -> Option<&Value> {
+        self.string_position(key)
+            .map(|index| &self.entries[index].1)
+    }
+    pub(crate) fn replace_value(&mut self, index: usize, value: Value) -> Option<Value> {
+        // Updating a value preserves key order and the structural iterator version.
+        self.entries
+            .get_mut(index)
+            .map(|entry| std::mem::replace(&mut entry.1, value))
+    }
+    pub(crate) fn string_position(&self, key: &str) -> Option<usize> {
         let mut state = self.hasher.build_hasher();
         4u8.hash(&mut state);
         key.hash(&mut state);
         let mut index = self.heads.get(&state.finish()).copied().unwrap_or(END);
         while index != END {
             if matches!(&self.entries[index].0,Key::String(candidate) if candidate.as_str()==key) {
-                return Some(&self.entries[index].1);
+                return Some(index);
             }
             index = self.next[index];
         }
@@ -142,6 +160,18 @@ impl PartialEq for Dict {
 impl Hash for Key {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            Self::FrozenSet(data) => {
+                use std::collections::hash_map::DefaultHasher;
+                8u8.hash(state);
+                data.1.len().hash(state);
+                let mut combined = 0u64;
+                for key in &data.1 {
+                    let mut hash = DefaultHasher::new();
+                    key.hash(&mut hash);
+                    combined ^= hash.finish().wrapping_mul(0x9e3779b97f4a7c15);
+                }
+                combined.hash(state);
+            }
             Self::Protocol(_, hash) => {
                 6u8.hash(state);
                 hash.hash(state);

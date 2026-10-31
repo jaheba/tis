@@ -603,3 +603,56 @@ assert xs == [] and log == [False] * 12 + [True]
 "#,
     );
 }
+
+#[test]
+fn dictionary_literal_fast_path_preserves_order_and_protocol_fallback() {
+    check(
+        r#"
+assert list({'first': 1, 'second': 2, 'first': 3}) == ['first', 'second']
+assert {'first': 1, 'second': 2, 'first': 3}['first'] == 3
+log = []
+class Key:
+    def __hash__(self):
+        log.append('hash')
+        return hash('same')
+    def __eq__(self, other):
+        log.append('equal')
+        return other == 'same'
+key = Key()
+d = {key: 1, 'same': 2}
+assert len(d) == 1
+assert list(d)[0] is key
+assert d[key] == 2
+assert len(log) >= 3
+"#,
+    );
+}
+
+#[test]
+fn bytecode_unpack_batches_snapshot_lists_and_keep_custom_iterator_effects() {
+    check(
+        r#"
+values = [1, 2, 3]
+for i in range(200):
+    a, b, c = values
+    values[0] = a + 1
+    assert (b, c) == (2, 3)
+assert a == 200
+assert values[0] == 201
+log = []
+class Sequence:
+    def __iter__(self):
+        log.append('iter')
+        return iter([4, 5, 6])
+for i in range(20):
+    a, b, c = Sequence()
+    assert (a, b, c) == (4, 5, 6)
+assert len(log) == 20
+try:
+    a, b = values
+    assert False
+except ValueError:
+    pass
+"#,
+    );
+}

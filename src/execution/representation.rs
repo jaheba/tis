@@ -14,6 +14,15 @@ impl Vm {
         quote: bool,
         active: &mut std::collections::HashSet<crate::ObjectId>,
     ) -> Result<String> {
+        if let Ok(Object::Library(p)) = self.heap.get(value)
+            && let crate::library::Payload::Date(date) = &**p
+        {
+            return Ok(if quote {
+                format!("datetime.date({}, {}, {})", date.year, date.month, date.day)
+            } else {
+                format!("{:04}-{:02}-{:02}", date.year, date.month, date.day)
+            });
+        }
         if active.len() > 256 {
             return Err(error("RecursionError: recursive representation"));
         }

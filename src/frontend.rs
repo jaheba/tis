@@ -128,6 +128,45 @@ impl Builder {
     fn runtime(&mut self, block: BlockId, op: CoreOp, values: Vec<ValueId>) -> ValueId {
         self.function.append(block, Op::Runtime(op, values))
     }
+    fn collection_literal(
+        &mut self,
+        elements: &[Expr],
+        tuple: bool,
+        mut block: BlockId,
+    ) -> Result<(BlockId, ValueId)> {
+        if !elements.iter().any(|e| matches!(e, Expr::Starred(_))) {
+            let (next, values) = self.expressions(elements, block)?;
+            let value = self.function.append(
+                next,
+                if tuple {
+                    Op::Tuple(values)
+                } else {
+                    Op::List(values)
+                },
+            );
+            return Ok((next, value));
+        }
+        let list = self.function.append(block, Op::List(vec![]));
+        for element in elements {
+            if let Expr::Starred(element) = element {
+                let (next, value) = self.expression(&element.value, block)?;
+                block = next;
+                let method = self.runtime(block, CoreOp::GetAttr("extend".into()), vec![list]);
+                self.runtime(block, CoreOp::Call(vec![None]), vec![method, value]);
+            } else {
+                let (next, value) = self.expression(element, block)?;
+                block = next;
+                self.runtime(block, CoreOp::ListAppend, vec![list, value]);
+            }
+        }
+        let value = if tuple {
+            self.runtime(block, CoreOp::TupleFromList, vec![list])
+        } else {
+            list
+        };
+        Ok((block, value))
+    }
+
     fn constant(&mut self, block: BlockId, value: Constant) -> ValueId {
         self.function.append(block, Op::Constant(value))
     }
@@ -169,6 +208,7 @@ impl Builder {
 
     fn function(parameters: &ast::Parameters, body: &[Stmt]) -> Result<Function> {
         let mut builder = Self::new(body, false)?;
+        builder.function.generator = has_yield(body);
         builder.parameters(parameters)?;
         let block = builder.statements(body, Some(builder.function.entry()))?;
         builder.finish(block)?;
@@ -239,10 +279,8 @@ impl Builder {
         match statement {
             Stmt::Import(stmt) => {
                 for alias in &stmt.names {
-                    if !matches!(alias.name.as_str(), "math" | "json" | "bisect") {
-                        return Err(Error::Unsupported(
-                            "only builtin math, json and bisect imports",
-                        ));
+                    if !crate::library::supports_module(alias.name.as_str()) {
+                        return Err(Error::Unsupported("module not available in tis"));
                     }
                     let value = self.runtime(block, CoreOp::Import(alias.name.to_string()), vec![]);
                     let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
@@ -251,10 +289,17 @@ impl Builder {
             }
             Stmt::ImportFrom(stmt) => {
                 let module = stmt.module.as_ref().map(|name| name.as_str());
-                if stmt.level != 0 || !matches!(module, Some("math" | "json" | "bisect")) {
-                    return Err(Error::Unsupported(
-                        "only builtin math, json and bisect imports",
-                    ));
+                if stmt.level == 0
+                    && module == Some("__future__")
+                    && stmt
+                        .names
+                        .iter()
+                        .all(|alias| alias.name.as_str() == "annotations")
+                {
+                    return Ok(Some(block));
+                }
+                if stmt.level != 0 || !module.is_some_and(crate::library::supports_module) {
+                    return Err(Error::Unsupported("module not available in tis"));
                 }
                 let module = self.runtime(block, CoreOp::Import(module.unwrap().into()), vec![]);
                 for alias in &stmt.names {
@@ -295,6 +340,13 @@ impl Builder {
                 }
             }
             Stmt::AnnAssign(stmt) => {
+                if self.class_scope
+                    && let Expr::Name(name) = &*stmt.target
+                {
+                    let (next, value) = self.expression(&stmt.annotation, block)?;
+                    block = next;
+                    self.runtime(block, CoreOp::Annotation(name.id.to_string()), vec![value]);
+                }
                 if let Some(value) = &stmt.value {
                     let (next, value) = self.expression(value, block)?;
                     block = self.assign(&stmt.target, value, next)?;
@@ -540,6 +592,39 @@ impl Builder {
 
     fn expression(&mut self, expr: &Expr, mut block: BlockId) -> Result<(BlockId, ValueId)> {
         let value = match expr {
+            Expr::Yield(expr) => {
+                if !self.function.generator {
+                    return Err(Error::Unsupported("yield outside resumable function body"));
+                }
+                let value = if let Some(expr) = &expr.value {
+                    let (next, value) = self.expression(expr, block)?;
+                    block = next;
+                    value
+                } else {
+                    self.none(block)
+                };
+                self.runtime(block, CoreOp::Yield, vec![value])
+            }
+            Expr::YieldFrom(expr) => {
+                if !self.function.generator {
+                    return Err(Error::Unsupported(
+                        "yield from outside resumable function body",
+                    ));
+                }
+                let (next, source) = self.expression(&expr.value, block)?;
+                let iterator = self.runtime(next, CoreOp::Iter, vec![source]);
+                let head = self.function.block(0);
+                let body = self.function.block(0);
+                let exit = self.function.block(0);
+                self.jump(next, head);
+                let item = self.runtime(head, CoreOp::Next, vec![iterator]);
+                let done = self.runtime(head, CoreOp::IsDone, vec![item]);
+                self.branch(head, done, exit, body);
+                self.runtime(body, CoreOp::Yield, vec![item]);
+                self.jump(body, head);
+                block = exit;
+                self.runtime(exit, CoreOp::GeneratorResult, vec![iterator])
+            }
             Expr::Name(expr) => self.runtime(block, CoreOp::LoadName(expr.id.to_string()), vec![]),
             Expr::NoneLiteral(_) => self.none(block),
             Expr::BooleanLiteral(expr) => self.constant(block, Constant::Bool(expr.value)),
@@ -689,14 +774,10 @@ impl Builder {
                 self.function.parameters(join)[0]
             }
             Expr::List(expr) => {
-                let (next, values) = self.expressions(&expr.elts, block)?;
-                block = next;
-                self.function.append(block, Op::List(values))
+                return self.collection_literal(&expr.elts, false, block);
             }
             Expr::Tuple(expr) => {
-                let (next, values) = self.expressions(&expr.elts, block)?;
-                block = next;
-                self.function.append(block, Op::Tuple(values))
+                return self.collection_literal(&expr.elts, true, block);
             }
             Expr::Set(expr) => {
                 let (next, values) = self.expressions(&expr.elts, block)?;
@@ -1568,4 +1649,28 @@ fn validate_scope(
         }
     }
     Ok(())
+}
+
+fn has_yield(body: &[Stmt]) -> bool {
+    use ast::visitor::{self, Visitor};
+    struct Find(bool);
+    impl<'a> Visitor<'a> for Find {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                visitor::walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if matches!(expr, Expr::Yield(_) | Expr::YieldFrom(_)) {
+                self.0 = true;
+            } else if !matches!(expr, Expr::Lambda(_)) {
+                visitor::walk_expr(self, expr);
+            }
+        }
+    }
+    let mut find = Find(false);
+    for stmt in body {
+        find.visit_stmt(stmt);
+    }
+    find.0
 }

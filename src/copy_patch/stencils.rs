@@ -288,6 +288,25 @@ compare!(tis_stencil_flt, Lt);
 compare!(tis_stencil_fle, Le);
 compare!(tis_stencil_fgt, Gt);
 compare!(tis_stencil_fge, Ge);
+/// Preflight borrows the suspended VM without allocation/GC; scratch contains only primitive bits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_inline_preflight(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        let check: extern "C" fn(*mut c_void, *mut Slot, i32, *mut Slot) -> i32 =
+            std::mem::transmute(p.power);
+        let output = slots.cast::<u8>().add(p.left).cast::<Slot>();
+        match check(ctx, slots, p.location, output) {
+            0 => next(ctx, slots, p),
+            status if status < 0 => u64::MAX,
+            _ => fallback(ctx, slots, p),
+        }
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tis_stencil_callback(
     ctx: *mut c_void,
@@ -1295,18 +1314,63 @@ unsafe fn range_fill(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> bool {
             return false;
         }
         let info = &*(p.a as *const RangeFill);
-        let Some(iterator) = checked_native_row(ctx, read(slots, p.left)) else {
-            return false;
+        let counter_mode = info.counter_limit != usize::MAX;
+        let (cursor, size, count, first, last, step, end) = if counter_mode {
+            let first = read(slots, p.left);
+            let limit = read(slots, info.counter_limit);
+            let step = read(slots, info.counter_step);
+            if first.tag != INT || limit.tag != INT || step.tag != INT {
+                return false;
+            }
+            let first = first.a as i64;
+            let step = step.a as i64;
+            let Some(limit) = (limit.a as i64).checked_add(info.counter_add) else {
+                return false;
+            };
+            let Some((count, last, end)) =
+                counter_span(first, limit, step, info.inclusive, info.descending)
+            else {
+                return false;
+            };
+            (
+                std::ptr::null_mut(),
+                0,
+                count,
+                first as i128,
+                last,
+                step,
+                end,
+            )
+        } else {
+            let Some(iterator) = checked_native_row(ctx, read(slots, p.left)) else {
+                return false;
+            };
+            let iterator = &*iterator;
+            if iterator.kind != 7 || iterator.shape == 0 {
+                return false;
+            }
+            let cursor = iterator.shape as *mut usize;
+            let position = cursor.read();
+            if position >= iterator.len {
+                return false;
+            }
+            let start = iterator.class_tag as i64 as i128;
+            let step = iterator.class_payload as i64;
+            let first = start + step as i128 * position as i128;
+            let last = start + step as i128 * (iterator.len - 1) as i128;
+            let Ok(last) = i64::try_from(last) else {
+                return false;
+            };
+            (
+                cursor,
+                iterator.len,
+                iterator.len - position,
+                first,
+                last,
+                step,
+                0,
+            )
         };
-        let iterator = &*iterator;
-        if iterator.kind != 7 || iterator.shape == 0 {
-            return false;
-        }
-        let cursor = iterator.shape as *mut usize;
-        let position = cursor.read();
-        if position >= iterator.len {
-            return false;
-        }
         let Some(list) = checked_native_row(ctx, read(slots, p.right)) else {
             return false;
         };
@@ -1318,11 +1382,7 @@ unsafe fn range_fill(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> bool {
         {
             return false;
         }
-        let start = iterator.class_tag as i64 as i128;
-        let step = iterator.class_payload as i64;
-        let first = start + step as i128 * position as i128;
-        let last = start + step as i128 * (iterator.len - 1) as i128;
-        let (Ok(mut value), Ok(last)) = (i64::try_from(first), i64::try_from(last)) else {
+        let Ok(mut value) = i64::try_from(first) else {
             return false;
         };
         let length = list.len as i128;
@@ -1330,7 +1390,6 @@ unsafe fn range_fill(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> bool {
         {
             return false;
         }
-        let count = iterator.len - position;
         let mut remaining = count;
         let fill = u8::from(info.value != 0);
         let data = list.writable_values.cast::<u8>();
@@ -1348,7 +1407,12 @@ unsafe fn range_fill(ctx: *mut c_void, slots: *mut Slot, p: &Patch) -> bool {
                 value = value.wrapping_add(step);
             }
         }
-        cursor.write(iterator.len);
+        if counter_mode {
+            write(slots, p.left, scalar(INT, end as u64));
+            write(slots, info.counter_update, scalar(INT, end as u64));
+        } else {
+            cursor.write(size);
+        }
         if info.last != usize::MAX {
             write(slots, info.last, scalar(INT, last as u64));
         }

@@ -145,3 +145,48 @@ for _ in range(200):
         assert!(vm.heap.get(child).is_err());
     }
 }
+
+#[test]
+fn guarded_dict_get_keeps_defaults_protocols_and_bound_receiver_identity() {
+    for tier in [Tiering::Native, Tiering::CopyPatch] {
+        for encoding in [BytecodeMode::Register, BytecodeMode::Stack] {
+            let vm = compiled(
+                r#"
+def read(getter,key,default):
+    return getter(key,default)
+d={'x':4,'键🙂':7}
+for repeat in range(200):
+    assert read(d.get,'x',None)==4
+    assert read(d.get,'键🙂',None)==7
+    assert read(d.get,'missing',[123])==[123]
+# Value updates preserve insertion order and structural iterator validity.
+for key in d:
+    d[key]=d[key]+1
+assert list(d)==['x','键🙂']
+assert read(d.get,'x',None)==5
+other={'x':42}
+assert read(other.get,'x',None)==42
+class Custom:
+    def get(self,key,default):
+        return default
+assert read(Custom().get,'x',99)==99
+events=[]
+class Key:
+    def __hash__(self):
+        events.append('hash')
+        for i in range(12000):
+            trash=[i]
+        return hash('absent')
+    def __eq__(self,other):
+        events.append('eq')
+        return False
+assert read(d.get,Key(),[456])==[456]
+assert events==['hash']
+"#,
+                encoding,
+                tier,
+            );
+            assert_eq!(vm.stack_len(), 0);
+        }
+    }
+}

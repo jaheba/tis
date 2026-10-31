@@ -653,7 +653,7 @@ first VM/process results include it and should accompany cheap-linking claims.
 
 The native bridge scanned every HIR slot even though fresh windows initialize only entry parameters.
 Python bindings already live in the separately rooted local frame. Importing those parameter registers directly
-improved paired Barnes samples by roughly3.5–5%; operation/frame/root counters did not change.
+improved paired Barnes samples by roughly 3.5–5%; operation/frame/root counters did not change.
 OSR and resumed windows still require their complete live image. Reference/collection and OSR regressions check both paths.
 
 This is not permission to retain uninitialized or stale values. VM shadow windows still clear and native images still
@@ -664,6 +664,24 @@ The final profile and counters still point to frame/helper/heap/root work. Shari
 regions is a larger next step than assuming another continuation tweak will close the remaining gap.
 
 [Final comparisons, RSS, compilation boundaries and profile](../benchmarks/results/overnight-copy-patch/README.md).
+
+## 38. Equal loop coverage largely removes the sieve backend gap
+
+Cranelift now consumes the same Boolean fill/reduction LIR plans as CnP and emits its own guarded machine loops.
+The sieve comparison changed from roughly 38ms Cranelift versus 3ms CnP to 2.45–2.80ms versus roughly 3ms.
+The previous result primarily measured optimization coverage, not an intrinsic advantage of copying code.
+Both backends account for the same selected iterations and preserve the original loop on misses.
+
+The initial Cranelift reduction updated accumulators with add-zero work on false predicates.
+Keeping checked additions and last-selected updates on the selected arm improved 3.50 ->2.63ms in the pilot.
+A successful plan does not replace ordinary iterator exhaustion, snapshots, error ordering or profiling.
+Shared tests now cover both backends, including exact backedge counts and gateway-free bulk work.
+
+Cold costs still differ. New Cranelift backend compilation took roughly 5.5–7.8ms versus CnP 0.13–0.17ms;
+a fresh-process sieve took 16.6ms versus 9.4ms. Those boundaries include different startup/lowering costs from
+the retained execution comparison and should accompany claims that either backend is faster.
+
+[Implementation, controls and reproduction](../benchmarks/results/2026-10-31-cranelift-boolean-regions/README.md).
 
 ## Open questions, 2026-10-31
 
@@ -680,6 +698,215 @@ regions is a larger next step than assuming another continuation tweak will clos
 - Can broader inlining reduce frame/root costs without increasing helper, state and compilation costs?
 
 These are hypotheses, not measured wins.
+
+## 39. Fresh-session suites measure different tradeoffs from retained kernels
+
+The full 120-workload Flying Circus run tested whether retained CnP and Cranelift gains carry over to short programs.
+Both tiers took about 2.11 times CPython's elapsed time across their 88 common passing workloads in repeated fresh sessions.
+Their aggregate CnP/Cranelift ratio was 0.999, although Cranelift was much faster on Barnes–Hut.
+These requests include compilation; they do not contradict the retained-kernel measurements.
+Bytecode took 1.38 times Monty's elapsed time across 87 common passing workloads.
+
+All tis tiers passed the same 88 workloads, with 17 unsupported and 15 failures.
+Eight new Unicode workloads failed on missing string `find`; six workloads failed on missing `frozenset`.
+The remaining failure was a class-base case.
+Broad suite coverage and short-program compilation remain separate work from optimizing retained native loops.
+Three timing samples and one PyPy warmup support rough comparisons only.
+
+Evidence: [full Flying Circus report](../benchmarks/results/2026-10-31-flying-circus-full/README.md).
+
+## 40. Share semantic bodies as well as compiled bytecode
+
+The full suite exposed a 3× unpacking gap and heavy allocation in closure-heavy record building.
+A CPU sample showed HIR cloning and destruction alongside allocator and GC work.
+Closure creation already shared compiled bytecode and profiles, but deep-cloned semantic blocks and scope metadata.
+Copy-on-write HIR bodies reduced record-building from 881 to 548 ms in a seven-sample comparison.
+A follow-up measured 865 to 554 ms, while Monty took 329 ms.
+Captures and defaults remain separate; editing a body detaches it and invalidates cached code.
+Legacy addition feedback still mutates instruction data and can detach a body on first use.
+Separating that state from semantic HIR remains an opportunity.
+
+Guarded register-bytecode unpack batches reduced repeated unpacking from 152 to 46 ms, near Monty's 48 ms.
+They require exact builtin sequences, adjacent reads, no other token users and a quiet feedback window.
+Elements are copied before further execution; custom iterator effects and length errors retain the original path.
+Cached ASCII indexing reduced random ASCII access from 15.6 to 4.1 ms, versus Monty's 2.8 ms.
+Direct string-key dictionary construction did not establish a standalone throughput gain.
+
+These wins did not establish suite-wide parity.
+Across 87 common passing workloads, bytecode remained 1.24× Monty one-shot and 1.39× in repeated fresh sessions.
+The paired frozen tis control was 1.31× and 1.43×, respectively.
+Three-sample microbenchmark regressions largely disappeared in follow-up; Unicode memory cases still cost about 9–11% more.
+Backend coverage: unpack dispatch is register-bytecode only; string/runtime and HIR storage changes are shared.
+All execution tiers passed semantic tests; performance claims here concern bytecode.
+
+Evidence: [Monty parity experiment](../benchmarks/results/2026-10-31-monty-parity/README.md).
+
+## 41. UTF-8 offsets need selective caching and borrowed operations
+
+Monty PR #1195 motivated removing repeated scans and full receiver copies before changing execution backends.
+String methods and encoding now borrow receivers; bounds callbacks and custom join iteration finish before that borrow.
+Unicode indexing, search and contiguous slices share character/byte offsets.
+A cursor handles nearby reads; stride-32 checkpoints appear only after distant traversals scan 32 times the text bytes.
+Cache keys include heap identity and generation; host mutable access invalidates them before exposing the object.
+GC discards entries without keeping strings alive, and heap generation slots remain eight bytes.
+
+The first version cached every Unicode length and probed the offset table on every heap mutation.
+A quick retained-Latin-1 case regressed from 14.0 to 24.4 ms.
+A per-heap recent-length cache avoids entries for length-only scans; actual Unicode string mutations alone probe invalidation.
+Short Unicode indexing also regressed about 17% through the cursor table.
+Strings up to 64 bytes now retain bounded scans; a seven-sample confirmation returned that case near baseline.
+The full quick suite's larger memory regressions did not recur in confirmation; mixed-Unicode memory remained about 4% slower.
+Small differences remain uncertain.
+
+In confirmation, CJK random access improved from 35.8 to 5.7 ms, Unicode slices from 3.39 to 0.91 ms,
+and repeated Unicode length from 18.1 to 1.50 ms.
+ASCII-run case conversion improved from 20.3 to 4.84 ms.
+Dense/short-run mixed text did not benefit and retains the standard decoder; contextual sigma uses full-string lowercase.
+New search methods made eight agent workloads pass, raising full-suite coverage from 88 to 96 of 120.
+The 88 paired passing workloads improved about 6% one-shot and 7% in repeated fresh sessions.
+The Monty reference predates PR #1195; these are not comparisons against its optimized build.
+
+Backend coverage: all four tiers use the shared services; all 27 confirmation programs pass in the final tis tiers.
+No direct string-loop stencils or native UTF-8 lowering were added, so native runtime crossings remain.
+Tests cover reentrant bounds conversion that searches the same string and triggers GC, host mutation and slot reuse.
+Overall Monty parity remains unmet, and Chinese agent workloads still trail both reference runtimes.
+
+Evidence: [borrowed string runtime experiment](../benchmarks/results/2026-10-31-string-runtime/README.md).
+Source: [Monty PR #1195](https://github.com/pydantic/monty/pull/1195).
+
+## 42. Workload coverage depends on runtime protocols as well as syntax
+
+The remaining 24 Flying Circus failures clustered around a small set of missing services: immutable sets,
+seeded randomness/codecs, regular expressions, lazy adapters, list subclasses, generators and object-copy protocols.
+Implementing shared services raised coverage from 96 to 120 unchanged workloads in bytecode, LIR, Cranelift and copy-and-patch.
+The full quick suite passed all 120 in both one-shot and repeated fresh-session modes.
+This establishes workload coverage; the new modules still expose partial Python APIs.
+
+Generator functions need an explicit HIR flag even when their yield is unreachable.
+Otherwise a scalar planner can inline a function that should return a generator object.
+`Yield` and delegation remain HIR operations. Suspension stores the bytecode position, frame values and locals in the heap;
+the ordinary collector visits those values. Both bytecode encodings resume their saved frames.
+Generator bodies currently reject native lowering and scalar inlining, and yield values do not become function return-type feedback.
+Eagerly collecting generators would fail infinite pidigits input and change side effects, so that approach was excluded.
+
+List subclasses retain class identity and user attributes alongside separately traced builtin list storage.
+Inherited descriptors delegate to that storage; overrides and `super()` keep normal class lookup.
+Cached instance dictionary views retain their owner and read the current attributes rather than returning snapshots.
+Deepcopy roots source snapshots and memoized copies across reduction/state callbacks, preserving cycles and aliases.
+Review added a dataclass repr recursion guard and roots for a temporary comparison operand across a second attribute callback.
+
+Round trips alone cannot establish wire compatibility. Separate CPython checks matched MT19937 seeding/word packing,
+all six codec outputs, and protocol 4/5 pickle in both directions.
+Sparse pickle memo indices require dictionary cardinality for `MEMOIZE`, not the largest assigned index plus one.
+The decoder checks operand lengths and rejects unsupported globals; it never imports or invokes host Python.
+
+Remaining work includes native generator suspension, complete dictionary views, broader dataclass/copy hooks,
+Decimal semantics and full regex/pickle APIs. The full-suite result does not establish CPython feature parity or performance parity.
+
+Evidence: [all 120 Flying Circus workloads](../benchmarks/results/2026-10-31-all120/README.md).
+
+## 43. Equivalent loop and call forms need independent performance checks
+
+A frozen runtime passed 48 program controls/variants across 11 families, but equivalent structural rewrites exposed large cliffs.
+Names, inputs and a Barnes–Hut field-layout variation stayed much steadier in the tested cases.
+The generator preserves fixture timing boundaries, verifies AST round-trip controls and checks outputs against CPython.
+CPython-normalized ratios distinguish a change in work from a loss of relative performance.
+
+With ten samples, sieve's inner `for range` rewritten as `while` makes CnP 46–50× slower and Cranelift 14–15× slower.
+Bytecode rises about 12%, while CPython rises about 27%. Runtime crossings jump from thousands to millions.
+This is missing loop-form coverage, not evidence that the changed limit or identifier names need special handling.
+General induction-loop lowering should serve both source forms and both native backends.
+
+Extracting n-body's squared-distance expression into a helper makes CnP about 2× slower and Cranelift about 8.5× slower.
+Cranelift still records 198,920 successful arithmetic body inlines, but preflight callbacks remain and region fusion shrinks.
+Inlining arithmetic without eliminating/hoisting the call boundary does not preserve the original fused loop.
+Experimental CFG inlining does not repair the measured counters in diagnostic runs.
+Unpacking also warns against assuming static unrolling helps: a looped form is over twice as fast for fresh-session Cranelift.
+Profiling, lowering, compilation and execution all contribute to these timings.
+
+The broad three-sample naming/data shifts are inconclusive; several one-shot outliers do not recur in repeated mode.
+No runtime changes were made during this probe. Future optimization work needs fixed regression variants and fresh seeded
+holdouts, plus first-execution and retained-execution measurements. The tested seed is not evidence of universal generalization.
+
+Evidence: [performance generalization probe](../benchmarks/results/2026-10-31-variations/README.md).
+
+## 44. Share loop plans across iterator and induction-variable syntax
+
+The Boolean fill kernel previously required a `Next` iterator header.
+An equivalent integer-counter `while` loop incurred millions of callbacks.
+The shared LIR plan now recognizes guarded integer induction loops for both native backends.
+It proves direction, finite inline arithmetic and all store bounds before writing, and publishes the final counter.
+Misses retain the original loop and its partial effects, custom arithmetic and arbitrary-precision values.
+
+Ten-sample paired medians reduce the 1M sieve while variant from 187 to 3.75 ms in CnP and 125 to 8.09 ms in Cranelift.
+The for-range controls take 3.70 and 8.20 ms respectively.
+A renamed, reversed-comparison holdout at a fresh limit improves similarly.
+Barnes–Hut and unpacking controls remain within about 1% in these samples.
+Timings include compilation in fresh VM sessions; they do not measure retained JIT throughput.
+
+This is a shared recognizer, not general induction-loop normalization.
+A held-out `counter < limit + 1` header still misses because it computes its bound inside the header.
+It remains 144 ms in CnP and 95 ms in Cranelift.
+Loop-invariant expression hoisting and the n-body helper/preflight fusion gap remain unfinished.
+Keep these failures alongside the successful variants instead of rewriting tests to fit the recognizer.
+
+Evidence: [counter-loop fills](../benchmarks/results/2026-10-31-counter-loops/README.md).
+
+## 45. New applications expose gaps that benchmark rewrites can miss
+
+Seventeen custom programs vary loop form, helper boundaries, sequence layouts, dictionary update syntax,
+Unicode data, bound methods and constructor store order.
+All 255 checks across five runtimes and three timing boundaries produce the expected output.
+These workloads were frozen before timing; the runtime was not changed to fit them.
+
+The direct retained numeric loop takes 0.24 ms with Cranelift versus 1.01 ms with CPython and 0.11 ms with PyPy.
+Extracting the arithmetic helper changes Cranelift to 5.51 ms, CPython to 1.30 ms and PyPy to 0.29 ms.
+The helper boundary gap therefore reproduces outside n-body.
+Dictionary updates remain slower with retained native code than with bytecode, CPython or PyPy.
+Bound methods lose the advantage CnP achieves for direct object fields.
+
+The custom counter fill also misses the new region plan: its literal stride adds a constant instruction to the body.
+LIR inspection confirms the four-instruction body where the recognizer expects three.
+The range form selects the kernel, but generic `list.count(False)` still contributes substantial runtime-library cost.
+Preserve these application costs and failures rather than changing the checksum or lifting constants in the benchmark.
+General invariant handling remains necessary.
+
+Keep cold/fresh sessions distinct from retained sessions with the same function objects.
+Even 20 retained warmups leave outliers in these short PyPy samples; medians alone do not establish stable throughput.
+Record all warmups and measured calls, and report absolute times as well as ratios.
+
+Evidence: [custom variation comparison](../benchmarks/results/2026-10-31-custom-variations/README.md).
+
+## 46. Runtime crossings and frame/root work are different costs
+
+The custom variation suite was frozen before changing the compiler/runtime.
+Guarded literal/affine induction plans and exact Boolean count reduce retained CnP fills from 43–45 ms to 0.46 ms.
+Bytecode benefits from count and dictionary runtime improvements without a JIT change.
+
+CnP now copies numeric helper expressions after the same preflight used by Cranelift.
+In the numeric-helper diagnostic, runtime crossings remain 38,596, while root synchronizations drop from 18,898 to 26
+and positional frames from 20,002 to 1,130.
+Retained execution improves from 4.66 to 1.77 ms.
+Counting callbacks alone would miss the gain: a closed guard is cheaper than constructing and executing a frame.
+Code/patch growth and compile cost remain measured; copying a body is not free.
+
+The two backends also had different float-view acquisition paths.
+Giving Cranelift the guarded directory/token path already available in CnP improves the fresh-session extracted-helper
+n-body variant from 268 to 118 ms. The original n-body control remains near 31 ms.
+The equivalent CnP helper variant improves from 86 to 55 ms, while its original control remains near 43 ms.
+
+Auditing field-expression copying found a missing descriptor/hook guard in the shared inliner.
+Shape and float checks cannot justify deduplicating property reads.
+The shared preflight now rejects field plans when attribute protocols are active, preserving both getter calls.
+The guard is conservative until a class/version proof replaces it.
+
+Builtin dict.get can use a closed probe only after checking the actual bound receiver and key protocols.
+String reads borrow existing storage; existing-key writes replace a slot without cloning its key.
+Protocol fallbacks must retain default values through callbacks and collection.
+Dictionary time improves about 30%, but dispatch and method acquisition remain far from CPython/PyPy.
+Per-call inline validation and method-object construction also remain; no backend parity claim follows from these wins.
+
+Evidence: [custom variation fixes](../benchmarks/results/2026-10-31-custom-fixes/README.md).
 
 ## Updating this notebook
 

@@ -42,6 +42,7 @@ pub enum Key {
     Bytes(std::rc::Rc<(Value, Vec<u8>)>),
     Float(u64),
     Tuple(Vec<Key>),
+    FrozenSet(std::rc::Rc<(Value, Vec<Key>)>),
     Protocol(Value, i64),
 }
 
@@ -49,10 +50,12 @@ impl Key {
     pub(crate) fn has_protocol(&self) -> bool {
         matches!(self, Self::Protocol(..))
             || matches!(self,Self::Tuple(keys) if keys.iter().any(Self::has_protocol))
+            || matches!(self,Self::FrozenSet(data) if data.1.iter().any(Self::has_protocol))
     }
     pub(crate) fn visit_values(&self, f: &mut impl FnMut(Value)) {
         match self {
             Self::Protocol(value, _) => f(*value),
+            Self::FrozenSet(value) => f(value.0),
             Self::Bytes(value) => f(value.0),
             Self::BigInt(value) => f(value.0),
             Self::Tuple(keys) => {
@@ -69,11 +72,14 @@ impl Key {
 pub enum Object {
     String(String),
     Bytes(Vec<u8>),
+    ByteArray(Vec<u8>),
     BigInt(num_bigint::BigInt),
     List(crate::List),
     Tuple(Vec<Value>),
     Dict(crate::Dict),
     Set(crate::Dict),
+    FrozenSet(crate::Dict),
+    Library(Box<crate::library::Payload>),
     Environment(crate::execution::Environment),
     Function(crate::execution::Closure),
     Native(std::borrow::Cow<'static, str>),
@@ -110,6 +116,7 @@ pub enum Object {
         stop: Value,
         step: Value,
     },
+    Suspended(Box<crate::generator::Generator>),
     Generator {
         parts: std::rc::Rc<[Value]>,
         binding: Option<std::rc::Rc<(Value, String)>>,
@@ -333,6 +340,9 @@ pub struct Heap {
     generations: RefCell<Vec<Generation>>,
     live: Cell<usize>,
     collection_epoch: usize,
+    last_unicode_length: Cell<Option<(ObjectId, usize)>>,
+    string_indexes:
+        RefCell<std::collections::HashMap<ObjectId, std::rc::Rc<crate::string_index::StringIndex>>>,
 }
 
 impl Heap {
@@ -347,6 +357,8 @@ impl Heap {
             generations: RefCell::new(Vec::new()),
             live: Cell::new(0),
             collection_epoch: 0,
+            last_unicode_length: Cell::new(None),
+            string_indexes: RefCell::new(Default::default()),
         }
     }
 
@@ -437,6 +449,74 @@ impl Heap {
         Ok(ascii)
     }
 
+    fn string_index(&self, value: Value) -> Result<std::rc::Rc<crate::string_index::StringIndex>> {
+        self.checked_id(value)?;
+        let Value::Ref(id) = value else {
+            return Err(Error::Type("expected heap string"));
+        };
+        let length = self
+            .last_unicode_length
+            .get()
+            .filter(|(key, _)| *key == id)
+            .map(|(_, n)| n);
+        Ok(self
+            .string_indexes
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| {
+                std::rc::Rc::new(crate::string_index::StringIndex::with_length(length))
+            })
+            .clone())
+    }
+
+    fn unicode_length(&self, id: ObjectId, text: &str) -> usize {
+        if let Some((key, length)) = self.last_unicode_length.get()
+            && key == id
+        {
+            return length;
+        }
+        // Length-only scans need no per-string allocation. Indexed strings share their cache.
+        let indexes = self.string_indexes.borrow();
+        let length = if let Some(cache) = indexes.get(&id) {
+            cache.len(text)
+        } else {
+            text.chars().count()
+        };
+        self.last_unicode_length.set(Some((id, length)));
+        length
+    }
+
+    pub(crate) fn string_byte_offset(&self, value: Value, position: usize) -> Result<usize> {
+        let text = self.as_str(&value).ok_or(Error::Type("expected string"))?;
+        if position == 0 {
+            return Ok(0);
+        }
+        if self.string_is_ascii(value)? {
+            return Ok(position.min(text.len()));
+        }
+        if text.len() <= 64 {
+            return Ok(text
+                .char_indices()
+                .nth(position)
+                .map_or(text.len(), |(i, _)| i));
+        }
+        Ok(self.string_index(value)?.byte_offset(text, position))
+    }
+
+    pub(crate) fn string_char_offset(&self, value: Value, byte: usize) -> Result<usize> {
+        let text = self.as_str(&value).ok_or(Error::Type("expected string"))?;
+        if byte == 0 {
+            return Ok(0);
+        }
+        if self.string_is_ascii(value)? {
+            return Ok(byte);
+        }
+        if text.len() <= 64 {
+            return Ok(text[..byte].chars().count());
+        }
+        Ok(self.string_index(value)?.char_offset(text, byte))
+    }
+
     pub fn get(&self, value: Value) -> Result<&Object> {
         let id = self.checked_id(value)?;
         Ok(&self.entries.get(id).object)
@@ -446,7 +526,17 @@ impl Heap {
         let id = self.checked_id(value)?;
         // A host may replace an object or edit a String through this borrow, even if it
         // forgets the guard. Recompute string metadata on the next read in that case.
-        self.generations.get_mut()[id.index()].ascii = None;
+        let unicode = self.generations.get_mut()[id.index()].ascii.take() == Some(false);
+        if unicode && let Value::Ref(object) = value {
+            self.string_indexes.get_mut().remove(&object);
+            if self
+                .last_unicode_length
+                .get()
+                .is_some_and(|(key, _)| key == object)
+            {
+                self.last_unicode_length.set(None);
+            }
+        }
         let fields = if self.native_fields.get().heap != 0 {
             let rows = self.field_rows.get_mut();
             let generation = self.generations.get_mut()[id.index()].version;
@@ -518,6 +608,10 @@ impl Heap {
                 Object::String(value) => Ok(Key::String(value.as_str().into())),
                 Object::BigInt(n) => Ok(Key::BigInt(std::rc::Rc::new((value, n.clone())))),
                 Object::Bytes(bytes) => Ok(Key::Bytes(std::rc::Rc::new((value, bytes.clone())))),
+                Object::FrozenSet(items) => Ok(Key::FrozenSet(std::rc::Rc::new((
+                    value,
+                    items.iter().map(|(key, _)| key.clone()).collect(),
+                )))),
                 Object::Tuple(values) => values
                     .iter()
                     .map(|&value| self.key_at(value, depth + 1))
@@ -543,14 +637,17 @@ impl Heap {
                 if self.string_is_ascii(value)? {
                     text.len()
                 } else {
-                    text.chars().count()
+                    let Value::Ref(id) = value else {
+                        unreachable!()
+                    };
+                    self.unicode_length(id, text)
                 }
             }
-            Object::Bytes(value) => value.len(),
+            Object::Bytes(value) | Object::ByteArray(value) => value.len(),
             Object::List(value) => value.len(),
             Object::Tuple(value) => value.len(),
             Object::Dict(value) => value.len(),
-            Object::Set(value) => value.len(),
+            Object::Set(value) | Object::FrozenSet(value) => value.len(),
             Object::View { source, .. } => return self.len(*source),
             Object::Range { start, stop, step } => {
                 crate::execution::range_len(*start, *stop, *step)?
@@ -564,19 +661,52 @@ impl Heap {
             return crate::execution::slice(self, object, key);
         }
         if let Value::InlineString(text) = object {
-            return self.string_item(text.as_str(), key);
+            return self.string_item(text.as_str(), key, text.as_str().is_ascii());
         }
         match self.get(object)? {
             Object::List(items) => items.value(index(key, items.len())?).ok_or(Error::Index),
             Object::Tuple(items) => Ok(items[index(key, items.len())?]),
-            Object::Bytes(items) => Ok(Value::Int(i64::from(items[index(key, items.len())?]))),
-            Object::String(text) => self.string_item(text, key),
+            Object::Bytes(items) | Object::ByteArray(items) => {
+                Ok(Value::Int(i64::from(items[index(key, items.len())?])))
+            }
+            Object::String(text) => {
+                if self.string_is_ascii(object)? {
+                    self.string_item(text, key, true)
+                } else {
+                    // Short UTF-8 scans cost less than allocating or probing an offset cache.
+                    if text.len() <= 64 {
+                        return self.string_item(text, key, false);
+                    }
+                    let key = crate::execution::integer(key)?;
+                    let character = if key == 0 {
+                        text.chars().next()
+                    } else if key == -1 {
+                        text.chars().next_back()
+                    } else {
+                        self.string_index(object)?.character(text, key)
+                    }
+                    .ok_or(Error::Index)?;
+                    Ok(self.string(character.encode_utf8(&mut [0; 4])))
+                }
+            }
+            Object::Range { start, stop, step } => {
+                let position = index(key, crate::execution::range_len(*start, *stop, *step)?)?;
+                let value = i128::from(*start) + (position as i128) * i128::from(*step);
+                Ok(Value::Int(
+                    i64::try_from(value).map_err(|_| Error::IntegerOverflow)?,
+                ))
+            }
             Object::Dict(items) => self.dict_get(items, key)?.ok_or(Error::MissingKey),
             _ => Err(Error::Type("object is not subscriptable")),
         }
     }
 
-    fn string_item(&self, text: &str, key: Value) -> Result<Value> {
+    fn string_item(&self, text: &str, key: Value, ascii: bool) -> Result<Value> {
+        // Heap strings cache ASCII status; host mutation invalidates that cache.
+        if ascii {
+            let byte = text.as_bytes()[index(key, text.len())?];
+            return Ok(self.string(std::str::from_utf8(&[byte]).unwrap()));
+        }
         let position = index(key, text.chars().count())?;
         let character = text.chars().nth(position).ok_or(Error::Index)?;
         Ok(self.string(character.encode_utf8(&mut [0; 4])))
@@ -600,6 +730,12 @@ impl Heap {
             None
         };
         match &mut *self.get_mut(object)? {
+            Object::ByteArray(items) => {
+                let position = index(key, items.len())?;
+                items[position] = u8::try_from(crate::execution::integer(value)?)
+                    .map_err(|_| Error::Runtime("ValueError: byte must be in range(256)".into()))?;
+                Ok(())
+            }
             Object::List(items) => {
                 let index = index(key, items.len())?;
                 items.set(index, value);
@@ -660,6 +796,12 @@ impl Heap {
             directory.entries = rows.as_ptr();
             self.native_fields.set(directory);
         }
+        let generations = self.generations.get_mut();
+        self.string_indexes.get_mut().retain(|id, _| {
+            let slot = &generations[id.index as usize];
+            slot.live && slot.version == id.generation
+        });
+        self.last_unicode_length.set(None);
         self.live.set(self.live.get() - freed);
         Ok(freed)
     }
@@ -758,6 +900,9 @@ impl PartialEq for Object {
             (Self::Bytes(a), Self::Bytes(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (Self::FrozenSet(a), Self::FrozenSet(b)) => {
+                a.len() == b.len() && a.iter().all(|(key, _)| b.get(key).is_some())
+            }
             (Self::Dict(a), Self::Dict(b)) => a == b,
             _ => false,
         }
@@ -786,6 +931,9 @@ impl PartialEq for Key {
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Bytes(a), Self::Bytes(b)) => a.1 == b.1,
             (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (Self::FrozenSet(a), Self::FrozenSet(b)) => {
+                a.1.len() == b.1.len() && a.1.iter().all(|item| b.1.contains(item))
+            }
             (Self::Protocol(a, _), Self::Protocol(b, _)) => a == b,
             _ => false,
         }

@@ -63,6 +63,13 @@ pub(crate) struct IteratorBranch {
     pub no: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UnpackBundle {
+    pub source: ValueId,
+    pub token: ValueId,
+    pub items: Vec<ValueId>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RegisterCode {
     pub body: Vec<Instruction>,
@@ -72,6 +79,7 @@ pub(crate) struct RegisterCode {
     // Cells allow recursive frames to share quickening without retaining a mutable code borrow.
     pub numeric: Vec<Cell<Option<Plan>>>,
     pub iterator_branches: Vec<Option<IteratorBranch>>,
+    pub unpack_bundles: Vec<Option<UnpackBundle>>,
     quickened_window: Cell<Option<u32>>,
     pub max_arguments: usize,
     pub max_transfer: usize,
@@ -287,6 +295,41 @@ impl RegisterCode {
                 .blocks
                 .get(edge.target)
                 .ok_or(Error::InvalidIr("register edge target"))?;
+        }
+        output.unpack_bundles.resize(output.body.len(), None);
+        for (index, instruction) in output.body.iter().enumerate() {
+            if !matches!(instruction.op, Opcode::Runtime) {
+                continue;
+            }
+            let Some((CoreOp::Unpack(count), _)) = code.operations.get(instruction.a as usize)
+            else {
+                continue;
+            };
+            if uses[instruction.dst as usize] != *count {
+                continue;
+            }
+            let Some(items) = output.body.get(index + 1..index + 1 + count) else {
+                continue;
+            };
+            if !items.iter().enumerate().all(|(offset, item)| {
+                matches!(item.op, Opcode::GetItem)
+                    && item.a == instruction.dst
+                    && item.b as usize == offset
+                    && item.c != 0
+            }) {
+                continue;
+            }
+            output.unpack_bundles[index] = Some(UnpackBundle {
+                source: code.sites[instruction.dst as usize]
+                    .as_ref()
+                    .unwrap()
+                    .inputs[0],
+                token: ValueId(instruction.dst as usize),
+                items: items
+                    .iter()
+                    .map(|item| ValueId(item.dst as usize))
+                    .collect(),
+            });
         }
         output.iterator_branches.resize(output.body.len(), None);
         for (index, instructions) in output.body.windows(3).enumerate() {

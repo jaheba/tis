@@ -20,8 +20,22 @@ pub(crate) fn add(heap: &mut Heap, lhs: Value, rhs: Value) -> Result<Value> {
     }
     if let (Value::Ref(_), Value::Ref(_)) = (lhs, rhs) {
         let object = match (heap.get(lhs)?, heap.get(rhs)?) {
-            (Object::Bytes(lhs), Object::Bytes(rhs)) => {
-                Object::Bytes([lhs.as_slice(), rhs.as_slice()].concat())
+            (
+                left @ (Object::Bytes(_) | Object::ByteArray(_)),
+                right @ (Object::Bytes(_) | Object::ByteArray(_)),
+            ) => {
+                let (Object::Bytes(lhs) | Object::ByteArray(lhs)) = left else {
+                    unreachable!()
+                };
+                let (Object::Bytes(rhs) | Object::ByteArray(rhs)) = right else {
+                    unreachable!()
+                };
+                let data = [lhs.as_slice(), rhs.as_slice()].concat();
+                if matches!(left, Object::ByteArray(_)) {
+                    Object::ByteArray(data)
+                } else {
+                    Object::Bytes(data)
+                }
             }
             (Object::String(lhs), Object::String(rhs)) => Object::String(format!("{lhs}{rhs}")),
             (Object::List(lhs), Object::List(rhs)) => {
@@ -76,13 +90,23 @@ pub(crate) fn truth(heap: &Heap, value: Value) -> Result<bool> {
         Value::Int(value) => value != 0,
         Value::Float(value) => value != 0.0,
         Value::Ref(_) => match heap.get(value)? {
+            Object::Library(payload)
+                if matches!(&**payload, crate::library::Payload::Decimal(_)) =>
+            {
+                let crate::library::Payload::Decimal(d) = &**payload else {
+                    unreachable!()
+                };
+                d.coefficient != num_bigint::BigInt::from(0)
+            }
             Object::BigInt(n) => n != &num_bigint::BigInt::from(0),
             Object::String(_)
             | Object::Bytes(_)
+            | Object::ByteArray(_)
             | Object::List(_)
             | Object::Tuple(_)
             | Object::Dict(_)
             | Object::Set(_)
+            | Object::FrozenSet(_)
             | Object::Range { .. }
             | Object::View { .. } => heap.len(value)? != 0,
             _ => true,

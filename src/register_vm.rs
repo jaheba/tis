@@ -173,11 +173,39 @@ impl Vm {
                 Opcode::Return => return self.read(base, ValueId(a)),
                 _ => {}
             }
+            if !collecting && let Some(bundle) = &register.unpack_bundles[instruction_index] {
+                let source = self.read(base, bundle.source)?;
+                let items = match self.heap.get(source) {
+                    Ok(Object::Tuple(items)) if items.len() == bundle.items.len() => {
+                        transfers.clear();
+                        transfers.extend_from_slice(items);
+                        true
+                    }
+                    Ok(Object::List(items)) if items.len() == bundle.items.len() => {
+                        transfers.clear();
+                        transfers.extend((0..items.len()).map(|i| items.value(i).unwrap()));
+                        true
+                    }
+                    _ => false,
+                };
+                if items {
+                    // The token is consumed only by these adjacent reads. No callback, collection
+                    // or side exit can observe a list before its complete snapshot has been copied.
+                    self.write(base, bundle.token, source)?;
+                    for (&destination, &value) in bundle.items.iter().zip(transfers.iter()) {
+                        self.write(base, destination, value)?;
+                    }
+                    ip += bundle.items.len();
+                    continue;
+                }
+            }
             if !collecting && let Some(branch) = register.iterator_branches[instruction_index] {
                 // Keep both HIR results and the original instruction offsets. Active feedback and
                 // reconstruction after Next still use the unfused body; no iterator call is repeated.
                 let iterator = self.read(base, ValueId(a))?;
                 let (value, entered_runtime) = if let Some(value) = self.try_range_next(iterator)? {
+                    (value, false)
+                } else if let Some(value) = self.try_string_next(iterator)? {
                     (value, false)
                 } else {
                     (self.next(iterator)?, true)
@@ -375,6 +403,9 @@ impl Vm {
                         if let Some(value) = self.try_range_next(iterator)? {
                             checkpoint = false;
                             value
+                        } else if let Some(value) = self.try_string_next(iterator)? {
+                            checkpoint = false;
+                            value
                         } else {
                             self.next(iterator)?
                         }
@@ -502,13 +533,7 @@ impl Vm {
                                 self.heap.allocate(Object::List(arguments.clone().into()))
                             }
                             Opcode::Tuple => self.heap.allocate(Object::Tuple(arguments.clone())),
-                            Opcode::Dict => {
-                                let dict = self.heap.allocate(Object::Dict(Default::default()));
-                                for pair in arguments.as_chunks::<2>().0 {
-                                    self.py_set_item(dict, pair[0], pair[1])?;
-                                }
-                                dict
-                            }
+                            Opcode::Dict => self.build_dict(arguments)?,
                             _ => {
                                 let (operation, count) = code
                                     .operations
@@ -521,6 +546,17 @@ impl Vm {
                                     .ok_or(Error::InvalidIr("register runtime operation"))?;
                                 if *count != arguments.len() {
                                     return Err(Error::InvalidIr("register runtime arity"));
+                                }
+                                if matches!(operation, CoreOp::Yield) {
+                                    let value = arguments[0];
+                                    self.materialize_methods(base, methods)?;
+                                    self.yield_point = Some(crate::generator::YieldPoint {
+                                        depth: self.depth,
+                                        ip,
+                                        previous,
+                                        destination: Some(destination),
+                                    });
+                                    return Ok(value);
                                 }
                                 // Inputs remain in this register window across nested execution.
                                 // Unlike stack bytecode, operand collection does not remove their roots.

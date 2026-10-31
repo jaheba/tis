@@ -51,13 +51,25 @@ impl Vm {
         key: Value,
         value: Value,
     ) -> Result<bool> {
-        if self.heap.as_str(&key).is_some()
-            && matches!(self.heap.get(object), Ok(Object::Dict(items)) if !items.has_protocol_keys())
-        {
+        let Some(text) = self.heap.as_str(&key) else {
+            return Ok(false);
+        };
+        let Ok(Object::Dict(items)) = self.heap.get(object) else {
+            return Ok(false);
+        };
+        if items.has_protocol_keys() {
+            return Ok(false);
+        }
+        let index = items.string_position(text);
+        if let Some(index) = index {
+            // No callback, collection or mutation intervenes between finding and replacing this slot.
+            if let Object::Dict(items) = &mut *self.heap.get_mut(object)? {
+                items.replace_value(index, value).ok_or(Error::MissingKey)?;
+                return Ok(true);
+            }
+        } else {
             let builtin_key = self.heap.key(key)?;
             if let Object::Dict(items) = &mut *self.heap.get_mut(object)? {
-                // RHS callbacks may have removed or replaced an augmented target. Insertion
-                // preserves the current equal key and uses the already computed value.
                 items.insert(builtin_key, value);
                 return Ok(true);
             }
@@ -148,7 +160,11 @@ impl Vm {
             Err(err)
                 if matches!(
                     self.heap.get(value),
-                    Ok(Object::List(_) | Object::Dict(_) | Object::Set(_) | Object::Slice { .. })
+                    Ok(Object::List(_)
+                        | Object::Dict(_)
+                        | Object::Set(_)
+                        | Object::ByteArray(_)
+                        | Object::Slice { .. })
                 ) =>
             {
                 Err(err)
@@ -170,7 +186,7 @@ impl Vm {
 
     pub(super) fn mapping(&self, object: Value) -> Result<&crate::Dict> {
         match self.heap.get(object)? {
-            Object::Dict(items) | Object::Set(items) => Ok(items),
+            Object::Dict(items) | Object::Set(items) | Object::FrozenSet(items) => Ok(items),
             _ => Err(Error::Type("mapping required")),
         }
     }
@@ -214,18 +230,32 @@ impl Vm {
         }
     }
 
-    pub(super) fn mapping_get(&mut self, object: Value, key: Value) -> Result<Option<Value>> {
-        self.protocol_roots(&[object, key], |vm| {
-            let items = vm.mapping(object)?;
-            if !items.has_protocol_keys() {
-                // Borrow string storage and convert other builtin keys only once.
-                if let Some(text) = vm.heap.as_str(&key) {
-                    return Ok(items.get_str(text).copied());
-                }
-                if let Ok(key) = vm.heap.key(key) {
-                    return Ok(items.get(&key).copied());
-                }
+    // Outer None requires Python hashing/equality; Some(None) is a builtin miss.
+    pub(super) fn builtin_mapping_get(
+        &self,
+        object: Value,
+        key: Value,
+    ) -> Result<Option<Option<Value>>> {
+        let items = self.mapping(object)?;
+        if !items.has_protocol_keys() {
+            if let Some(text) = self.heap.as_str(&key) {
+                return Ok(Some(items.get_str(text).copied()));
             }
+            if let Ok(key) = self.heap.key(key)
+                && !key.has_protocol()
+            {
+                return Ok(Some(items.get(&key).copied()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn mapping_get(&mut self, object: Value, key: Value) -> Result<Option<Value>> {
+        // Builtin lookup cannot call Python or collect; only the protocol path needs roots.
+        if let Some(found) = self.builtin_mapping_get(object, key)? {
+            return Ok(found);
+        }
+        self.protocol_roots(&[object, key], |vm| {
             let key = vm.py_key(key)?;
             let found = vm.mapping_find(object, &key)?;
             Ok(found.and_then(|key| vm.mapping(object).ok()?.get(&key).copied()))
@@ -275,6 +305,11 @@ impl Vm {
         args: &[Value],
     ) -> Result<Value> {
         arity(args, 1, 2)?;
+        if name == "get"
+            && let Some(found) = self.builtin_mapping_get(object, args[0])?
+        {
+            return Ok(found.unwrap_or_else(|| args.get(1).copied().unwrap_or(Value::None)));
+        }
         let mut roots = vec![object];
         roots.extend_from_slice(args);
         self.protocol_roots(&roots, |vm| {

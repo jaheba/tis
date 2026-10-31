@@ -55,6 +55,9 @@ impl Default for ReadyCacheIdentity {
 
 #[derive(Debug, Default)]
 pub struct Vm {
+    pub(crate) dataclass_repr: Vec<Value>,
+    pub(crate) yield_point: Option<crate::generator::YieldPoint>,
+    pub(crate) suspended_frame: Option<crate::generator::SavedFrame>,
     ready_cache_identity: ReadyCacheIdentity,
     pub heap: Heap,
     pub(crate) stack: Vec<Option<Value>>,
@@ -91,6 +94,7 @@ pub struct Vm {
     pub(crate) attribute_protocols: bool,
     pub(crate) protocol_depth: usize,
     pub(crate) modules: std::collections::BTreeMap<String, Value>,
+    pub(crate) random_state: Option<crate::library::random::Mt19937>,
     pub(crate) integer_pool: std::collections::HashMap<num_bigint::BigInt, Value>,
     pub(crate) bytes_pool: std::collections::HashMap<Vec<u8>, Value>,
     pub(crate) literal_pool: std::collections::HashMap<String, Value>,
@@ -230,6 +234,37 @@ impl Vm {
                 }
             }
         };
+        if function.borrow().generator {
+            {
+                let function = function.borrow();
+                function
+                    .profile
+                    .borrow_mut()
+                    .layout(function.blocks.len(), function.value_count);
+                let mut profile = function.profile.borrow_mut();
+                profile.entries = profile.entries.saturating_add(1);
+                profile.returns = profile.returns.saturating_add(1);
+                if self.profiling.collecting(profile.phase) {
+                    profile
+                        .return_types
+                        .observe(crate::profile::ValueKind::Internal);
+                }
+            }
+            return Ok(self.heap.allocate(Object::Suspended(Box::new(
+                crate::generator::Generator {
+                    function,
+                    code,
+                    environment,
+                    mode: self.bytecode,
+                    frame: Some(crate::generator::Frame::Fresh {
+                        arguments: arguments.to_vec(),
+                        defaults: bindings.map(|b| (b.defaults.to_vec(), b.count)),
+                    }),
+                    running: false,
+                    result: Value::None,
+                },
+            ))));
+        }
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
@@ -290,7 +325,7 @@ impl Vm {
         let local_start = self.local_slots.len();
         let (register_len, local_len) = match &input {
             FrameInput::Fresh { .. } => (code.slots, code.local_names.len()),
-            FrameInput::Resume { slots, locals } => (slots.len(), locals.len()),
+            FrameInput::Resume { locals, .. } => (code.slots, locals.len()),
         };
         let frame_end = base + register_len;
         let initialized = (|| -> Result<()> {
@@ -370,10 +405,27 @@ impl Vm {
                 self.execute(&function, &code, base, frame_end, ip, block)
             }
         });
+        if self
+            .yield_point
+            .as_ref()
+            .is_some_and(|point| point.depth == self.depth)
+        {
+            let point = self.yield_point.take().unwrap();
+            if let Some(destination) = point.destination {
+                self.stack[base + destination.0] = Some(Value::None);
+            }
+            self.suspended_frame = Some(crate::generator::SavedFrame {
+                slots: self.stack[base..].to_vec(),
+                locals: self.local_slots[local_start..].to_vec(),
+                ip: point.ip,
+                previous: point.previous,
+            });
+        }
         {
             let function = function.borrow();
             let mut profile = function.profile.borrow_mut();
             match &result {
+                Ok(_) if function.generator => {}
                 Ok(value) => {
                     profile.returns = profile.returns.saturating_add(1);
                     if self.profiling.collecting(profile.phase) {
@@ -640,6 +692,9 @@ impl Vm {
         hotspot: crate::profile::Hotspot,
     ) {
         let function = function.borrow();
+        if function.generator {
+            return;
+        }
         let compiled_profile =
             function.profile.borrow().phase == crate::profile::ProfilePhase::Compiled;
         if self.profiling.mode == crate::profile::ProfileMode::Staged
@@ -893,13 +948,7 @@ impl Vm {
                     let result = match opcode {
                         Opcode::List => self.heap.allocate(Object::List(values.into())),
                         Opcode::Tuple => self.heap.allocate(Object::Tuple(values)),
-                        _ => {
-                            let result = self.heap.allocate(Object::Dict(Default::default()));
-                            for pair in values.as_chunks::<2>().0 {
-                                self.py_set_item(result, pair[0], pair[1])?;
-                            }
-                            result
-                        }
+                        _ => self.build_dict(&values)?,
                     };
                     self.push(result);
                 }
@@ -944,6 +993,16 @@ impl Vm {
                         .into_iter()
                         .map(|value| value.ok_or(Error::InvalidIr("empty operand")))
                         .collect::<Result<Vec<_>>>()?;
+                    if matches!(operation, crate::hir::CoreOp::Yield) {
+                        self.push(Value::None);
+                        self.yield_point = Some(crate::generator::YieldPoint {
+                            depth: self.depth,
+                            ip,
+                            previous: current_block,
+                            destination: None,
+                        });
+                        return Ok(values[0]);
+                    }
                     let roots = self.transient_roots.len();
                     self.transient_roots.extend_from_slice(&values);
                     let result = self.operation(operation, &values);
@@ -1650,6 +1709,54 @@ mod mutation_region_tests {
                 .unwrap();
             vm.collect_garbage(&[]).unwrap();
             assert!(vm.heap.get(child).is_err());
+        }
+    }
+}
+
+impl Vm {
+    pub(crate) fn resume_generator_frame(
+        &mut self,
+        function: Rc<RefCell<Function>>,
+        code: Rc<Code>,
+        environment: Value,
+        frame: crate::generator::Frame,
+    ) -> Result<Value> {
+        match frame {
+            crate::generator::Frame::Fresh {
+                arguments,
+                defaults,
+            } => {
+                let bindings = defaults
+                    .as_ref()
+                    .map(|(defaults, count)| PositionalBindings {
+                        defaults,
+                        count: *count,
+                    });
+                self.execute_window(
+                    function,
+                    code,
+                    environment,
+                    FrameInput::Fresh {
+                        arguments: &arguments,
+                        bindings,
+                    },
+                    0,
+                    None,
+                    None,
+                )
+            }
+            crate::generator::Frame::Saved(frame) => self.execute_window(
+                function,
+                code,
+                environment,
+                FrameInput::Resume {
+                    slots: frame.slots,
+                    locals: frame.locals,
+                },
+                frame.ip,
+                frame.previous,
+                None,
+            ),
         }
     }
 }

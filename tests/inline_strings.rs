@@ -185,3 +185,41 @@ fn compiled_inline_literals_return_without_runtime_helpers() {
         }
     }
 }
+
+#[test]
+fn bytecode_string_iteration_preserves_unicode_and_sticky_exhaustion() {
+    let mut vm = Vm::new();
+    vm.tiering = Tiering::Bytecode;
+    let mut program = compile(
+        r#"
+for text in ['a' * 500, 'é😀東京' * 200, '', 'abc']:
+    iterator = iter(text)
+    result = ''
+    for character in iterator:
+        result += character
+    assert result == text
+    assert next(iterator, 'end') == 'end'
+    assert next(iterator, 'end') == 'end'
+"#,
+    )
+    .unwrap();
+    vm.run_program(&mut program).unwrap();
+}
+
+#[test]
+fn indexed_ascii_cache_is_invalidated_by_host_string_mutation() {
+    let mut heap = Heap::new();
+    let value = heap.allocate(Object::String("abcdefghijkl".into()));
+    let item = heap.get_item(value, Value::Int(-1)).unwrap();
+    assert_eq!(heap.as_str(&item), Some("l"));
+    *heap.get_mut(value).unwrap() = Object::String("é😀abcdefghijkl".into());
+    for (index, expected) in [(0, "é"), (1, "😀"), (-1, "l"), (-14, "é")] {
+        let item = heap.get_item(value, Value::Int(index)).unwrap();
+        assert_eq!(heap.as_str(&item), Some(expected));
+    }
+    assert!(heap.get_item(value, Value::Int(14)).is_err());
+    assert!(heap.get_item(value, Value::Int(-15)).is_err());
+    *heap.get_mut(value).unwrap() = Object::String("abcdefghijkl".into());
+    let item = heap.get_item(value, Value::Int(0)).unwrap();
+    assert_eq!(heap.as_str(&item), Some("a"));
+}

@@ -156,6 +156,8 @@ impl Plan {
         let local_metadata =
             (!entry_locals.is_empty()).then_some(lir.registers.len() + 1 + scratch);
         let scratch = scratch + usize::from(local_metadata.is_some());
+        let inline_base = lir.registers.len() + 1 + scratch;
+        let scratch = scratch + crate::body_inline::scratch_slots(lir);
         let mut plan = Self {
             gateway: if lir.inline_scopes.is_empty() {
                 native_runtime::callback_no_inline as *const u8 as usize
@@ -245,7 +247,41 @@ impl Plan {
                     .iter()
                     .position(|&(from, to)| from == fill.body.0 && to == block)
             {
+                for (register, constant) in &fill.literals {
+                    let value = Slot::boxed(
+                        constant
+                            .immediate()
+                            .ok_or(Error::InvalidIr("fill literal"))?,
+                    );
+                    plan.push(
+                        "constant",
+                        Patch {
+                            dst: slot(*register)?,
+                            tag: value.tag,
+                            a: value.a,
+                            ..Patch::default()
+                        },
+                    );
+                }
                 let info = Box::new(RangeFill {
+                    counter_add: fill.counter.map_or(0, |counter| counter.limit_add),
+                    counter_limit: fill
+                        .counter
+                        .map(|c| slot(c.limit))
+                        .transpose()?
+                        .unwrap_or(usize::MAX),
+                    counter_step: fill
+                        .counter
+                        .map(|c| slot(c.step))
+                        .transpose()?
+                        .unwrap_or(usize::MAX),
+                    counter_update: fill
+                        .counter
+                        .map(|c| slot(c.update))
+                        .transpose()?
+                        .unwrap_or(usize::MAX),
+                    inclusive: fill.counter.is_some_and(|c| c.inclusive),
+                    descending: fill.counter.is_some_and(|c| c.descending),
                     last: fill.last.map(slot).transpose()?.unwrap_or(usize::MAX),
                     constant: slot(fill.constant)?,
                     result: fill.result.map(slot).transpose()?.unwrap_or(usize::MAX),
@@ -418,6 +454,90 @@ impl Plan {
                         p.event = SEQUENCE;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
                         "callback"
+                    }
+                    Operation::Call {
+                        helper: lir::Helper::InlineCall { body, .. },
+                        ..
+                    } if !feedback
+                        && instruction.result.is_some()
+                        && body.nodes.iter().all(|n| {
+                            matches!(
+                                n,
+                                crate::body_inline::Node::Argument(_)
+                                    | crate::body_inline::Node::Field(..)
+                                    | crate::body_inline::Node::Constant(_)
+                                    | crate::body_inline::Node::Add(..)
+                                    | crate::body_inline::Node::Subtract(..)
+                                    | crate::body_inline::Node::Multiply(..)
+                                    | crate::body_inline::Node::Less(..)
+                                    | crate::body_inline::Node::Compare(..)
+                            )
+                        }) =>
+                    {
+                        p.left = slot(Register(inline_base))?;
+                        p.tag = body.nodes.len() as u64;
+                        p.power = native_runtime::inline_preflight as *const u8 as usize;
+                        p.callback = plan.gateway;
+                        p.event = HELPER;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        let fast = plan.push("inline_preflight", p);
+                        let slow = plan.push("callback", p);
+                        plan.nodes[slow].cold = true;
+                        plan.nodes[fast].alternate = Target::Node(slow);
+                        plan.nodes[fast].next = Target::Node(plan.nodes.len());
+                        for (index, node) in body.nodes.iter().enumerate() {
+                            use crate::body_inline::Node as Expr;
+                            let mut operands = Patch {
+                                dst: slot(Register(inline_base + index))?,
+                                ..Patch::default()
+                            };
+                            let stencil = match node {
+                                Expr::Argument(_) | Expr::Field(..) => continue,
+                                Expr::Constant(value) => {
+                                    operands.tag = RAW_FLOAT;
+                                    operands.a = value.to_bits();
+                                    "constant"
+                                }
+                                Expr::Add(a, b)
+                                | Expr::Subtract(a, b)
+                                | Expr::Multiply(a, b)
+                                | Expr::Less(a, b)
+                                | Expr::Compare(_, a, b) => {
+                                    operands.left = slot(Register(inline_base + *a))?;
+                                    operands.right = slot(Register(inline_base + *b))?;
+                                    match node {
+                                        Expr::Add(..) => "fadd",
+                                        Expr::Subtract(..) => "fsub",
+                                        Expr::Multiply(..) => "fmul",
+                                        Expr::Less(..) => "flt",
+                                        Expr::Compare(op, ..) => match op.as_str() {
+                                            "<" => "flt",
+                                            "<=" => "fle",
+                                            ">" => "fgt",
+                                            ">=" => "fge",
+                                            "==" => "feq",
+                                            "!=" => "fne",
+                                            _ => return Err(Error::InvalidIr("inline comparison")),
+                                        },
+                                        _ => unreachable!(),
+                                    }
+                                }
+                                _ => unreachable!(),
+                            };
+                            plan.push(stencil, operands);
+                        }
+                        plan.push(
+                            "retag",
+                            Patch {
+                                dst,
+                                left: slot(Register(inline_base + body.result))?,
+                                tag: if body.boolean { BOOL } else { FLOAT },
+                                ..Patch::default()
+                            },
+                        );
+                        // A guard miss executes the original Call once, then skips the copied body.
+                        plan.nodes[slow].next = Target::Node(plan.nodes.len());
+                        continue;
                     }
                     Operation::Copy(value) => {
                         p.left = slot(*value)?;
@@ -1047,9 +1167,16 @@ impl CopyCode {
                 .ok_or(Error::IntegerOverflow)?,
         ))?;
         for fill in &plan.fills {
-            for offset in [fill.last, fill.constant, fill.result]
-                .into_iter()
-                .filter(|&o| o != usize::MAX)
+            for offset in [
+                fill.last,
+                fill.constant,
+                fill.result,
+                fill.counter_limit,
+                fill.counter_step,
+                fill.counter_update,
+            ]
+            .into_iter()
+            .filter(|&o| o != usize::MAX)
             {
                 if !offset.is_multiple_of(std::mem::size_of::<Slot>())
                     || offset
@@ -1106,6 +1233,19 @@ impl CopyCode {
             } else {
                 0
             };
+            if node.stencil == "inline_preflight"
+                && patch
+                    .left
+                    .checked_add(
+                        usize::try_from(patch.tag)
+                            .map_err(|_| Error::IntegerOverflow)?
+                            .checked_mul(std::mem::size_of::<Slot>())
+                            .ok_or(Error::IntegerOverflow)?,
+                    )
+                    .is_none_or(|end| end > frame_bytes)
+            {
+                return Err(Error::InvalidIr("inline scratch bounds"));
+            }
             let checked_offsets = [patch.dst, patch.left, patch.right].into_iter().chain(
                 if node.stencil == "next_test" {
                     [patch.b as usize, patch.c as usize, 0]
@@ -1301,7 +1441,7 @@ mod tests {
     };
     #[test]
     fn stencil_library_contains_offline_code() {
-        assert_eq!(generated::STENCILS.len(), 60);
+        assert_eq!(generated::STENCILS.len(), 61);
         assert!(
             generated::STENCILS
                 .iter()

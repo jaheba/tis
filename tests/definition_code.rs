@@ -11,6 +11,14 @@ fn repeated_definitions_share_buffers_but_keep_captures_and_body_edits_independe
         let mut vm = Vm::new();
         vm.run_program(&mut program).unwrap();
         let functions = vm.get_global("functions").unwrap();
+        let a = vm.heap.get_item(functions, Value::Int(0)).unwrap();
+        let b = vm.heap.get_item(functions, Value::Int(1)).unwrap();
+        let (Object::Function(a), Object::Function(b)) =
+            (vm.heap.get(a).unwrap(), vm.heap.get(b).unwrap())
+        else {
+            panic!()
+        };
+        assert!(std::ptr::eq(&**a.function.borrow(), &**b.function.borrow()));
         let mut bodies = vec![];
         let before = vm.tier_stats.bytecode_compilations;
         for i in 0..100 {
@@ -43,4 +51,26 @@ fn repeated_try_thunks_compile_once_and_unused_definitions_stay_lazy() {
     vm.run_program(&mut compile("def unused(x):\n    return x + 100\ndef identity(x):\n    return x\nfor i in range(100):\n    try:\n        result = identity(i)\n    except Exception:\n        assert False\nassert result == 99\n").unwrap()).unwrap();
     assert_eq!(vm.tier_stats.bytecode_compilations, 3);
     assert!(vm.tier_stats.bytecode_compile_ns > 0);
+}
+
+#[test]
+fn replacing_an_opaque_shared_body_retires_cached_code() {
+    use tis::hir::Function;
+    let mut first = Function::new(0);
+    let entry = first.entry();
+    let value = first.append(entry, Op::Constant(Constant::Int(1)));
+    first.terminate(entry, Terminator::Return(value));
+    let mut second = Function::new(0);
+    let entry = second.entry();
+    let value = second.append(entry, Op::Constant(Constant::Int(2)));
+    second.terminate(entry, Terminator::Return(value));
+    let mut vm = Vm::new();
+    assert_eq!(vm.run(&mut first, &[]).unwrap(), Value::Int(1));
+    assert_eq!(vm.run(&mut second, &[]).unwrap(), Value::Int(2));
+    let revisions = (first.revision(), second.revision());
+    std::mem::swap(&mut *first, &mut *second);
+    assert_ne!(first.revision(), revisions.0);
+    assert_ne!(second.revision(), revisions.1);
+    assert_eq!(vm.run(&mut first, &[]).unwrap(), Value::Int(2));
+    assert_eq!(vm.run(&mut second, &[]).unwrap(), Value::Int(1));
 }

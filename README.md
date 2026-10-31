@@ -6,7 +6,7 @@ A research Python VM in Rust with a profiling interpreter and two native compila
 Built around an explicit value IR, tis implements a Python subset.
 Ruff AST → HIR → register bytecode → interpreter.
 Runtime profiles feed HIR → typed LIR → reference execution, Cranelift, or copy-and-patch native code.
-There is no stdlib or sandbox infrastructure.
+Builtin library services cover selected standard-library APIs. There is no sandbox or general module loader.
 
 Research findings, failed approaches and open questions are recorded in [Lessons learned](docs/lessons-learned.md).
 [Benchmark reports](benchmarks/results/README.md) retain the methods and evidence for individual experiments.
@@ -45,23 +45,29 @@ Equal inline strings share identity under `is`, including independently construc
 `Heap::string` and `Heap::string_owned` select the representation; `Heap::as_str` reads either form.
 `Heap::allocate(Object::String(...))` explicitly creates a heap string, including for short text.
 
+String searches support `find`, `rfind`, `index`, `rindex` and `count` with optional character bounds.
+`startswith` and `endswith` accept bounds and tuples of affixes.
+Bounds can use Python `__index__`; conversion finishes before borrowing string storage.
+Unicode indexing and contiguous slicing share lazy character/byte offsets, with short strings on bounded scans.
+Derived caches are invalidated by host mutation and reclaimed with the string.
+
 ## Language core
 
-- Lists, tuples, insertion-ordered dictionaries, sets, indexing, slicing and nested/starred unpacking.
+- Lists, tuples, insertion-ordered dictionaries, sets, frozensets, bytearrays, indexing, slicing and nested/starred unpacking.
 - Numeric arithmetic, comparisons, short-circuit boolean expressions and conditional expressions.
 - Functions, recursion, lambdas, definition-time defaults, positional-only and keyword-only arguments,
   `*args`, `**kwargs`, and starred call arguments.
 - Shared lexical environments for closures, including `global` and `nonlocal` assignment.
 - `for`, `while`, loop `else`, `break` and `continue`.
 - List, set and dictionary comprehensions with nested generators and filters, in their own lexical scope.
-- Classes with C3 multiple inheritance, constructors, bound methods, decorators and `super()`.
+- Classes with C3 multiple inheritance, constructors, bound methods, decorators, `super()`, and list subclasses.
 - Arithmetic/reflected/in-place slots, rich comparisons, truth/length, indexing, iteration, calling and string conversion.
 - Custom descriptors, properties, static/class methods and attribute access/mutation hooks.
 - Hashable user objects in dictionaries and sets, including equality callbacks and keys retained through GC.
 - General `try`/`except`/`else`/`finally`, exception subclasses, `except ... as ...`, chaining and bare reraising.
 - Synchronous context managers, including suppression and cleanup on return, break and continue.
-- Lazy single-clause generator expressions; list slice assignment/deletion and `__index__` conversions.
-- Core builtins, container methods, lazy `range`, `enumerate` and `zip`, and basic f-string formatting.
+- Lazy single-clause generator expressions, resumable generator functions and `yield from`; list slice assignment/deletion and `__index__` conversions.
+- Core builtins, container methods, lazy `range`, `enumerate`, `zip`, `map` and `filter`, basic f-string and percent formatting.
 
 Class bases and object classes are fixed at creation: assigning or deleting `C.__bases__` or `obj.__class__`
 raises `TypeError`, including through `setattr`, `delattr` and the `object` attribute bypass methods.
@@ -80,8 +86,23 @@ Their explicit control outcomes carry normal completion, return, break, continue
 They do not reparse source or delegate execution to another interpreter.
 
 The language remains a subset: metaclasses, `__slots__`, `__del__` finalizers,
-builtin-type subclassing (except exceptions), general `yield`,
+builtin-type subclassing beyond lists and exceptions,
 async constructs, `except*`, arbitrary module imports and most of the standard library are unsupported.
+Generator functions save their bytecode position, operand/register slots and locals in a GC-traced heap object.
+Their bodies execute in bytecode in every tier; scalar inlining and native lowering reject them.
+Unreachable yields still make a function a generator, and `yield from` retains a delegated generator's return value.
+`send`, `throw`, `close` and suspension inside protected `try`/`with` suites remain unsupported.
+
+Builtin library services include seeded MT19937 randomness, six base64-family codecs, text/binary regular expressions,
+finite Decimal arithmetic and precision contexts, basic dataclasses, graph deepcopy, dates, protocol 4/5 pickle,
+and lazy `itertools.count`/`islice`. These are partial APIs, sufficient for all 120 unchanged Flying Circus workloads.
+Text regexes support backreferences; empty matches, replacement templates and general regex keyword arguments remain open.
+Decimal covers `+`, `-`, `*`, `//`, comparison and `as_tuple`; non-finite values, signed zero and full context flags remain open.
+Dataclasses generate basic initialization, equality and repr. Options, field factories and full dataclass metadata remain open.
+Deepcopy preserves shared/cyclic containers and supports three-part `__reduce__` state; custom memo and `__deepcopy__` APIs remain open.
+Instance `__dict__` views are live and support `get`, `copy` and `update`; the complete dictionary interface remains open.
+Pickle supports the workload's primitive/container/date graphs; arbitrary globals/classes and older protocols remain unsupported.
+
 Integers that fit in signed 64 bits stay inline; larger literals and overflow results use immutable heap integers.
 Native integer guards resume the generic operation on overflow.
 Core bytes and integer compatibility, audit commands and remaining gaps are documented in [docs/monty-parity.md](docs/monty-parity.md).

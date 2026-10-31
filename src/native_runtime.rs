@@ -478,16 +478,31 @@ pub(crate) extern "C" fn inline_preflight(
         else {
             return Err(Error::InvalidIr("inline body"));
         };
+        // Field deduplication requires the same global protocol guard as ordinary native field probes.
+        // Properties/hooks can change read order and results even when the instance shape is unchanged.
+        if vm.attribute_protocols
+            && body
+                .nodes
+                .iter()
+                .any(|node| matches!(node, crate::body_inline::Node::Field(..)))
+        {
+            return Ok(false);
+        }
         // SAFETY: native installation reserves the maximum plan length after all region/local
         // metadata. Neither image nor scratch moves; no raw pointer survives this callback.
         let slots =
             unsafe { std::slice::from_raw_parts(registers, context.lir.registers.len() + 1) };
         let output = unsafe { std::slice::from_raw_parts_mut(output, body.nodes.len()) };
-        let arguments = arguments
-            .iter()
-            .map(|r| slots[r.0].value())
-            .collect::<Result<Vec<_>>>()?;
-        let hit = body.prepare(&vm.heap, &arguments, output).is_some();
+        // Plans admit at most four Python parameters. Keep this non-collecting gateway
+        // allocation-free even for object/field arguments; failed binding uses the original Call.
+        let mut values = [Value::Unbound; 5];
+        let Some(values) = values.get_mut(..arguments.len()) else {
+            return Ok(false);
+        };
+        for (value, register) in values.iter_mut().zip(arguments) {
+            *value = slots[register.0].value()?;
+        }
+        let hit = body.prepare(&vm.heap, values, output).is_some();
         if hit {
             vm.tier_stats.native_body_inlines += 1;
         }
@@ -582,7 +597,10 @@ pub(crate) extern "C" fn guarded_helper_callback(
                     return Ok(false);
                 };
                 let value = value?;
-                debug_assert!(matches!(value, Value::Int(_) | Value::Float(_)));
+                debug_assert!(
+                    *builtin == lir::ScalarBuiltin::DictGet
+                        || matches!(value, Value::Int(_) | Value::Float(_))
+                );
                 value
             }
             (RANGE_NEXT, lir::Helper::Python(crate::hir::CoreOp::Next)) => {

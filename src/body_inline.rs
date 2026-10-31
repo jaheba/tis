@@ -393,18 +393,20 @@ mod tests {
 
     #[test]
     fn inline_miss_preserves_callee_recursion_limit_checkpoint() {
-        let mut vm = Vm::new();
-        vm.tiering = Tiering::Native;
-        vm.thresholds.function_entries = 32;
-        vm.run_program(&mut compile("def square(x):\n    return x*x\ndef caller(x):\n    return square(x)\nfor i in range(500):\n    caller(3.0)\n").unwrap()).unwrap();
-        let caller = vm.get_global("caller").unwrap();
-        let hits = vm.tier_stats.native_body_inlines;
-        vm.depth = 255;
-        let error = vm.call(caller, &[Value::Float(4.0)]).unwrap_err();
-        assert!(error.to_string().contains("RecursionError"));
-        assert_eq!(vm.tier_stats.native_body_inlines, hits);
-        assert_eq!(vm.depth, 255);
-        assert_eq!(vm.stack_len(), 0);
-        vm.depth = 0;
+        for tier in [Tiering::Native, Tiering::CopyPatch] {
+            let mut vm = Vm::new();
+            vm.tiering = tier;
+            vm.thresholds.function_entries = 32;
+            vm.run_program(&mut compile("def square(x):\n    return x*x\ndef caller(x):\n    return square(x)\nfor i in range(500):\n    caller(3.0)\n").unwrap()).unwrap();
+            let caller = vm.get_global("caller").unwrap();
+            let hits = vm.tier_stats.native_body_inlines;
+            vm.depth = 255;
+            let error = vm.call(caller, &[Value::Float(4.0)]).unwrap_err();
+            assert!(error.to_string().contains("RecursionError"));
+            assert_eq!(vm.tier_stats.native_body_inlines, hits);
+            assert_eq!(vm.depth, 255);
+            assert_eq!(vm.stack_len(), 0);
+            vm.depth = 0;
+        }
     }
 }

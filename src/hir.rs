@@ -130,6 +130,9 @@ pub struct Block {
 /// Runtime operations retain their semantic identity through bytecode lowering.
 #[derive(Debug, Clone)]
 pub enum CoreOp {
+    Annotation(String),
+    Yield,
+    GeneratorResult,
     Missing,
     BytesLiteral(Vec<u8>),
     IntegerLiteral(num_bigint::BigInt),
@@ -162,6 +165,7 @@ pub enum CoreOp {
     EnterExcept,
     ExitExcept,
     ListAppend,
+    TupleFromList,
     Generator(usize, Option<String>),
     Iter,
     Next,
@@ -178,13 +182,21 @@ pub enum CoreOp {
     Namespace,
 }
 
-/// A function owns semantic IR, lexical scope metadata and cached bytecode.
+/// Semantic IR is shared between closures; edits detach the body while profiles retain code identity.
 #[derive(Debug, Clone)]
 pub struct Function {
     id: FunctionId,
-    pub(crate) name: String,
     revision: u64,
     pub(crate) profile: Rc<RefCell<FunctionProfile>>,
+    pub(crate) code: Option<Rc<Code>>,
+    body: Rc<FunctionBody>,
+}
+
+/// Copy-on-write semantic body. Closure environments and defaults live outside this shared data.
+#[derive(Debug, Clone)]
+pub struct FunctionBody {
+    pub(crate) generator: bool,
+    pub(crate) name: String,
     pub(crate) blocks: Vec<Block>,
     pub(crate) parameter_names: Vec<String>,
     pub(crate) positional_only: usize,
@@ -198,32 +210,48 @@ pub struct Function {
     pub(crate) nonlocal_names: Vec<String>,
     pub(crate) module: bool,
     pub(crate) value_count: usize,
-    pub(crate) code: Option<Rc<Code>>,
     locations: Vec<Option<(usize, usize)>>,
+}
+
+impl std::ops::Deref for Function {
+    type Target = FunctionBody;
+    fn deref(&self) -> &FunctionBody {
+        &self.body
+    }
+}
+impl std::ops::DerefMut for Function {
+    fn deref_mut(&mut self) -> &mut FunctionBody {
+        // Even replacing an opaque body through a mutable borrow must retire cached code.
+        self.invalidate();
+        Rc::make_mut(&mut self.body)
+    }
 }
 
 impl Function {
     pub fn new(parameters: usize) -> Self {
         let mut function = Self {
             id: profile::function_id(),
-            name: "<anonymous>".into(),
             revision: profile::revision(),
             profile: Rc::new(RefCell::new(FunctionProfile::default())),
-            blocks: Vec::new(),
-            parameter_names: Vec::new(),
-            positional_only: 0,
-            keyword_only: Vec::new(),
-            vararg: None,
-            kwarg: None,
-            local_names: Vec::new(),
-            local_slots: Vec::new(),
-            local_states: Vec::new(),
-            global_names: Vec::new(),
-            nonlocal_names: Vec::new(),
-            module: false,
-            value_count: 0,
             code: None,
-            locations: Vec::new(),
+            body: Rc::new(FunctionBody {
+                generator: false,
+                name: "<anonymous>".into(),
+                blocks: Vec::new(),
+                parameter_names: Vec::new(),
+                positional_only: 0,
+                keyword_only: Vec::new(),
+                vararg: None,
+                kwarg: None,
+                local_names: Vec::new(),
+                local_slots: Vec::new(),
+                local_states: Vec::new(),
+                global_names: Vec::new(),
+                nonlocal_names: Vec::new(),
+                module: false,
+                value_count: 0,
+                locations: Vec::new(),
+            }),
         };
         function.block(parameters);
         function
@@ -234,6 +262,9 @@ impl Function {
     }
 
     pub(crate) fn environment_required(&self) -> bool {
+        if self.generator {
+            return true;
+        }
         if let Some(code) = &self.code {
             return code.environment_required;
         }
@@ -323,7 +354,8 @@ impl Function {
                 .into_iter()
                 .collect();
         }
-        for instruction in self.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+        let body = Rc::make_mut(&mut self.body);
+        for instruction in body.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
             if let Op::Runtime(operation, _) = &mut instruction.op {
                 match operation {
                     CoreOp::Function(body) | CoreOp::TryCall(body) | CoreOp::With(body) => {
@@ -331,7 +363,7 @@ impl Function {
                     }
                     CoreOp::Class(_, body) => body.index_locals(true),
                     CoreOp::LoadName(name) | CoreOp::StoreName(name) => {
-                        if let Ok(slot) = self.local_slots.binary_search(name) {
+                        if let Ok(slot) = body.local_slots.binary_search(name) {
                             *operation = if matches!(operation, CoreOp::LoadName(_)) {
                                 CoreOp::LoadLocal(slot)
                             } else {
@@ -356,8 +388,8 @@ impl Function {
             terminator: None,
         });
         if !self.local_states.is_empty() {
-            self.local_states
-                .push(vec![vec![None; self.local_slots.len()]]);
+            let slots = self.local_slots.len();
+            self.local_states.push(vec![vec![None; slots]]);
         }
         id
     }
@@ -396,7 +428,7 @@ impl Function {
 
     pub(crate) fn feedback_mut(&mut self, value: ValueId) -> Option<&mut AddFeedback> {
         let &(block, instruction) = self.locations.get(value.0)?.as_ref()?;
-        self.blocks[block].instructions[instruction]
+        Rc::make_mut(&mut self.body).blocks[block].instructions[instruction]
             .feedback
             .as_mut()
     }
@@ -438,7 +470,7 @@ impl Function {
         let mut snapshot = self.clone();
         snapshot.profile = Rc::new(RefCell::new(self.profile()));
         snapshot.code = None;
-        for block in &mut snapshot.blocks {
+        for block in &mut Rc::make_mut(&mut snapshot.body).blocks {
             for instruction in &mut block.instructions {
                 if let Op::Runtime(
                     CoreOp::Function(body)

@@ -316,9 +316,10 @@ impl Function {
         self.local_states = states;
         self.value_count = count;
         self.locations = vec![None; count];
-        for (block, body) in self.blocks.iter().enumerate() {
+        let data = std::rc::Rc::make_mut(&mut self.body);
+        for (block, body) in data.blocks.iter().enumerate() {
             for (index, instruction) in body.instructions.iter().enumerate() {
-                self.locations[instruction.result.0] = Some((block, index));
+                data.locations[instruction.result.0] = Some((block, index));
             }
         }
         self.invalidate();

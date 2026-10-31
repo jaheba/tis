@@ -142,12 +142,14 @@ impl Vm {
         }
         let source = args[0];
         if args.len() > 1 {
-            let text = self
-                .heap
-                .as_str(&source)
-                .ok_or(Error::Type("encoding without a string argument"))?
-                .to_owned();
-            return self.encode_bytes(&text, &args[1..]);
+            if self.heap.as_str(&source).is_none() {
+                return Err(Error::Type("encoding without a string argument"));
+            }
+            return self.encode_string(source, &args[1..]);
+        }
+        if let Ok(Object::ByteArray(data)) = self.heap.get(source) {
+            let data = data.clone();
+            return Ok(self.bytes_value(data));
         }
         if matches!(self.heap.get(source), Ok(Object::Bytes(_))) {
             return Ok(source);
@@ -207,10 +209,18 @@ impl Vm {
         };
         Ok((canonical.into(), errors.into()))
     }
-    pub(super) fn encode_bytes(&mut self, text: &str, args: &[Value]) -> Result<Value> {
+    pub(super) fn encode_string(&mut self, receiver: Value, args: &[Value]) -> Result<Value> {
+        let text = self
+            .heap
+            .as_str(&receiver)
+            .ok_or(Error::Type("expected string"))?;
+        let data = self.encoded_bytes(text, args)?;
+        Ok(self.bytes_value(data))
+    }
+    fn encoded_bytes(&self, text: &str, args: &[Value]) -> Result<Vec<u8>> {
         let (encoding, errors) = self.encoding_args(args)?;
         if encoding == "utf-8" {
-            return Ok(self.bytes_value(text.as_bytes().to_vec()));
+            return Ok(text.as_bytes().to_vec());
         }
         let mut data = Vec::with_capacity(text.len());
         for (index, ch) in text.chars().enumerate() {
@@ -234,7 +244,7 @@ impl Vm {
                 }
             }
         }
-        Ok(self.bytes_value(data))
+        Ok(data)
     }
     fn decode_bytes(&mut self, data: &[u8], args: &[Value]) -> Result<Value> {
         let (encoding, errors) = self.encoding_args(args)?;
@@ -602,6 +612,80 @@ impl Vm {
                 Ok(self.heap.allocate(Object::List(values.into())))
             }
             _ => Err(Error::Unsupported("bytes method")),
+        }
+    }
+}
+
+impl Vm {
+    pub(super) fn bytearray_method(
+        &mut self,
+        receiver: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        match name {
+            "append" => {
+                arity(args, 1, 1)?;
+                let byte = u8::try_from(self.py_index(args[0])?)
+                    .map_err(|_| error("ValueError: byte must be in range(256)"))?;
+                if let Object::ByteArray(data) = &mut *self.heap.get_mut(receiver)? {
+                    data.push(byte);
+                }
+                Ok(Value::None)
+            }
+            "extend" => {
+                arity(args, 1, 1)?;
+                let bytes = match self.heap.get(args[0]) {
+                    Ok(Object::Bytes(data) | Object::ByteArray(data)) => data.clone(),
+                    _ => {
+                        let values = self.collect_iter(args[0])?;
+                        self.protocol_roots(&values, |vm| {
+                            values
+                                .iter()
+                                .map(|&v| {
+                                    u8::try_from(vm.py_index(v)?).map_err(|_| {
+                                        error("ValueError: byte must be in range(256)")
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })?
+                    }
+                };
+                if let Object::ByteArray(data) = &mut *self.heap.get_mut(receiver)? {
+                    data.extend(bytes);
+                }
+                Ok(Value::None)
+            }
+            "clear" => {
+                arity(args, 0, 0)?;
+                if let Object::ByteArray(data) = &mut *self.heap.get_mut(receiver)? {
+                    data.clear();
+                }
+                Ok(Value::None)
+            }
+            "pop" => {
+                arity(args, 0, 1)?;
+                let Object::ByteArray(data) = self.heap.get(receiver)? else {
+                    unreachable!()
+                };
+                let index = args.first().copied().unwrap_or(Value::Int(-1));
+                let index = integer(index)? as i128;
+                let index = if index < 0 {
+                    index + data.len() as i128
+                } else {
+                    index
+                };
+                let i = usize::try_from(index)
+                    .ok()
+                    .filter(|&i| i < data.len())
+                    .ok_or(Error::Index)?;
+                let mut object = self.heap.get_mut(receiver)?;
+                let Object::ByteArray(data) = &mut *object else {
+                    unreachable!()
+                };
+                Ok(Value::Int(i64::from(data.remove(i))))
+            }
+            _ => Err(Error::Unsupported("bytearray method")),
         }
     }
 }

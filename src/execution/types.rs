@@ -5,16 +5,24 @@ pub(super) fn builtin_type_name(name: &str) -> bool {
     is_exception(name)
         || matches!(
             name,
-            "object"
+            "datetime.date"
+                | "decimal.Decimal"
+                | "decimal.Context"
+                | "random.Random"
+                | "object"
                 | "int"
                 | "float"
                 | "bool"
                 | "str"
                 | "bytes"
+                | "bytearray"
+                | "map"
+                | "filter"
                 | "list"
                 | "tuple"
                 | "dict"
                 | "set"
+                | "frozenset"
                 | "range"
                 | "type"
                 | "NoneType"
@@ -57,16 +65,19 @@ impl Vm {
             Value::Ref(_) => match self.heap.get(value)? {
                 Object::String(_) => "str",
                 Object::Bytes(_) => "bytes",
+                Object::ByteArray(_) => "bytearray",
                 Object::BigInt(_) => "int",
                 Object::List(_) => "list",
                 Object::Tuple(_) => "tuple",
                 Object::Dict(_) => "dict",
                 Object::Set(_) => "set",
+                Object::FrozenSet(_) => "frozenset",
+                Object::Library(payload) => payload.type_name(),
                 Object::Range { .. } => "range",
                 Object::Function(_) => "function",
                 Object::Method(..) => "method",
                 Object::Bound(..) => "builtin_function_or_method",
-                Object::Generator { .. } => "generator",
+                Object::Generator { .. } | Object::Suspended(_) => "generator",
                 Object::Property { .. } => "property",
                 Object::StaticMethod(_) => "staticmethod",
                 Object::ClassMethod(_) => "classmethod",

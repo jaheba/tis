@@ -19,7 +19,8 @@ enum Step {
 }
 impl Plan {
     fn compile(function: &Function) -> Option<Self> {
-        if function.module
+        if function.generator
+            || function.module
             || !function.parameter_names.is_empty()
             || !function.local_names.is_empty()
             || !function.global_names.is_empty()

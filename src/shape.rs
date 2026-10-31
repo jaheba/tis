@@ -47,6 +47,8 @@ impl Shape {
 
 #[derive(Debug, Clone)]
 pub struct Attributes {
+    builtin: Option<Box<Value>>,
+    dictionary: Option<Box<Value>>,
     shape: Rc<Shape>,
     values: Vec<Value>,
 }
@@ -54,8 +56,35 @@ impl Attributes {
     pub fn new(shape: Rc<Shape>) -> Self {
         Self {
             shape,
+            builtin: None,
+            dictionary: None,
             values: Vec::new(),
         }
+    }
+    pub(crate) fn dictionary(&self) -> Option<Value> {
+        self.dictionary.as_deref().copied()
+    }
+    pub(crate) fn set_dictionary(&mut self, value: Value) {
+        self.dictionary = Some(Box::new(value));
+    }
+    pub(crate) fn items(&self) -> Vec<(String, Value)> {
+        let mut fields = self
+            .shape
+            .fields
+            .iter()
+            .map(|(name, index)| (*index, name))
+            .collect::<Vec<_>>();
+        fields.sort_unstable_by_key(|(index, _)| *index);
+        fields
+            .into_iter()
+            .filter_map(|(index, name)| self.values.get(index).map(|v| (name.clone(), *v)))
+            .collect()
+    }
+    pub(crate) fn builtin(&self) -> Option<Value> {
+        self.builtin.as_deref().copied()
+    }
+    pub(crate) fn set_builtin(&mut self, value: Value) {
+        self.builtin = Some(Box::new(value));
     }
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(*self.shape.fields.get(name)?)

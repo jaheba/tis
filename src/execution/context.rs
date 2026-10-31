@@ -8,6 +8,10 @@ impl Vm {
         manager: Value,
         env: Value,
     ) -> Result<Value> {
+        if matches!(self.heap.get(manager),Ok(Object::Library(p)) if matches!(&**p,crate::library::Payload::DecimalContext(_)))
+        {
+            return self.with_decimal_context(body, manager, env);
+        }
         let class = self
             .instance_class(manager)
             .ok_or(Error::Type("object is not a context manager"))?;

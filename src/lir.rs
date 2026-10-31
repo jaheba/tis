@@ -423,6 +423,9 @@ impl Function {
         allow_inline: bool,
         allow_cfg: bool,
     ) -> Result<Self> {
+        if hir.generator {
+            return Err(Error::Unsupported("generator bodies execute in bytecode"));
+        }
         let analysis = hir.analyze()?;
         let profile = hir.profile();
         let mut output = Self {
@@ -1207,16 +1210,22 @@ impl Function {
                                             .operands
                                             .first()
                                             .and_then(|operand| operand.monomorphic())
-                                            == Some(ValueKind::Native)
+                                            .is_some_and(|kind| {
+                                                matches!(
+                                                    kind,
+                                                    ValueKind::Native | ValueKind::Method
+                                                )
+                                            })
                                 })
-                                .and_then(|site| {
-                                    if let crate::profile::CallTarget::Native(name) =
-                                        site.call_targets.keys().next()?
-                                    {
+                                .and_then(|site| match site.call_targets.keys().next()? {
+                                    crate::profile::CallTarget::Native(name) => {
                                         ScalarBuiltin::from_name(name)
-                                    } else {
-                                        None
                                     }
+                                    crate::profile::CallTarget::Method {
+                                        receiver: ValueKind::Dict,
+                                        name,
+                                    } if name == "get" => Some(ScalarBuiltin::DictGet),
+                                    _ => None,
                                 });
                             leaf.filter(|builtin| builtin.accepts(names.len()))
                                 .map(Helper::ScalarCall)
@@ -2778,6 +2787,10 @@ impl Helper {
                 | CoreOp::CheckLocal(_)
                 | CoreOp::Unary(_)
                 | CoreOp::GetAttr(_)
+                | CoreOp::Annotation(_)
+                | CoreOp::Yield
+                | CoreOp::GeneratorResult
+                | CoreOp::TupleFromList
                 | CoreOp::Iter
                 | CoreOp::Next
                 | CoreOp::IsDone

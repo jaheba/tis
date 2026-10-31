@@ -106,16 +106,22 @@ pub(crate) fn set(heap: &mut Heap, source: Value, key: Value, value: Value) -> R
     Ok(true)
 }
 
-/// Exact builtin sequences and primitive integer indices cannot enter Python.
+/// Exact builtin sequences and primitive integer indices cannot enter Python or allocate VM objects.
 pub(crate) fn get_builtin(heap: &Heap, source: Value, key: Value) -> Result<Option<Value>> {
     let index = match key {
         Value::Int(i) => i,
         Value::Bool(b) => i64::from(b),
         _ => return Ok(None),
     };
+    if matches!(source, Value::InlineString(_)) {
+        return heap.get_item(source, key).map(Some);
+    }
     let Ok(object) = heap.get(source) else {
         return Ok(None);
     };
+    if matches!(object, Object::String(_)) {
+        return heap.get_item(source, key).map(Some);
+    }
     let len = match object {
         Object::List(items) => items.len(),
         Object::Tuple(items) => items.len(),

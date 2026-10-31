@@ -375,3 +375,78 @@ fn count(b: &mut FunctionBuilder<'_>, vm: ir::Value, field: usize) {
     let count = b.ins().iadd_imm_s(count, 1);
     b.ins().store(MemFlagsData::new(), count, vm, offset);
 }
+
+/// Resolve a writable float view only for exact storage with a valid exclusive-write token.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn float_view(
+    b: &mut FunctionBuilder<'_>,
+    scalars: &ScalarVars,
+    host: ir::Value,
+    registers: ir::Value,
+    receiver: Register,
+    length: Option<usize>,
+    destination: Register,
+    done: ir::Block,
+) -> Result<()> {
+    if !cfg!(target_endian = "little") {
+        return Ok(());
+    }
+    let miss = b.create_block();
+    macro_rules! guard {
+        ($valid:expr) => {{
+            let next = b.create_block();
+            b.ins().brif($valid, next, &[], miss, &[]);
+            b.switch_to_block(next);
+        }};
+    }
+    let (_, row) = fields::checked_row(b, scalars, host, registers, receiver, miss)?;
+    let kind = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, kind) as i32,
+    );
+    let exact = b.ins().icmp_imm_s(IntCC::Equal, kind, 4);
+    guard!(exact);
+    let len = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, len) as i32,
+    );
+    if let Some(length) = length {
+        let same = b.ins().icmp_imm_s(IntCC::Equal, len, length as i64);
+        guard!(same);
+    }
+    let pointer = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, writable_values) as i32,
+    );
+    let nonnull = b.ins().icmp_imm_s(IntCC::NotEqual, pointer, 0);
+    guard!(nonnull);
+    let token = b.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        row,
+        offset_of!(NativeFields, shape) as i32,
+    );
+    let nonnull = b.ins().icmp_imm_s(IntCC::NotEqual, token, 0);
+    guard!(nonnull);
+    // A generic read can invalidate write permission by caching a boxed snapshot.
+    let writable = b.ins().load(types::I8, MemFlagsData::new(), token, 0);
+    let valid = b.ins().icmp_imm_s(IntCC::NotEqual, writable, 0);
+    guard!(valid);
+    let tag = b.ins().ishl_imm_s(len, VIEW_LENGTH_SHIFT as i64);
+    let tag = b.ins().bor_imm_s(tag, FLOAT_VIEW_TAG as i64);
+    store_word_cached(b, scalars, registers, destination, 0, tag)?;
+    store_word_cached(b, scalars, registers, destination, 8, pointer)?;
+    let offset = offset_of!(crate::native_runtime::Context<'_>, inline_float_views) as i32;
+    let count = b.ins().load(types::I64, MemFlagsData::new(), host, offset);
+    let count = b.ins().iadd_imm_s(count, 1);
+    b.ins().store(MemFlagsData::new(), count, host, offset);
+    b.ins().jump(done, &[]);
+    b.switch_to_block(miss);
+    Ok(())
+}
