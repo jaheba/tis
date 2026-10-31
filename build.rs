@@ -1,11 +1,13 @@
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::{env, fs, path::PathBuf, process::Command};
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(tis_offline_stencils)");
     for path in [
         "build.rs",
         "src/copy_patch/stencils.rs",
         "src/copy_patch/patch.rs",
         "src/native_abi.rs",
+        "src/value.rs",
         "src/scalar.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
@@ -29,6 +31,8 @@ fn main() {
         .current_dir(&out)
         .arg(source)
         .args([
+            "--cfg",
+            "tis_offline_stencils",
             "--crate-name",
             "tis_stencils",
             "--crate-type",
@@ -99,6 +103,33 @@ fn main() {
             let begin = ir.find(&marker).expect("stencil LLVM definition");
             let body = &ir[begin..];
             let body = &body[..body.find("\n}").unwrap()];
+            if name.starts_with("fpair_")
+                || matches!(
+                    name,
+                    "range_reduce"
+                        | "range_fill"
+                        | "quiet_enter"
+                        | "next_test"
+                        | "direct_next"
+                        | "direct_string_slice"
+                        | "direct_scalar"
+                        | "local_load"
+                        | "direct_field"
+                        | "direct_float_view"
+                        | "direct_unpack"
+                        | "direct_getitem"
+                        | "direct_setitem"
+                        | "is_done"
+                )
+            {
+                assert!(
+                    body.lines()
+                        .filter(|line| line.contains(" call "))
+                        .all(|line| line.contains("@llvm.")
+                            || (line.contains("tail") && line.contains(" i64 %"))),
+                    "fast stencil {name} contains a non-tail runtime call"
+                );
+            }
             let continuations = body
                 .lines()
                 .filter(|line| {
@@ -120,7 +151,7 @@ fn main() {
         generated.push_str(&format!("({name:?}, &{code:?}),\n"));
         count += 1;
     }
-    assert_eq!(count, 26, "missing or unexpected stencil symbols");
+    assert_eq!(count, 60, "missing or unexpected stencil symbols");
     generated.push_str("];\n");
     fs::write(out.join("stencils.rs"), generated).unwrap();
 }

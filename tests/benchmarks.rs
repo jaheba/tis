@@ -83,38 +83,42 @@ fn sort_errors_restore_detached_items() {
 
 #[test]
 fn native_field_reads_preserve_aliases_method_fallbacks_and_missing_errors() {
-    let source = "class A:\n    def __init__(self):\n        self.x=[1]\n    def method(self):\n        return 42\ndef f(a):\n    return a.x\na=A()\nfor i in range(1000):\n    f(a)\n";
-    let mut vm = run(source, Tiering::Native);
-    let f = vm.get_global("f").unwrap();
-    let a = vm.get_global("a").unwrap();
-    let before = vm.tier_stats.native_field_hits;
-    let value = vm.call(f, &[a]).unwrap();
-    assert!(vm.tier_stats.native_field_hits > before);
-    vm.collect_garbage(&[]).unwrap();
-    assert_eq!(
-        vm.heap.get_item(value, tis::Value::Int(0)).unwrap(),
-        tis::Value::Int(1)
-    );
-    let mut p =
-        compile("a.x=[2]\nassert f(a)==[2]\nassert a.method()==42\nclass B:\n    pass\nb=B()")
-            .unwrap();
-    vm.run_program(&mut p).unwrap();
-    let b = vm.get_global("b").unwrap();
-    assert!(
-        vm.call(f, &[b])
-            .unwrap_err()
-            .to_string()
-            .contains("AttributeError")
-    );
-    assert_eq!(vm.stack_len(), 0);
-    assert!(vm.call(f, &[a]).is_ok());
+    for tier in [Tiering::Native, Tiering::CopyPatch] {
+        let source = "class A:\n    def __init__(self):\n        self.x=[1]\n    def method(self):\n        return 42\ndef f(a):\n    return a.x\na=A()\nfor i in range(1000):\n    f(a)\n";
+        let mut vm = run(source, tier);
+        let f = vm.get_global("f").unwrap();
+        let a = vm.get_global("a").unwrap();
+        let before = vm.tier_stats.native_field_hits;
+        let value = vm.call(f, &[a]).unwrap();
+        assert!(vm.tier_stats.native_field_hits > before);
+        vm.collect_garbage(&[]).unwrap();
+        assert_eq!(
+            vm.heap.get_item(value, tis::Value::Int(0)).unwrap(),
+            tis::Value::Int(1)
+        );
+        let mut p =
+            compile("a.x=[2]\nassert f(a)==[2]\nassert a.method()==42\nclass B:\n    pass\nb=B()")
+                .unwrap();
+        vm.run_program(&mut p).unwrap();
+        let b = vm.get_global("b").unwrap();
+        assert!(
+            vm.call(f, &[b])
+                .unwrap_err()
+                .to_string()
+                .contains("AttributeError")
+        );
+        assert_eq!(vm.stack_len(), 0);
+        assert!(vm.call(f, &[a]).is_ok());
+    }
 }
 
 #[test]
 fn native_field_results_remain_rooted_across_allocating_calls() {
-    let source = "class A:\n    def __init__(self,x):\n        self.x=x\ndef churn(a):\n    a.x=None\n    for i in range(6000):\n        garbage=[i]\ndef f(a):\n    saved=a.x\n    churn(a)\n    return saved[0]\nfor i in range(100):\n    assert f(A([123]))==123\n";
-    let vm = run(source, Tiering::Native);
-    assert!(vm.tier_stats.native_field_hits > 0);
+    for tier in [Tiering::Native, Tiering::CopyPatch] {
+        let source = "class A:\n    def __init__(self,x):\n        self.x=x\ndef churn(a):\n    a.x=None\n    for i in range(6000):\n        garbage=[i]\ndef f(a):\n    saved=a.x\n    churn(a)\n    return saved[0]\nfor i in range(100):\n    assert f(A([123]))==123\n";
+        let vm = run(source, tier);
+        assert!(vm.tier_stats.native_field_hits > 0);
+    }
 }
 
 #[test]

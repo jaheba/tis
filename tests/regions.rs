@@ -118,7 +118,7 @@ fn length_failure_preserves_iterator_progress_and_prior_effects() {
         range: None,
         index: 0.into(),
         size: 3,
-        exhausted: false,
+        exhausted: false.into(),
     });
     vm.heap
         .set_item(y, Value::Int(0), Value::Float(0.0))
@@ -138,9 +138,9 @@ fn length_failure_preserves_iterator_progress_and_prior_effects() {
         vm.heap.get(it).unwrap(),
         Object::Iterator {
             index,
-            exhausted: false,
+            exhausted,
             ..
-        } if index.get() == 2
+        } if !exhausted.get() && index.get() == 2
     ));
     assert_eq!(vm.stack_len(), 0);
 }
@@ -265,7 +265,7 @@ fn float_iteration_reads_updates_and_exhaustion_remains_sticky() {
         range: None,
         index: 0.into(),
         size: 3,
-        exhausted: false,
+        exhausted: false.into(),
     });
     assert_eq!(other.call(g, &[iter]).unwrap(), Value::Float(6.0));
     if let Object::List(v) = &mut *other.heap.get_mut(source).unwrap() {
@@ -626,7 +626,7 @@ fn closed_nest_failure_preserves_partial_writes_and_consumed_outer_item() {
         range: None,
         index: 0.into(),
         size: 7,
-        exhausted: false,
+        exhausted: false.into(),
     });
     let before = vm.tier_stats.clone();
     let error = vm.call(f, &[steps, input]).unwrap_err();
@@ -648,9 +648,9 @@ fn closed_nest_failure_preserves_partial_writes_and_consumed_outer_item() {
         vm.heap.get(steps).unwrap(),
         Object::Iterator {
             index,
-            exhausted: false,
+            exhausted,
             ..
-        } if index.get() == 2
+        } if !exhausted.get() && index.get() == 2
     ));
     assert_eq!(vm.stack_len(), 0);
 }
@@ -689,7 +689,7 @@ fn inner_iterator_alias_preserves_shared_exhaustion() {
         range: None,
         index: 0.into(),
         size: 3,
-        exhausted: false,
+        exhausted: false.into(),
     });
     vm.call(f, &[steps, iterator, Value::Float(1.0)]).unwrap();
     assert_eq!(
@@ -700,9 +700,9 @@ fn inner_iterator_alias_preserves_shared_exhaustion() {
         vm.heap.get(iterator).unwrap(),
         Object::Iterator {
             index,
-            exhausted: true,
+            exhausted,
             ..
-        } if index.get() == 3
+        } if exhausted.get() && index.get() == 3
     ));
 }
 

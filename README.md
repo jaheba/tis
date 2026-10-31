@@ -8,6 +8,9 @@ Ruff AST → HIR → register bytecode → interpreter.
 Runtime profiles feed HIR → typed LIR → reference execution, Cranelift, or copy-and-patch native code.
 There is no stdlib or sandbox infrastructure.
 
+Research findings, failed approaches and open questions are recorded in [Lessons learned](docs/lessons-learned.md).
+[Benchmark reports](benchmarks/results/README.md) retain the methods and evidence for individual experiments.
+
 ```sh
 cargo run --release -- tests/fixtures/game_nbody.py
 # -0.169075164

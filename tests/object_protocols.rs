@@ -475,3 +475,131 @@ for _ in range(10):
 "#,
     );
 }
+
+#[test]
+fn augmented_item_operations_preserve_rhs_order_and_reentrant_updates() {
+    check(
+        r#"
+for _ in range(10):
+    d = {'x': 10}
+    def rhs():
+        d.clear()
+        d['x'] = 100
+        return 3
+    d['x'] += rhs()
+    assert d['x'] == 13
+    def removed():
+        d.clear()
+        return 2
+    d['x'] += removed()
+    assert d['x'] == 15
+    d['x'] -= 3
+    d['x'] *= 2
+    d['x'] //= 3
+    d['x'] %= 5
+    d['x'] **= 2
+    d['x'] |= 2
+    d['x'] &= 6
+    d['x'] ^= 1
+    d['x'] <<= 2
+    d['x'] >>= 1
+    assert d['x'] == 6
+    d['x'] /= 2
+    assert d['x'] == 3.0
+    d['x'] = 9223372036854775807
+    d['x'] += 1
+    assert d['x'] == 9223372036854775808
+    d['x'] += 2
+    assert d['x'] == 9223372036854775810
+    d['x'] = True
+    d['x'] += 1
+    assert d['x'] == 2 and type(d['x']) is int
+    items = {'x': [1]}
+    alias = items['x']
+    items['x'] += [2,3]
+    items['x'] *= 2
+    assert items['x'] is alias and alias == [1,2,3,1,2,3]
+    log = []
+    class Box:
+        def __getitem__(self, key):
+            log.append('get')
+            return self.value
+        def __setitem__(self, key, value):
+            log.append('set')
+            self.value = value
+    box = Box()
+    box.value = 4
+    def receiver():
+        log.append('receiver')
+        return box
+    def key():
+        log.append('key')
+        return 'x'
+    def operand():
+        log.append('rhs')
+        return 5
+    receiver()[key()] += operand()
+    assert box.value == 9
+    assert log == ['receiver','key','get','rhs','set']
+    log.clear()
+    try:
+        {}['missing'] += operand()
+        assert False
+    except KeyError:
+        pass
+    assert log == []
+    class Value:
+        def __iadd__(self, other):
+            log.append('iadd')
+            box.value = None
+            return self
+    obj = Value()
+    box.value = obj
+    box['x'] += 3
+    assert box.value is obj and log == ['get','iadd','set']
+def hot_update(mapping, rhs):
+    mapping['x'] += rhs
+mapping = {'x': 0}
+for _ in range(24):
+    hot_update(mapping, 1)
+assert mapping['x'] == 24
+log.clear()
+obj = Value()
+mapping['x'] = obj
+hot_update(mapping, 1)
+assert mapping['x'] is obj and log == ['iadd']
+mapping['x'] = 0.5
+hot_update(mapping, 2.0)
+assert mapping['x'] == 2.5
+mapping['x'] = 9223372036854775807
+hot_update(mapping, 1)
+assert mapping['x'] == 9223372036854775808
+"#,
+    );
+}
+
+#[test]
+fn augmented_float_store_exit_does_not_repeat_rhs_effects() {
+    check(
+        r#"
+log = []
+def delta(xs, shrink):
+    log.append(shrink)
+    if shrink:
+        xs.clear()
+    return 2.0
+def update(xs, shrink):
+    xs[0] += delta(xs, shrink)
+xs = [1.0]
+for _ in range(12):
+    update(xs, False)
+assert xs == [25.0]
+try:
+    update(xs, True)
+    assert False
+except IndexError:
+    pass
+assert xs == [] and log == [False] * 12 + [True]
+"#,
+    );
+}

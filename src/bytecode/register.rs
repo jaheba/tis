@@ -20,6 +20,7 @@ pub(crate) enum Opcode {
     Dict,
     GetItem,
     SetItem,
+    InplaceItem,
     Len,
     Iter,
     Next,
@@ -242,6 +243,13 @@ impl RegisterCode {
                             usize::from(operator == "!="),
                         )
                     }
+                    Op::Runtime(CoreOp::InplaceItem(_), inputs) => (
+                        Opcode::InplaceItem,
+                        inputs[0].0,
+                        inputs[1].0,
+                        site.runtime
+                            .ok_or(Error::InvalidIr("item update runtime mapping"))?,
+                    ),
                     Op::Runtime(_, inputs) if Operator::from_hir(&instruction.op).is_some() => {
                         (Opcode::Numeric, inputs[0].0, inputs[1].0, 0)
                     }
@@ -342,16 +350,26 @@ impl RegisterCode {
         for (instruction, slot) in self.body.iter().zip(&self.numeric) {
             let plan = function
                 .instruction(ValueId(instruction.dst as usize))
-                .and_then(|instruction| Operator::from_hir(&instruction.op))
-                .and_then(|operator| {
+                .and_then(|instruction| {
+                    let offset = usize::from(matches!(
+                        instruction.op,
+                        Op::Runtime(CoreOp::InplaceItem(_), _)
+                    )) * 2;
+                    Operator::from_hir(&instruction.op).map(|operator| (operator, offset))
+                })
+                .and_then(|(operator, offset)| {
                     profile
                         .sites
                         .get(instruction.dst as usize)
-                        .and_then(|site| Plan::from_profile(operator, site))
+                        .and_then(|site| Plan::from_profile(operator, site, offset))
                 });
             if matches!(
                 instruction.op,
-                Opcode::Add | Opcode::Subtract | Opcode::Less | Opcode::Numeric
+                Opcode::Add
+                    | Opcode::Subtract
+                    | Opcode::Less
+                    | Opcode::Numeric
+                    | Opcode::InplaceItem
             ) {
                 slot.set(plan);
                 installed += u64::from(plan.is_some());

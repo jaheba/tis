@@ -12,35 +12,6 @@ fn error(message: impl std::fmt::Display) -> Error {
     Error::Runtime(format!("native execution: {message}"))
 }
 impl Slot {
-    pub(crate) fn boxed(value: Value) -> Self {
-        match value {
-            Value::Unbound => Self { tag: UNBOUND, a: 0 },
-            Value::None => Self { tag: NONE, a: 0 },
-            Value::Bool(v) => Self {
-                tag: BOOL,
-                a: v as u64,
-            },
-            Value::Int(v) => Self {
-                tag: INT,
-                a: v as u64,
-            },
-            Value::Float(v) => Self {
-                tag: FLOAT,
-                a: v.to_bits(),
-            },
-            Value::InlineString(text) => {
-                let (high, a) = text.words();
-                Self {
-                    tag: INLINE_STRING | ((high as u64) << 32),
-                    a,
-                }
-            }
-            Value::Ref(id) => Self {
-                tag: REF | ((id.heap as u64) << 32),
-                a: id.index as u64 | ((id.generation as u64) << 32),
-            },
-        }
-    }
     pub(crate) fn value(self) -> Result<Value> {
         Ok(match self.tag & KIND_MASK {
             UNBOUND => Value::Unbound,
@@ -106,13 +77,35 @@ pub(crate) fn execute(
     let mut quiet_counts = std::mem::take(&mut scratch.quiet_counts);
     quiet_counts.resize(quiet_edges.len(), 0);
     quiet_counts.fill(0);
+    let done_root = vm.transient_roots.len();
+    vm.transient_roots.push(Value::None);
     let result = (|| {
         let mut rooted = std::mem::take(&mut scratch.rooted);
-        // Copy the initial image and record its existing shadow roots in the same frame scan.
-        for (index, value) in vm.stack[base..frame_end].iter().enumerate() {
-            if let Some(value) = value {
-                registers[index] = Slot::boxed(*value);
-                rooted.push(index);
+        let mut import = |index: usize, value: Value| {
+            registers[index] = Slot::boxed(value);
+            rooted.push(index);
+        };
+        if start == 0 && !skip_probe {
+            // Fresh windows initialize only entry parameters; Python bindings live in locals.
+            // OSR and resumed execution must retain the full HIR image, not just its parameters.
+            for parameter in &code.entry_parameters {
+                if let Some(value) = vm.stack[base + parameter.0] {
+                    import(parameter.0, value);
+                }
+            }
+            debug_assert!(
+                vm.stack[base..frame_end]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, value)| {
+                        value.is_none() || code.entry_parameters.iter().any(|p| p.0 == i)
+                    })
+            );
+        } else {
+            for (index, value) in vm.stack[base..frame_end].iter().enumerate() {
+                if let Some(value) = value {
+                    import(index, *value);
+                }
             }
         }
         let locals_ready = start == 0 && !skip_probe && !entry_locals.is_empty();
@@ -159,9 +152,18 @@ pub(crate) fn execute(
         }
         let mut context = Context {
             vm: vm as *mut Vm,
-            inline_field_hits: 0,
-            inline_block_hits: 0,
-            quiet_counts: quiet_counts.as_mut_ptr(),
+            done_root,
+            header: NativeHeader {
+                directory: &vm.heap.native_fields,
+                attribute_protocols: &vm.attribute_protocols,
+                inline_field_hits: 0,
+                inline_block_hits: 0,
+                quiet_counts: quiet_counts.as_mut_ptr(),
+                previous: usize::MAX,
+                skip_probe,
+                collecting: vm.collecting(function),
+                done: Slot::default(),
+            },
             function,
             code,
             lir,
@@ -171,9 +173,6 @@ pub(crate) fn execute(
             nest,
             base,
             rooted,
-            previous: usize::MAX,
-            skip_probe,
-            collecting: vm.collecting(function),
             error: None,
             registers: registers.as_mut_ptr(),
             helper_arguments: std::mem::take(&mut scratch.helper_arguments),
@@ -182,6 +181,9 @@ pub(crate) fn execute(
             active_region: None,
             region_done: None,
             schema_key: vec![],
+            inline_float_views: 0,
+            inline_unpack_batches: 0,
+            inline_next: 0,
         };
         let outcome = (|| {
             // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
@@ -195,10 +197,15 @@ pub(crate) fn execute(
                     u32::try_from(start).map_err(error)?,
                 )
             };
-            vm.tier_stats.native_inline_field_hits += context.inline_field_hits;
-            vm.tier_stats.native_inline_blocks += context.inline_block_hits;
-            vm.tier_stats.native_field_hits += context.inline_field_hits;
-            vm.tier_stats.shape_read_hits += context.inline_field_hits;
+            vm.tier_stats.native_inline_field_hits += context.header.inline_field_hits;
+            vm.tier_stats.native_inline_blocks += context.header.inline_block_hits;
+            vm.tier_stats.native_field_hits += context.header.inline_field_hits;
+            vm.tier_stats.shape_read_hits += context.header.inline_field_hits;
+            vm.tier_stats.native_float_views += context.inline_float_views;
+            vm.tier_stats.native_inline_float_views += context.inline_float_views;
+            vm.tier_stats.native_unpack_batches += context.inline_unpack_batches;
+            vm.tier_stats.native_inline_unpack_batches += context.inline_unpack_batches;
+            vm.tier_stats.native_inline_next += context.inline_next;
             context.flush_region()?;
             // Quiet counts contain no Python handles. Merge even on guard/error exits, after
             // native execution has stopped; observing blocks still use immediate bookkeeping.
@@ -250,6 +257,7 @@ pub(crate) fn execute(
     })();
     // Reuse only after reconstruction and every callback have finished. Clearing also prevents
     // stale references from being read when a later function uses fewer registers.
+    vm.transient_roots.truncate(done_root);
     registers.clear();
     scratch.registers = registers;
     quiet_counts.clear();
@@ -265,11 +273,8 @@ pub(crate) extern "C" fn power(left: f64, right: f64) -> f64 {
 
 #[repr(C)]
 pub(crate) struct Context<'a> {
+    pub(crate) header: NativeHeader,
     pub(crate) vm: *mut Vm,
-    pub(crate) inline_field_hits: u64,
-    pub(crate) inline_block_hits: u64,
-    /// Fixed invocation-owned array; never resized while native code runs.
-    pub(crate) quiet_counts: *mut u64,
     function: &'a Rc<RefCell<Function>>,
     code: &'a Code,
     lir: &'a lir::Function,
@@ -280,10 +285,7 @@ pub(crate) struct Context<'a> {
     nest: Option<&'a crate::region::nest::LoopNest>,
     base: usize,
     rooted: Vec<usize>,
-    // A word-sized sentinel lets native quiet blocks update bookkeeping without a Rust callback.
-    pub(crate) previous: usize,
-    pub(crate) skip_probe: bool,
-    pub(crate) collecting: bool,
+    done_root: usize,
     error: Option<Error>,
     registers: *mut Slot,
     // Each native invocation owns its scratch buffer, including during recursive helper calls.
@@ -293,7 +295,12 @@ pub(crate) struct Context<'a> {
     active_region: Option<usize>,
     region_done: Option<(usize, Value)>,
     schema_key: Vec<u64>,
+    pub(crate) inline_float_views: u64,
+    pub(crate) inline_unpack_batches: u64,
+    pub(crate) inline_next: u64,
 }
+const _: () = assert!(std::mem::offset_of!(Context<'static>, header) == 0);
+
 /// Probe only existing instance fields. No allocation, Python calls or collection may occur here.
 pub(crate) extern "C" fn field_callback(
     raw: *mut c_void,
@@ -309,7 +316,7 @@ pub(crate) extern "C" fn field_callback(
         if registers != context.registers {
             return Err(Error::InvalidIr("field register image"));
         }
-        if context.collecting || vm.attribute_protocols {
+        if context.header.collecting || vm.attribute_protocols {
             return Ok(false);
         }
         let &(block, index) = context
@@ -452,7 +459,8 @@ pub(crate) extern "C" fn inline_preflight(
         vm.tier_stats.native_runtime_calls += 1;
         // Preserve the skipped callee-entry recursion/collection checkpoints. Pressure must use
         // the fully rooted original call before any speculative field access or body execution.
-        if context.collecting || vm.depth >= 256 || !vm.allocation_fits_without_collection(0) {
+        if context.header.collecting || vm.depth >= 256 || !vm.allocation_fits_without_collection(0)
+        {
             return Ok(false);
         }
         if registers != context.registers {
@@ -498,7 +506,7 @@ pub(crate) extern "C" fn inline_preflight(
     }
 }
 
-/// Closed scalar/name evaluation and budgeted tuple allocation cannot collect or alter VM frames.
+/// Closed builtin evaluation and budgeted allocation cannot collect or alter VM frames.
 /// Status is 0=hit, 1=miss, -1=error. A miss occurs before allocation/effects and uses the original
 /// fully rooted helper exactly once. Heap::allocate must remain non-collecting for this contract.
 pub(crate) extern "C" fn guarded_helper_callback(
@@ -523,11 +531,12 @@ pub(crate) extern "C" fn guarded_helper_callback(
                 | STRING_NEXT
                 | RANGE_NEXT
                 | LIST_SET
+                | CLOSED_BUILTIN
         ) || registers != context.registers
         {
             return Err(Error::InvalidIr("guarded helper gateway"));
         }
-        if context.collecting {
+        if context.header.collecting {
             return Ok(false);
         }
         context.flush_region()?;
@@ -577,22 +586,132 @@ pub(crate) extern "C" fn guarded_helper_callback(
                 value
             }
             (RANGE_NEXT, lir::Helper::Python(crate::hir::CoreOp::Next)) => {
-                let Some(value) = vm.try_range_next(slots[arguments[0].0].value()?)? else {
+                let iterator = slots[arguments[0].0].value()?;
+                if let Some(value) = vm.try_range_next(iterator)? {
+                    value
+                } else if let Some(value) = vm.try_sequence_next(iterator)? {
+                    // Exact list/tuple cursors can advance without allocating an end sentinel.
+                    vm.tier_stats.native_sequence_loads += 1;
+                    value
+                } else {
                     return Ok(false);
-                };
-                value
+                }
             }
-            (LIST_SET, lir::Helper::SetItem) => {
-                if !crate::sequence::set(
-                    &mut vm.heap,
-                    slots[arguments[0].0].value()?,
-                    slots[arguments[1].0].value()?,
-                    slots[arguments[2].0].value()?,
-                )? {
+            (LIST_SET | CLOSED_BUILTIN, lir::Helper::SetItem) => {
+                let object = slots[arguments[0].0].value()?;
+                let key = slots[arguments[1].0].value()?;
+                let value = slots[arguments[2].0].value()?;
+                if !crate::sequence::set(&mut vm.heap, object, key, value)?
+                    && !vm.try_set_string_dict(object, key, value)?
+                {
                     return Ok(false);
                 }
                 context.views.clear();
+                vm.tier_stats.native_builtin_updates += 1;
                 Value::None
+            }
+            (CLOSED_BUILTIN, helper) => {
+                let mut values = [Value::None; 4];
+                if arguments.len() > values.len() {
+                    return Err(Error::InvalidIr("closed builtin arity"));
+                }
+                for (value, input) in values.iter_mut().zip(arguments) {
+                    *value = slots[input.0].value()?;
+                }
+                match helper {
+                    lir::Helper::GetItem => {
+                        // String keys cannot hit the sequence helper. Skip that extra probe
+                        // to preserve the existing mapping fast path.
+                        if matches!(values[1], Value::Int(_) | Value::Bool(_)) {
+                            let Some(value) =
+                                crate::sequence::get_builtin(&vm.heap, values[0], values[1])?
+                            else {
+                                return Ok(false);
+                            };
+                            vm.tier_stats.native_sequence_loads += 1;
+                            value
+                        } else {
+                            let Ok(crate::Object::Dict(items)) = vm.heap.get(values[0]) else {
+                                return Ok(false);
+                            };
+                            if items.has_protocol_keys() {
+                                return Ok(false);
+                            }
+                            let Some(text) = vm.heap.as_str(&values[1]) else {
+                                return Ok(false);
+                            };
+                            let Some(value) = items.get_str(text).copied() else {
+                                return Ok(false);
+                            };
+                            vm.tier_stats.native_mapping_reads += 1;
+                            value
+                        }
+                    }
+                    lir::Helper::Python(crate::hir::CoreOp::Compare(op))
+                        if op == "in" || op == "not in" =>
+                    {
+                        let Ok(crate::Object::Dict(items)) = vm.heap.get(values[1]) else {
+                            return Ok(false);
+                        };
+                        if items.has_protocol_keys() {
+                            return Ok(false);
+                        }
+                        let Some(text) = vm.heap.as_str(&values[0]) else {
+                            return Ok(false);
+                        };
+                        let found = items.get_str(text).is_some();
+                        vm.tier_stats.native_mapping_reads += 1;
+                        Value::Bool(if op == "in" { found } else { !found })
+                    }
+                    lir::Helper::Python(crate::hir::CoreOp::InplaceItem(op)) => {
+                        if !vm.try_inplace_item(op, values[0], values[1], values[2], values[3])? {
+                            return Ok(false);
+                        }
+                        context.views.clear();
+                        vm.tier_stats.native_builtin_updates += 1;
+                        Value::None
+                    }
+                    lir::Helper::Python(crate::hir::CoreOp::GetSlice) => {
+                        if values[3] != Value::None && values[3] != Value::Int(1) {
+                            return Ok(false);
+                        }
+                        let Some(text) = vm.heap.as_str(&values[0]) else {
+                            return Ok(false);
+                        };
+                        if !vm.heap.string_is_ascii(values[0])? {
+                            return Ok(false);
+                        }
+                        let bound = |value, default| match value {
+                            Value::None => Some(default),
+                            Value::Int(n) => {
+                                let n = i128::from(n);
+                                Some(
+                                    (if n < 0 { text.len() as i128 + n } else { n })
+                                        .clamp(0, text.len() as i128)
+                                        as usize,
+                                )
+                            }
+                            _ => None,
+                        };
+                        let (Some(start), Some(stop)) =
+                            (bound(values[1], 0), bound(values[2], text.len()))
+                        else {
+                            return Ok(false);
+                        };
+                        let text = &text[start..stop.max(start)];
+                        // Inline results need no arena slot. Longer strings use the same
+                        // no-collection allocation budget as closed tuple construction.
+                        if text.len() > crate::InlineString::CAPACITY
+                            && !vm.allocation_fits_without_collection(1)
+                        {
+                            return Ok(false);
+                        }
+                        let value = vm.heap.string(text);
+                        vm.tier_stats.native_string_slices += 1;
+                        value
+                    }
+                    _ => return Err(Error::InvalidIr("closed builtin operation")),
+                }
             }
             (STRING_NEXT, lir::Helper::StringNext) => {
                 let [iterator] = arguments.as_slice() else {
@@ -768,7 +887,7 @@ impl Context<'_> {
                 .or_default();
             *count = count.saturating_add(counts.a);
         }
-        self.previous = metadata.tag as usize;
+        self.header.previous = metadata.tag as usize;
         Ok(())
     }
     fn prepare_nest(&mut self) -> Result<()> {
@@ -808,7 +927,7 @@ impl Context<'_> {
                 range: None,
                 index: 0.into(),
                 size,
-                exhausted: false,
+                exhausted: false.into(),
             });
             slots[recipe.result.0] = Slot::boxed(iterator);
             roots.push(iterator);
@@ -962,8 +1081,8 @@ impl Context<'_> {
             if let crate::Object::List(list) = &mut *object
                 && length.is_none_or(|len| len == list.len())
             {
-                list.float_view()
-                    .map(|values| (values.as_mut_ptr() as usize, values.len()))
+                list.native_float_view()
+                    .map(|(pointer, len)| (pointer as usize, len))
             } else {
                 None
             }
@@ -983,7 +1102,11 @@ impl Context<'_> {
         registers[dst.0] = Slot {
             tag: FLOAT_VIEW_TAG
                 | ((length as u64) << VIEW_LENGTH_SHIFT)
-                | if self.collecting { VIEW_FEEDBACK } else { 0 },
+                | if self.header.collecting {
+                    VIEW_FEEDBACK
+                } else {
+                    0
+                },
             a: pointer as u64,
         };
         Ok(())
@@ -1011,7 +1134,7 @@ impl Context<'_> {
                 .ok_or(Error::InvalidIr("native leaf guard"))?;
             // Quiet setup cannot allocate, collect, or invoke Python. It shares the ordinary
             // helper semantics but publishes all results in one suspended native invocation.
-            if !self.collecting {
+            if !self.header.collecting {
                 // SAFETY: Entry owns this fixed image and exclusively suspends its VM borrow.
                 let slots = unsafe {
                     std::slice::from_raw_parts_mut(registers, self.lir.registers.len() + 1)
@@ -1065,7 +1188,7 @@ impl Context<'_> {
         if event == SEQUENCE || event == UNPACK_BATCH {
             self.views.floats_dirty = true;
         }
-        if event == UNPACK_BATCH && self.collecting {
+        if event == UNPACK_BATCH && self.header.collecting {
             // A recursive call may reopen feedback while an artifact with fused reads is active.
             let &(block, index) = self
                 .locations
@@ -1108,18 +1231,18 @@ impl Context<'_> {
                 }
             }
             if let Some(origin) = self.lir.block_origins[location as usize] {
-                if self.skip_probe {
-                    self.skip_probe = false;
+                if self.header.skip_probe {
+                    self.header.skip_probe = false;
                 } else {
                     vm.record_block(
                         self.function,
                         self.code,
                         origin.0,
-                        (self.previous != usize::MAX).then_some(self.previous),
+                        (self.header.previous != usize::MAX).then_some(self.header.previous),
                     )?;
                 }
-                self.collecting = vm.collecting(self.function);
-                self.previous = origin.0;
+                self.header.collecting = vm.collecting(self.function);
+                self.header.previous = origin.0;
             }
             return Ok(());
         }
@@ -1129,7 +1252,7 @@ impl Context<'_> {
             .ok_or(Error::InvalidIr("native callback site"))?;
         let instruction = &self.lir.blocks[block].instructions[index];
         let scoped = || SCOPED && self.lir.is_scoped_instruction(instruction);
-        if event == HELPER && !self.collecting && !scoped() {
+        if event == HELPER && !self.header.collecting && !scoped() {
             // Exact builtin probes cannot allocate VM objects, call Python or collect. Misses retain
             // the ordinary conservative helper path and its original deoptimization/root state.
             let value = match &instruction.operation {
@@ -1169,7 +1292,7 @@ impl Context<'_> {
             }
         }
         if event == HELPER
-            && !self.collecting
+            && !self.header.collecting
             && !scoped()
             && !vm.attribute_protocols
             && let Operation::Call {
@@ -1223,7 +1346,7 @@ impl Context<'_> {
                 overflow,
             } = instruction.operation
         {
-            let observed = self.collecting && !scoped() && {
+            let observed = self.header.collecting && !scoped() && {
                 vm.tier_stats.native_feedback_probes += 1;
                 vm.observe_site_with(self.function, self.code, instruction.origin, |r| {
                     registers[r.0].value()
@@ -1316,7 +1439,7 @@ impl Context<'_> {
                 self.side_exit = Some(failure);
                 return Ok(());
             };
-            let observed = self.collecting && !scoped() && {
+            let observed = self.header.collecting && !scoped() && {
                 vm.tier_stats.native_feedback_probes += 1;
                 vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                     registers[v.0].value()
@@ -1397,7 +1520,7 @@ impl Context<'_> {
                     for r in arguments {
                         self.helper_arguments.push(registers[r.0].value()?);
                     }
-                    observed = self.collecting && !scoped() && {
+                    observed = self.header.collecting && !scoped() && {
                         vm.tier_stats.native_feedback_probes += 1;
                         vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
                             registers[v.0].value()
@@ -1414,7 +1537,7 @@ impl Context<'_> {
                     vm.transient_roots.truncate(roots);
                     // A recursive call can reopen this function's observation window.
                     if effects.may_call {
-                        self.collecting = vm.collecting(self.function);
+                        self.header.collecting = vm.collecting(self.function);
                     }
                     Slot::boxed(result?)
                 }
@@ -1427,6 +1550,19 @@ impl Context<'_> {
                 }
                 _ => unreachable!(),
             };
+            if matches!(
+                &instruction.operation,
+                Operation::Call {
+                    helper: lir::Helper::Python(crate::hir::CoreOp::Next),
+                    ..
+                }
+            ) && self.header.done.tag == EMPTY
+                && vm.is_done(result.value()?)
+            {
+                // The reserved transient root survives nested calls and every native safepoint.
+                vm.transient_roots[self.done_root] = result.value()?;
+                self.header.done = result;
+            }
             registers[instruction.result.unwrap().0] = result;
         } else if event != FINISH {
             return Err(Error::InvalidIr("native callback event"));
@@ -1434,7 +1570,7 @@ impl Context<'_> {
         if let Some(result) = instruction.result
             && self.lir.registers[result.0] == lir::Type::Boxed
         {
-            if event == FINISH && self.collecting && !scoped() {
+            if event == FINISH && self.header.collecting && !scoped() {
                 vm.tier_stats.native_feedback_probes += 1;
                 observed =
                     vm.observe_site_with(self.function, self.code, instruction.origin, |v| {
@@ -1470,6 +1606,35 @@ impl Context<'_> {
             Ok(())
         }
     }
+}
+
+/// Quiet loops accumulate incoming edges without borrowing Python profile maps per iteration.
+pub(crate) fn quiet_loop_edges(lir: &lir::Function) -> Vec<(usize, usize)> {
+    if lir.block_origins.iter().any(Option::is_none) {
+        return vec![];
+    }
+    let headers = lir
+        .osr_entries
+        .iter()
+        .map(|e| e.header.0)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut edges = std::collections::BTreeSet::new();
+    for (from, block) in lir.blocks.iter().enumerate() {
+        let mut add = |to| {
+            if headers.contains(&to) {
+                edges.insert((from, to));
+            }
+        };
+        match &block.terminator {
+            lir::Terminator::Jump(e) => add(e.block.0),
+            lir::Terminator::Branch { yes, no, .. } => {
+                add(yes.block.0);
+                add(no.block.0);
+            }
+            lir::Terminator::Return(_) => {}
+        }
+    }
+    edges.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -1554,5 +1719,30 @@ mod compact_value_tests {
             };
             assert_eq!(result.to_bits(), bits);
         }
+    }
+    #[test]
+    fn exhaustion_cache_root_survives_gc_and_native_unwinding() {
+        let mut vm = Vm::new();
+        vm.tiering = crate::Tiering::CopyPatch;
+        vm.profiling.window_ticks = 32;
+        vm.thresholds.function_entries = 8;
+        vm.thresholds.loop_backedges = 8;
+        let mut program = crate::compile("def drain(a,n):\n    for j in range(n):\n        for x in a:\n            pass\n    return 7\na=[1,2]\nfor j in range(40):\n    assert drain(a,100)==7\n").unwrap();
+        vm.run_program(&mut program).unwrap();
+        let retained = vm.heap.string("root held by an outer native caller");
+        vm.transient_roots.push(retained);
+        let epoch = vm.heap.collection_epoch();
+        vm.run_program(&mut crate::compile("assert drain(a,10000)==7\n").unwrap())
+            .unwrap();
+        assert!(vm.heap.collection_epoch() > epoch);
+        assert_eq!(vm.transient_roots, vec![retained]);
+        assert!(vm.heap.get(retained).is_ok());
+        assert!(
+            vm.run_program(&mut crate::compile("drain(None,100)\n").unwrap())
+                .is_err()
+        );
+        assert_eq!(vm.transient_roots, vec![retained]);
+        vm.transient_roots.clear();
+        assert_eq!(vm.stack_len(), 0);
     }
 }

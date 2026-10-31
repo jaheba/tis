@@ -44,6 +44,72 @@ pub(super) fn key_hash(key: &Key) -> i64 {
 }
 
 impl Vm {
+    /// Exact string-keyed dictionary writes cannot call Python or allocate heap objects.
+    pub(crate) fn try_set_string_dict(
+        &mut self,
+        object: Value,
+        key: Value,
+        value: Value,
+    ) -> Result<bool> {
+        if self.heap.as_str(&key).is_some()
+            && matches!(self.heap.get(object), Ok(Object::Dict(items)) if !items.has_protocol_keys())
+        {
+            let builtin_key = self.heap.key(key)?;
+            if let Object::Dict(items) = &mut *self.heap.get_mut(object)? {
+                // RHS callbacks may have removed or replaced an augmented target. Insertion
+                // preserves the current equal key and uses the already computed value.
+                items.insert(builtin_key, value);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns true when the update neither calls Python nor allocates heap objects.
+    pub(crate) fn try_inplace_item(
+        &mut self,
+        op: &str,
+        object: Value,
+        key: Value,
+        old: Value,
+        rhs: Value,
+    ) -> Result<bool> {
+        let scalar = Self::inplace_scalar(op, old, rhs);
+        if let Some(value) = scalar {
+            // Exact builtin updates neither call Python nor collect. Root installation
+            // is only needed for the protocol fallback below.
+            if self.try_set_string_dict(object, key, value)? {
+                return Ok(true);
+            }
+            if crate::sequence::set(&mut self.heap, object, key, value)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn inplace_item(
+        &mut self,
+        op: &str,
+        object: Value,
+        key: Value,
+        old: Value,
+        rhs: Value,
+    ) -> Result<bool> {
+        if self.try_inplace_item(op, object, key, old, rhs)? {
+            return Ok(true);
+        }
+        let scalar = Self::inplace_scalar(op, old, rhs);
+        self.protocol_roots(&[object, key, old, rhs], |vm| {
+            let value = match scalar {
+                Some(value) => value,
+                None => vm.inplace_value(op, old, rhs)?,
+            };
+            vm.protocol_roots(&[value], |vm| vm.py_set_item(object, key, value))?;
+            Ok(false)
+        })
+    }
+
     pub(crate) fn py_key(&mut self, value: Value) -> Result<Key> {
         self.protocol_roots(&[value], |vm| vm.key_protocol(value, 0))
     }

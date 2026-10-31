@@ -1,5 +1,7 @@
 //! Allocation-free native loop regions. Heap views are usable only until the next runtime boundary.
+pub(crate) mod fill;
 pub mod nest;
+pub(crate) mod reduce;
 pub mod schema;
 use crate::native_abi::{KIND_MASK, REF, Slot};
 use crate::{
@@ -290,7 +292,7 @@ impl HeapViews {
                     // Stable arena payloads cannot move or be collected while the verified region runs.
                     // Refresh iterator field pointers after each boundary; generic next may replace the payload.
                     d.index = index.as_ptr() as u64;
-                    d.exhausted = exhausted as *mut bool as u64;
+                    d.exhausted = exhausted.as_ptr() as u64;
                 }
                 Object::Range { start, stop, step } => {
                     d.kind = RANGE;
@@ -310,11 +312,11 @@ impl HeapViews {
                 let Object::List(list) = &mut *guard else {
                     return Err(Error::InvalidIr("region float owner"));
                 };
-                let Some(values) = list.float_view() else {
+                let Some((pointer, len)) = list.native_float_view() else {
                     return Ok(false);
                 };
-                self.descriptors[id.index as usize].data = values.as_mut_ptr() as u64;
-                self.descriptors[id.index as usize].len = values.len() as u64;
+                self.descriptors[id.index as usize].data = pointer as u64;
+                self.descriptors[id.index as usize].len = len as u64;
             }
             self.floats_dirty = false;
         }

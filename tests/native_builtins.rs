@@ -144,6 +144,9 @@ assert f==['new',False]
             assert!(vm.tier_stats.native_list_stores > 0);
             assert!(vm.tier_stats.native_sequence_loads > 0);
         }
+        if tier == Tiering::CopyPatch {
+            assert!(vm.tier_stats.native_sequence_loads > 0);
+        }
         assert_eq!(vm.tier_stats.compilation_errors, 0);
         vm.collect_garbage(&[]).unwrap();
     }
@@ -172,4 +175,84 @@ for x in [range(4), iter(range(4)), [1,2], (1,2)]:
     vm.run_program(&mut compile(source).unwrap()).unwrap();
     assert!(vm.tier_stats.native_sequence_loads >= 2);
     assert_eq!(vm.tier_stats.compilation_errors, 0);
+}
+
+#[test]
+fn exact_sequence_cursors_preserve_aliases_mutation_and_sticky_exhaustion() {
+    let source = r#"
+def collect(it, skip):
+    result=[]
+    for value in it:
+        result.append(value)
+        if skip: next(it, None)
+    return result
+for i in range(30):
+    assert collect(iter([0,1,2,3,4]),True)==[0,2,4]
+    assert collect(iter((0,1,2,3,4)),False)==[0,1,2,3,4]
+    assert collect(iter([1.0,2.0]),False)==[1.0,2.0]
+    assert collect(iter([True,False]),False)==[True,False]
+a=[1,2]
+it=iter(a)
+assert next(it)==1
+a.append(3)
+assert collect(it,False)==[2,3]
+a.append(4)
+assert collect(it,False)==[]
+a=[1,2,3]
+it=iter(a)
+assert next(it)==1
+a.pop(); a.pop()
+assert collect(it,False)==[]
+a.extend([2,3])
+assert next(it,99)==99
+class Seq:
+    def __init__(self): self.calls=[]
+    def __getitem__(self,i):
+        self.calls.append(i)
+        if i==3: raise IndexError()
+        return i+10
+s=Seq()
+assert collect(iter(s),False)==[10,11,12]
+assert s.calls==[0,1,2,3]
+"#;
+    for tier in [
+        Tiering::Bytecode,
+        Tiering::Lir,
+        Tiering::Native,
+        Tiering::CopyPatch,
+    ] {
+        let mut vm = machine(tier);
+        vm.run_program(&mut compile(source).unwrap()).unwrap();
+        assert_eq!(vm.tier_stats.compilation_errors, 0);
+        if tier == Tiering::CopyPatch {
+            assert!(vm.tier_stats.native_sequence_loads > 0);
+        }
+    }
+}
+
+#[test]
+fn closed_sequence_results_survive_owner_removal_and_collection() {
+    let source = r#"
+def read_and_churn(xs):
+    child=xs[-1]
+    xs[-1]=None
+    for j in range(9000): garbage=[j]
+    return child[0]
+def iterate_and_churn(rows):
+    for child in rows:
+        rows[0]=None
+        for j in range(9000): garbage=[j]
+        assert child[0]==42
+for i in range(24):
+    assert read_and_churn([[42]])==42
+    iterate_and_churn([[42]])
+"#;
+    for tier in [Tiering::Native, Tiering::CopyPatch] {
+        let mut vm = machine(tier);
+        vm.run_program(&mut compile(source).unwrap()).unwrap();
+        assert!(vm.tier_stats.native_sequence_loads > 0);
+        assert_eq!(vm.tier_stats.compilation_errors, 0);
+        assert_eq!(vm.stack_len(), 0);
+        vm.collect_garbage(&[]).unwrap();
+    }
 }

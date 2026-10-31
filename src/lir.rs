@@ -765,16 +765,19 @@ impl Function {
                                 .iter()
                                 .all(|operand| operand.monomorphic() == Some(ValueKind::Int))
                     });
+                let item_update =
+                    matches!(instruction.op, hir::Op::Runtime(CoreOp::InplaceItem(_), _));
                 let float_signature = profile
                     .site(origin)
                     .filter(|site| {
                         mode == LoweringMode::Profiled
                             && site.executions >= hir::AddFeedback::WARMUP as u64
-                            && site.operands.len() == 2
+                            && site.operands.len() == if item_update { 4 } else { 2 }
                     })
                     .and_then(|site| {
-                        let left = site.operands[0].monomorphic()?;
-                        let right = site.operands[1].monomorphic()?;
+                        let offset = if item_update { 2 } else { 0 };
+                        let left = site.operands[offset].monomorphic()?;
+                        let right = site.operands[offset + 1].monomorphic()?;
                         if [left, right]
                             .iter()
                             .all(|kind| matches!(kind, ValueKind::Int | ValueKind::Float))
@@ -785,19 +788,36 @@ impl Function {
                             None
                         }
                     });
+                let item_list_store =
+                    if let hir::Op::Runtime(CoreOp::InplaceItem(_), inputs) = &instruction.op {
+                        profile.site(origin).and_then(|site| {
+                            if site.operands.first()?.monomorphic() != Some(ValueKind::List) {
+                                return None;
+                            }
+                            let hir::Op::Constant(Constant::Int(index)) =
+                                hir.instruction(inputs[1])?.op
+                            else {
+                                return None;
+                            };
+                            Some((inputs[0], index))
+                        })
+                    } else {
+                        None
+                    };
                 let float_operator = match &instruction.op {
                     hir::Op::Add(..) => Some(FloatOperator::Add),
                     hir::Op::Subtract(..) => Some(FloatOperator::Subtract),
-                    hir::Op::Runtime(CoreOp::Binary(op) | CoreOp::Inplace(op), _) => {
-                        match op.as_str() {
-                            "+" => Some(FloatOperator::Add),
-                            "-" => Some(FloatOperator::Subtract),
-                            "*" => Some(FloatOperator::Multiply),
-                            "/" => Some(FloatOperator::Divide),
-                            "**" => Some(FloatOperator::Power),
-                            _ => None,
-                        }
-                    }
+                    hir::Op::Runtime(
+                        CoreOp::Binary(op) | CoreOp::Inplace(op) | CoreOp::InplaceItem(op),
+                        _,
+                    ) if !item_update || item_list_store.is_some() => match op.as_str() {
+                        "+" => Some(FloatOperator::Add),
+                        "-" => Some(FloatOperator::Subtract),
+                        "*" => Some(FloatOperator::Multiply),
+                        "/" => Some(FloatOperator::Divide),
+                        "**" => Some(FloatOperator::Power),
+                        _ => None,
+                    },
                     _ => None,
                 };
                 let float_compare = match &instruction.op {
@@ -916,6 +936,11 @@ impl Function {
                 {
                     let guard = output.exit(state, ExitReason::TypeGuard);
                     let inputs = instruction.op.inputs();
+                    let inputs = if item_update {
+                        inputs[2..].to_vec()
+                    } else {
+                        inputs
+                    };
                     let mut args = vec![];
                     for (input, kind) in inputs.into_iter().zip(signature) {
                         if let Some(&(known, scalar)) = scalars.get(&input)
@@ -975,8 +1000,41 @@ impl Function {
                                 failure,
                             },
                         );
-                        emit(&mut instructions, Some(result), Operation::BoxFloat(reg));
-                        scalars.insert(origin, (ValueKind::Float, reg));
+                        if let Some((source, index)) = item_list_store {
+                            let failure = output.exit(state, ExitReason::SequenceGuard);
+                            let view = if let Some(&view) = views.get(&source) {
+                                view
+                            } else {
+                                views.clear();
+                                let view = output.register(Type::FloatView);
+                                emit(
+                                    &mut instructions,
+                                    Some(view),
+                                    Operation::FloatListView {
+                                        value: Register(source.0),
+                                        length: None,
+                                        failure,
+                                    },
+                                );
+                                views.insert(source, view);
+                                view
+                            };
+                            // Arithmetic is pure; guards resume this update with the saved
+                            // old value, without repeating RHS effects or earlier writes.
+                            emit(
+                                &mut instructions,
+                                Some(result),
+                                Operation::FloatListStore {
+                                    view,
+                                    index,
+                                    value: reg,
+                                    failure,
+                                },
+                            );
+                        } else {
+                            emit(&mut instructions, Some(result), Operation::BoxFloat(reg));
+                            scalars.insert(origin, (ValueKind::Float, reg));
+                        }
                     } else {
                         let reg = output.register(Type::Bool);
                         emit(
@@ -2742,7 +2800,7 @@ impl Helper {
                 | CoreOp::Compare(_)
                 | CoreOp::SetAttr(_) => count == 2,
                 CoreOp::Slice => count == 3,
-                CoreOp::GetSlice => count == 4,
+                CoreOp::GetSlice | CoreOp::InplaceItem(_) => count == 4,
                 CoreOp::Call(names) => count == names.len() + 1,
                 CoreOp::Function(_)
                 | CoreOp::Class(..)

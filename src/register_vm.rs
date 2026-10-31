@@ -2,7 +2,7 @@
 use crate::{
     Error, Object, Result, Value, Vm,
     bytecode::{Code, register::Opcode},
-    hir::{Function, ValueId},
+    hir::{CoreOp, Function, ValueId},
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -221,8 +221,15 @@ impl Vm {
                 collecting && self.observe_site(function, code, base, destination)?;
             let specialized = if self.numeric == crate::NumericMode::Adaptive {
                 if let Some(plan) = register.numeric[instruction_index].get() {
-                    let left = self.read(base, ValueId(a))?;
-                    let right = self.read(base, ValueId(b))?;
+                    let (left, right) = if matches!(op, Opcode::InplaceItem) {
+                        let inputs = &code.sites[destination.0]
+                            .as_ref()
+                            .ok_or(Error::InvalidIr("item numeric inputs"))?
+                            .inputs;
+                        (self.read(base, inputs[2])?, self.read(base, inputs[3])?)
+                    } else {
+                        (self.read(base, ValueId(a))?, self.read(base, ValueId(b))?)
+                    };
                     match plan.evaluate(left, right) {
                         crate::bytecode::numeric::Outcome::Value(value) => {
                             self.tier_stats.numeric_fast_paths =
@@ -253,8 +260,19 @@ impl Vm {
                 None
             };
             let result = if let Some(value) = specialized {
-                checkpoint = false;
-                value
+                if matches!(op, Opcode::InplaceItem) {
+                    let object = self.read(base, ValueId(a))?;
+                    let key = self.read(base, ValueId(b))?;
+                    if crate::sequence::set(&mut self.heap, object, key, value)? {
+                        checkpoint = false;
+                    } else {
+                        self.py_set_item(object, key, value)?;
+                    }
+                    Value::None
+                } else {
+                    checkpoint = false;
+                    value
+                }
             } else {
                 match op {
                     Opcode::Constant => match code
@@ -443,6 +461,28 @@ impl Vm {
                             self.call_from_registers(callable, arguments)?
                         }
                     }
+                    Opcode::InplaceItem => {
+                        let site = code
+                            .sites
+                            .get(destination.0)
+                            .and_then(Option::as_ref)
+                            .ok_or(Error::InvalidIr("item update inputs"))?;
+                        let old = self.read(base, site.inputs[2])?;
+                        let rhs = self.read(base, site.inputs[3])?;
+                        let (CoreOp::InplaceItem(operator), _) = code
+                            .operations
+                            .get(c)
+                            .ok_or(Error::InvalidIr("item update runtime pool"))?
+                        else {
+                            return Err(Error::InvalidIr("item update operation"));
+                        };
+                        let object = self.read(base, ValueId(a))?;
+                        let key = self.read(base, ValueId(b))?;
+                        if self.inplace_item(operator, object, key, old, rhs)? {
+                            checkpoint = false;
+                        }
+                        Value::None
+                    }
                     Opcode::Runtime
                     | Opcode::Numeric
                     | Opcode::List
@@ -536,9 +576,13 @@ impl Vm {
         // A miss must record unexpected kinds even when the previous window exhausted its sample budget.
         if !observed {
             site.executions = site.executions.saturating_add(1);
-            site.operands.resize_with(2, Default::default);
-            site.operands[0].observe(crate::profile::ValueKind::of(&self.heap, left));
-            site.operands[1].observe(crate::profile::ValueKind::of(&self.heap, right));
+            let offset = usize::from(matches!(
+                function.instruction(destination).map(|i| &i.op),
+                Some(crate::hir::Op::Runtime(CoreOp::InplaceItem(_), _))
+            )) * 2;
+            site.operands.resize_with(offset + 2, Default::default);
+            site.operands[offset].observe(crate::profile::ValueKind::of(&self.heap, left));
+            site.operands[offset + 1].observe(crate::profile::ValueKind::of(&self.heap, right));
         }
         self.requested
             .retain(|(id, revision, _)| *id != function.id() || *revision != function.revision());

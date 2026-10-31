@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+pub(crate) use crate::native_abi::{NativeFieldDirectory, NativeFields};
 use crate::{Error, ObjectId, Result, Value};
 
 // These modules retain the copied storage invariants and stable arena addresses.
@@ -101,7 +102,8 @@ pub enum Object {
         // UTF-8 byte offset for strings; element index for other sequences.
         index: Cell<usize>,
         size: usize,
-        exhausted: bool,
+        // Native builtin exhaustion shares the same interior-mutation contract as the cursor.
+        exhausted: Cell<bool>,
     },
     Slice {
         start: Value,
@@ -174,26 +176,8 @@ struct Entry {
     object: Object,
 }
 
-/// Read-only native view, refreshed after allocation or any mutable object borrow.
-/// Values remain Rust-owned; native code may use a pointer only until its next callback.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NativeFields {
-    /// Zero rejects access; 1 = instance, 2 = boxed list, 3 = tuple, 4 = float list, 5 = range, 6 = iterator, 7 = cached range iterator, 8 = byte boolean list.
-    pub(crate) kind: u64,
-    pub(crate) class_tag: u64,
-    pub(crate) class_payload: u64,
-    pub(crate) generation: u64,
-    pub(crate) shape: u64,
-    /// Kind 8 addresses bytes; other sequence kinds address Values. Kind guards precede decoding.
-    pub(crate) values: *const Value,
-    /// Mutable provenance is published only after an exclusive boxed-list borrow.
-    pub(crate) writable_values: *mut Value,
-    pub(crate) len: usize,
-}
-
 impl NativeFields {
-    fn of(object: &Object, generation: u32) -> Self {
+    fn of(object: &Object, generation: u32, ascii: Option<bool>) -> Self {
         match object {
             Object::Instance { class, attributes } => {
                 let class = crate::native_abi::Slot::boxed(*class);
@@ -209,6 +193,23 @@ impl NativeFields {
                     len,
                 }
             }
+            Object::Native(name) if matches!(name.as_ref(), "len" | "math.sqrt") => Self {
+                kind: 10,
+                class_tag: if name.as_ref() == "len" {
+                    crate::native_abi::NATIVE_LEN
+                } else {
+                    crate::native_abi::NATIVE_SQRT
+                },
+                generation: generation as u64,
+                ..Self::default()
+            },
+            Object::String(text) if ascii.unwrap_or_else(|| text.is_ascii()) => Self {
+                kind: 9,
+                generation: generation as u64,
+                values: text.as_ptr().cast(),
+                len: text.len(),
+                ..Self::default()
+            },
             Object::List(values) => Self {
                 kind: if values.is_float() {
                     4
@@ -227,8 +228,8 @@ impl NativeFields {
                     },
                     |v| v.as_ptr().cast(),
                 ),
-                shape: if values.bools().is_some() {
-                    values.bool_write_token() as u64
+                shape: if values.bools().is_some() || values.is_float() {
+                    values.native_write_token() as u64
                 } else {
                     0
                 },
@@ -259,14 +260,15 @@ impl NativeFields {
                 range: Some((start, step)),
                 index,
                 size,
-                exhausted: false,
+                exhausted,
                 ..
-            } => Self {
+            } if !exhausted.get() => Self {
                 kind: 7,
                 generation: generation as u64,
                 class_tag: *start as u64,
                 class_payload: *step as u64,
                 shape: index.as_ptr() as u64,
+                writable_values: exhausted.as_ptr().cast(),
                 len: *size,
                 ..Self::default()
             },
@@ -274,9 +276,9 @@ impl NativeFields {
                 source,
                 index,
                 size,
-                exhausted: false,
+                exhausted,
                 ..
-            } => {
+            } if !exhausted.get() => {
                 let source = crate::native_abi::Slot::boxed(*source);
                 Self {
                     kind: 6,
@@ -284,6 +286,7 @@ impl NativeFields {
                     class_tag: source.tag,
                     class_payload: source.a,
                     shape: index.as_ptr() as u64,
+                    writable_values: exhausted.as_ptr().cast(),
                     len: *size,
                     ..Self::default()
                 }
@@ -293,7 +296,7 @@ impl NativeFields {
     }
 
     fn of_mut(object: &mut Object, generation: u32) -> Self {
-        let mut row = Self::of(object, generation);
+        let mut row = Self::of(object, generation, None);
         if let Object::List(list) = object {
             if let Some(values) = list.native_values_mut() {
                 row.values = values;
@@ -301,18 +304,13 @@ impl NativeFields {
             } else if let Some(values) = list.native_bools_mut() {
                 row.values = values.cast();
                 row.writable_values = values.cast();
+            } else if let Some(values) = list.native_floats_mut() {
+                row.values = values.cast();
+                row.writable_values = values.cast();
             }
         }
         row
     }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NativeFieldDirectory {
-    pub(crate) entries: *const NativeFields,
-    pub(crate) len: usize,
-    pub(crate) heap: u64,
 }
 
 #[derive(Debug)]
@@ -382,7 +380,7 @@ impl Heap {
         let generation = generations[id.index()].version;
         if self.native_fields.get().heap != 0 {
             let mut rows = self.field_rows.borrow_mut();
-            let fields = NativeFields::of(&self.entries.get(id).object, generation);
+            let fields = NativeFields::of(&self.entries.get(id).object, generation, ascii);
             if id.index() == rows.len() {
                 rows.push(fields);
             } else {
@@ -472,7 +470,7 @@ impl Heap {
         ))
     }
 
-    /// Cranelift heap probes use this directory; bytecode and stencils do not need it.
+    /// Native backends share this directory; bytecode does not need it.
     pub(crate) fn enable_native_fields(&self) {
         if self.native_fields.get().heap != 0 {
             return;
@@ -484,6 +482,7 @@ impl Heap {
                 NativeFields::of(
                     &self.entries.get(HeapId::from_index(index)).object,
                     generation.version,
+                    generation.ascii,
                 )
             } else {
                 NativeFields::default()
@@ -828,6 +827,9 @@ mod string_property_tests {
     fn string_metadata_is_invalidated_before_exposing_mutable_access() {
         let mut heap = Heap::new();
         let text = heap.allocate(Object::String("abcdefghijklmnop".into()));
+        heap.enable_native_fields();
+        let Value::Ref(id) = text else { unreachable!() };
+        assert_eq!(heap.field_rows.borrow()[id.index as usize].kind, 9);
         assert!(heap.string_is_ascii(text).unwrap());
         {
             let mut guard = heap.get_mut(text).unwrap();
@@ -838,6 +840,7 @@ mod string_property_tests {
             value.replace_range(..2, "é");
             std::mem::forget(guard);
         }
+        assert_eq!(heap.field_rows.borrow()[id.index as usize].generation, 0);
         assert!(!heap.string_is_ascii(text).unwrap());
         assert_eq!(heap.len(text).unwrap(), 15);
         let key = heap.allocate(Object::Slice {
@@ -852,6 +855,7 @@ mod string_property_tests {
         }
         assert!(heap.string_is_ascii(text).unwrap());
         assert_eq!(heap.len(text).unwrap(), 16);
+        assert_eq!(heap.field_rows.borrow()[id.index as usize].kind, 9);
     }
 
     #[test]

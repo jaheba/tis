@@ -954,18 +954,10 @@ impl Vm {
                 }
             }
             CoreOp::Binary(op) => self.py_binary(op, values[0], values[1])?,
-            CoreOp::Inplace(op) => {
-                if op == "+" && matches!(self.heap.get(values[0]), Ok(Object::List(_))) {
-                    self.method(values[0], "extend", &values[1..])?;
-                    values[0]
-                } else if op == "*" && matches!(self.heap.get(values[0]), Ok(Object::List(_))) {
-                    let replacement = repeat(&self.heap, values[0], integer(values[1])?)?;
-                    let object = self.heap.get(replacement)?.clone();
-                    *self.heap.get_mut(values[0])? = object;
-                    values[0]
-                } else {
-                    self.py_inplace(op, values[0], values[1])?
-                }
+            CoreOp::Inplace(op) => self.inplace_value(op, values[0], values[1])?,
+            CoreOp::InplaceItem(op) => {
+                self.inplace_item(op, values[0], values[1], values[2], values[3])?;
+                Value::None
             }
 
             CoreOp::Compare(op) => self.py_compare(op, values[0], values[1])?,
@@ -1651,7 +1643,7 @@ impl Vm {
                 range: None,
                 index: 0.into(),
                 size: text.as_str().chars().count(),
-                exhausted: false,
+                exhausted: false.into(),
             }));
         }
         if matches!(
@@ -1683,7 +1675,7 @@ impl Vm {
                     range: None,
                     index: 0.into(),
                     size: 0,
-                    exhausted: false,
+                    exhausted: false.into(),
                 }));
             }
             return Err(Error::Type("object is not iterable"));
@@ -1698,7 +1690,7 @@ impl Vm {
             range,
             index: 0.into(),
             size,
-            exhausted: false,
+            exhausted: false.into(),
         }))
     }
 
@@ -1707,12 +1699,15 @@ impl Vm {
         let Object::Iterator {
             source,
             index,
-            exhausted: false,
+            exhausted,
             ..
         } = self.heap.get(iterator)?
         else {
             return Ok(None);
         };
+        if exhausted.get() {
+            return Ok(None);
+        }
         let Some(text) = self.heap.as_str(source) else {
             return Ok(None);
         };
@@ -1738,11 +1733,14 @@ impl Vm {
             range,
             index,
             size,
-            exhausted: false,
+            exhausted,
         }) = self.heap.get(iterator)
         else {
             return Ok(None);
         };
+        if exhausted.get() {
+            return Ok(None);
+        }
         let position = index.get();
         if position >= *size {
             return Ok(None);
@@ -1760,6 +1758,34 @@ impl Vm {
         };
         index.set(position + 1);
         Ok(Some(Value::Int(value)))
+    }
+
+    /// Probe one unfinished exact list/tuple iterator. Exhaustion and custom sequences miss
+    /// before advancing; the ordinary path owns sticky exhaustion and sentinel allocation.
+    pub(crate) fn try_sequence_next(&self, iterator: Value) -> Result<Option<Value>> {
+        let Ok(Object::Iterator {
+            source,
+            range: None,
+            index,
+            exhausted,
+            ..
+        }) = self.heap.get(iterator)
+        else {
+            return Ok(None);
+        };
+        if exhausted.get() {
+            return Ok(None);
+        }
+        let position = index.get();
+        let Ok(key) = i64::try_from(position) else {
+            return Ok(None);
+        };
+        let Some(value) = crate::sequence::get_builtin(&self.heap, *source, Value::Int(key))?
+        else {
+            return Ok(None);
+        };
+        index.set(position + 1);
+        Ok(Some(value))
     }
 
     pub(crate) fn next(&mut self, iterator: Value) -> Result<Value> {
@@ -1781,7 +1807,7 @@ impl Vm {
                 size,
                 exhausted,
                 ..
-            } => Some((*source, index.get(), *size, *exhausted)),
+            } => Some((*source, index.get(), *size, exhausted.get())),
             _ => None,
         };
         let Some((source, index, size, exhausted)) = state else {
@@ -1805,7 +1831,7 @@ impl Vm {
                 {
                     self.pending_exception = None;
                     if let Object::Iterator { exhausted, .. } = &mut *self.heap.get_mut(iterator)? {
-                        *exhausted = true;
+                        exhausted.set(true);
                     }
                     Ok(self.heap.allocate(Object::Done))
                 }
@@ -1832,7 +1858,7 @@ impl Vm {
             if let Some(character) = character {
                 index.set(index.get() + character.len_utf8());
             } else {
-                *exhausted = true;
+                exhausted.set(true);
             }
             return Ok(value);
         }
@@ -1852,7 +1878,7 @@ impl Vm {
                 range: None,
                 index: index.into(),
                 size,
-                exhausted: true,
+                exhausted: true.into(),
             };
             return Ok(self.heap.allocate(Object::Done));
         }

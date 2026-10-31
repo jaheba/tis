@@ -14,4 +14,8 @@ Copy-and-patch stencils compile as a separate build-time Rust crate; preserve re
 Run `rustfmt --edition 2024 src/copy_patch/stencils.rs` when editing that source.
 Do not commit unless explicitly asked.
 
+After substantive architecture or performance experiments, update [the research notebook](docs/lessons-learned.md).
+Record the hypothesis, result, limits and evidence, including failed or inconclusive approaches and backend coverage.
+Keep run details in benchmark reports and raw artifacts outside Git, following benchmarks/results/README.md.
+
 Run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` after Rust changes.

@@ -29,3 +29,7 @@ object = { version = "=0.39.1", default-features = false, features = ["read", "s
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("ref-count-return"))'] }
+
+# Stabilize optimization of runtime callbacks when stencil/planner code changes.
+[profile.release.package.tis]
+codegen-units = 1

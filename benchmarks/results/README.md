@@ -1,7 +1,11 @@
 # Benchmark reports
 
+[Lessons learned](../../docs/lessons-learned.md) collects conclusions, failed approaches and open questions across
+experiments.
+
 Keep written reports and top-level reproduction code in Git.
-Store raw samples, JSON/HTML reports, profiles, logs, binaries, archives and copied workload trees outside the repository.
+Store raw samples, JSON/HTML reports, profiles, logs, binaries, archives and copied workload trees outside the
+repository.
 The root .gitignore enforces this layout.
 
 Historical artifact files are preserved locally under:

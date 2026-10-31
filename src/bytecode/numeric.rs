@@ -27,7 +27,7 @@ impl Operator {
             Op::Less(..) => Self::Compare(FloatCondition::Lt),
             // Binary + and - have dedicated HIR operations; the generic Binary helper rejects them.
             Op::Runtime(CoreOp::Binary(op), _) if matches!(op.as_str(), "+" | "-") => return None,
-            Op::Runtime(CoreOp::Binary(op) | CoreOp::Inplace(op), _) => {
+            Op::Runtime(CoreOp::Binary(op) | CoreOp::Inplace(op) | CoreOp::InplaceItem(op), _) => {
                 Self::Arithmetic(match op.as_str() {
                     "+" => FloatOperator::Add,
                     "-" => FloatOperator::Subtract,
@@ -54,15 +54,15 @@ pub(crate) enum Outcome {
     ArithmeticMiss,
 }
 impl Plan {
-    pub fn from_profile(operator: Operator, profile: &SiteProfile) -> Option<Self> {
+    pub fn from_profile(operator: Operator, profile: &SiteProfile, offset: usize) -> Option<Self> {
         if profile.executions < crate::hir::AddFeedback::WARMUP as u64
-            || profile.operands.len() != 2
+            || profile.operands.len() != offset + 2
         {
             return None;
         }
         let kinds = [
-            profile.operands[0].monomorphic()?,
-            profile.operands[1].monomorphic()?,
+            profile.operands[offset].monomorphic()?,
+            profile.operands[offset + 1].monomorphic()?,
         ];
         if !kinds
             .iter()

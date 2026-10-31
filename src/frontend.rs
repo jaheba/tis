@@ -304,12 +304,14 @@ impl Builder {
                 // Evaluate a subscript or attribute target once, before the RHS.
                 let (next, old, target) = self.target(&stmt.target, block)?;
                 let (next, rhs) = self.expression(&stmt.value, next)?;
-                let value = self.runtime(
-                    next,
-                    CoreOp::Inplace(operator_name(stmt.op)?.into()),
-                    vec![old, rhs],
-                );
-                block = self.store_target(target, value, next)?;
+                let op = operator_name(stmt.op)?.to_owned();
+                if let Target::Item(object, key) = target {
+                    self.runtime(next, CoreOp::InplaceItem(op), vec![object, key, old, rhs]);
+                    block = next;
+                } else {
+                    let value = self.runtime(next, CoreOp::Inplace(op), vec![old, rhs]);
+                    block = self.store_target(target, value, next)?;
+                }
             }
             Stmt::FunctionDef(stmt) => {
                 if stmt.is_async || stmt.type_params.is_some() {

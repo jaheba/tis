@@ -19,7 +19,7 @@ pub(super) fn probe(
         types::I8,
         MemFlagsData::new(),
         host,
-        offset_of!(crate::native_runtime::Context<'_>, collecting) as i32,
+        offset_of!(crate::native_abi::NativeHeader, collecting) as i32,
     );
     let quiet = b.ins().icmp_imm_s(IntCC::Equal, collecting, 0);
     let enabled = b.ins().band(ready, quiet);

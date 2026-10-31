@@ -147,6 +147,7 @@ pub enum CoreOp {
     CheckLocal(usize),
     Binary(String),
     Inplace(String),
+    InplaceItem(String),
     Compare(String),
     Unary(String),
     Call(Vec<Option<String>>),

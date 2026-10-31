@@ -136,7 +136,7 @@ impl NativeCode {
             quiet_edges: if feedback {
                 vec![]
             } else {
-                quiet_loop_edges(&lir)
+                crate::native_runtime::quiet_loop_edges(&lir)
             },
             inline_fields: !feedback
                 && cfg!(target_endian = "little")
@@ -354,6 +354,36 @@ impl NativeCode {
                     )?;
                 }};
             }
+            macro_rules! closed_builtin {
+                ($builder:expr, $inputs:expr, $location:expr, $done:expr) => {{
+                    scalars.materialize($builder, registers, $inputs)?;
+                    let event = $builder.ins().iconst(types::I32, CLOSED_BUILTIN as i64);
+                    let site = $builder.ins().iconst(types::I32, $location as i64);
+                    let call = $builder
+                        .ins()
+                        .call(guarded_helper_ref, &[host, registers, event, site]);
+                    let status = $builder.inst_results(call)[0];
+                    let error = $builder.ins().icmp_imm_s(IntCC::SignedLessThan, status, 0);
+                    let dispatch = $builder.create_block();
+                    $builder.ins().brif(error, failed, &[], dispatch, &[]);
+                    $builder.switch_to_block(dispatch);
+                    let hit = $builder.ins().icmp_imm_s(IntCC::Equal, status, 0);
+                    let fast = $builder.create_block();
+                    let slow = $builder.create_block();
+                    $builder.ins().brif(hit, fast, &[], slow, &[]);
+                    $builder.switch_to_block(fast);
+                    scalars.reload_callback(
+                        $builder,
+                        registers,
+                        &owner.lir,
+                        &owner.locations,
+                        CLOSED_BUILTIN,
+                        $location,
+                    )?;
+                    $builder.ins().jump($done, &[]);
+                    $builder.switch_to_block(slow);
+                }};
+            }
             macro_rules! side_exit {
                 ($builder:expr, $passed:expr, $exit:expr) => {{
                     let exit = $exit;
@@ -460,7 +490,7 @@ impl NativeCode {
                         types::I8,
                         MemFlagsData::new(),
                         host,
-                        std::mem::offset_of!(crate::native_runtime::Context<'_>, collecting) as i32,
+                        std::mem::offset_of!(crate::native_abi::NativeHeader, collecting) as i32,
                     );
                     let observe = b.create_block();
                     let quiet = b.create_block();
@@ -486,15 +516,14 @@ impl NativeCode {
                             types::I64,
                             MemFlagsData::new(),
                             host,
-                            std::mem::offset_of!(crate::native_runtime::Context<'_>, previous)
-                                as i32,
+                            std::mem::offset_of!(crate::native_abi::NativeHeader, previous) as i32,
                         );
                         let edge = b.ins().icmp_imm_s(IntCC::Equal, previous, from as i64);
                         let skip = b.ins().load(
                             types::I8,
                             MemFlagsData::new(),
                             host,
-                            std::mem::offset_of!(crate::native_runtime::Context<'_>, skip_probe)
+                            std::mem::offset_of!(crate::native_abi::NativeHeader, skip_probe)
                                 as i32,
                         );
                         let enabled = b.ins().icmp_imm_s(IntCC::Equal, skip, 0);
@@ -507,7 +536,7 @@ impl NativeCode {
                             types::I64,
                             MemFlagsData::new(),
                             host,
-                            std::mem::offset_of!(crate::native_runtime::Context<'_>, quiet_counts)
+                            std::mem::offset_of!(crate::native_abi::NativeHeader, quiet_counts)
                                 as i32,
                         );
                         let count = b.ins().load(
@@ -529,20 +558,20 @@ impl NativeCode {
                         MemFlagsData::new(),
                         block,
                         host,
-                        std::mem::offset_of!(crate::native_runtime::Context<'_>, previous) as i32,
+                        std::mem::offset_of!(crate::native_abi::NativeHeader, previous) as i32,
                     );
                     let zero = b.ins().iconst(types::I8, 0);
                     b.ins().store(
                         MemFlagsData::new(),
                         zero,
                         host,
-                        std::mem::offset_of!(crate::native_runtime::Context<'_>, skip_probe) as i32,
+                        std::mem::offset_of!(crate::native_abi::NativeHeader, skip_probe) as i32,
                     );
                     let count = b.ins().load(
                         types::I64,
                         MemFlagsData::new(),
                         host,
-                        std::mem::offset_of!(crate::native_runtime::Context<'_>, inline_block_hits)
+                        std::mem::offset_of!(crate::native_abi::NativeHeader, inline_block_hits)
                             as i32,
                     );
                     let count = b.ins().iadd_imm_s(count, 1);
@@ -550,7 +579,7 @@ impl NativeCode {
                         MemFlagsData::new(),
                         count,
                         host,
-                        std::mem::offset_of!(crate::native_runtime::Context<'_>, inline_block_hits)
+                        std::mem::offset_of!(crate::native_abi::NativeHeader, inline_block_hits)
                             as i32,
                     );
                     b.ins().jump(ready, &[]);
@@ -739,6 +768,7 @@ impl NativeCode {
                                 destination.unwrap(),
                                 done,
                             )?;
+                            closed_builtin!(&mut b, instruction.operation.inputs(), location, done);
                             runtime_call!(
                                 &mut b,
                                 callback_ref,
@@ -795,6 +825,7 @@ impl NativeCode {
                                 destination.unwrap(),
                                 done,
                             )?;
+                            closed_builtin!(&mut b, instruction.operation.inputs(), location, done);
                             runtime_call!(
                                 &mut b,
                                 callback_ref,
@@ -1525,6 +1556,32 @@ impl NativeCode {
                                 && region_index.is_none()
                                 && (matches!(
                                     helper,
+                                    lir::Helper::Python(
+                                        crate::hir::CoreOp::GetSlice
+                                            | crate::hir::CoreOp::InplaceItem(_)
+                                    )
+                                ) || matches!(helper, lir::Helper::Python(crate::hir::CoreOp::Compare(op)) if op == "in" || op == "not in")) =>
+                        {
+                            let done = b.create_block();
+                            closed_builtin!(&mut b, instruction.operation.inputs(), location, done);
+                            runtime_call!(
+                                &mut b,
+                                callback_ref,
+                                host,
+                                registers,
+                                HELPER,
+                                location,
+                                failed
+                            );
+                            b.ins().jump(done, &[]);
+                            b.switch_to_block(done);
+                        }
+                        Operation::Call { helper, .. }
+                            if !feedback
+                                && !in_nest
+                                && region_index.is_none()
+                                && (matches!(
+                                    helper,
                                     lir::Helper::ScalarCall(_)
                                         | lir::Helper::Tuple
                                         | lir::Helper::LoadName(_)
@@ -2130,6 +2187,7 @@ impl ScalarVars {
                 | STRING_NEXT
                 | RANGE_NEXT
                 | LIST_SET
+                | CLOSED_BUILTIN
         ) {
             return Ok(());
         }
@@ -2403,35 +2461,6 @@ fn callback_failure_values(
     state.map_or_else(Vec::new, |state| {
         state_values(&lir.states[state.0], lir.inline_roots(state))
     })
-}
-
-/// Quiet loops accumulate incoming edges without borrowing Python profile maps per iteration.
-fn quiet_loop_edges(lir: &lir::Function) -> Vec<(usize, usize)> {
-    if lir.block_origins.iter().any(Option::is_none) {
-        return vec![];
-    }
-    let headers = lir
-        .osr_entries
-        .iter()
-        .map(|e| e.header.0)
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut edges = std::collections::BTreeSet::new();
-    for (from, block) in lir.blocks.iter().enumerate() {
-        let mut add = |to| {
-            if headers.contains(&to) {
-                edges.insert((from, to));
-            }
-        };
-        match &block.terminator {
-            Terminator::Jump(e) => add(e.block.0),
-            Terminator::Branch { yes, no, .. } => {
-                add(yes.block.0);
-                add(no.block.0);
-            }
-            Terminator::Return(_) => {}
-        }
-    }
-    edges.into_iter().collect()
 }
 
 /// OSR entries name every HIR backedge target, including forward-layout backedges.

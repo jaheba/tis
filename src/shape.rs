@@ -1,5 +1,6 @@
 //! Immutable instance layouts share transitions; cached field slots are guarded by layout identity.
 use crate::Value;
+pub(crate) use crate::native_abi::FieldSlot;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -42,14 +43,6 @@ impl Shape {
             .insert(name.into(), shape.clone());
         shape
     }
-}
-
-// Zero is the empty-cache sentinel; real shape identities always start at one.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FieldSlot {
-    pub(crate) shape: u64,
-    pub(crate) index: usize,
 }
 
 #[derive(Debug, Clone)]

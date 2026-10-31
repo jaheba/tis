@@ -15,6 +15,7 @@ pub(crate) struct Patch {
     pub alternate_patch: usize,
     pub status: u64,
     pub callback: usize,
+    // Stencil-specific secondary pointer or Context field offset.
     pub power: usize,
     pub event: i32,
     pub location: i32,

@@ -15,7 +15,7 @@ enum Storage {
 pub struct List {
     storage: Storage,
     snapshot: OnceCell<Vec<Value>>,
-    native_bool_writes: Cell<u8>,
+    native_writes: Cell<u8>,
 }
 impl From<Vec<Value>> for List {
     fn from(values: Vec<Value>) -> Self {
@@ -45,7 +45,7 @@ impl From<Vec<Value>> for List {
         Self {
             storage,
             snapshot: OnceCell::new(),
-            native_bool_writes: Cell::new(0),
+            native_writes: Cell::new(0),
         }
     }
 }
@@ -106,15 +106,15 @@ impl List {
             _ => None,
         }
     }
-    pub(crate) fn bool_write_token(&self) -> *mut u8 {
-        self.native_bool_writes.as_ptr()
+    pub(crate) fn native_write_token(&self) -> *mut u8 {
+        self.native_writes.as_ptr()
     }
     /// The native writer checks this token because a later shared borrow can cache a snapshot.
     pub(crate) fn native_bools_mut(&mut self) -> Option<*mut u8> {
         self.snapshot.take();
         match &mut self.storage {
             Storage::Bools(v) => {
-                self.native_bool_writes.set(1);
+                self.native_writes.set(1);
                 Some(v.as_mut_ptr())
             }
             _ => None,
@@ -129,7 +129,7 @@ impl List {
         Self {
             storage,
             snapshot: OnceCell::new(),
-            native_bool_writes: Cell::new(0),
+            native_writes: Cell::new(0),
         }
     }
     pub fn floats(&self) -> Option<&[f64]> {
@@ -157,6 +157,22 @@ impl List {
         }
         match &mut self.storage {
             Storage::Floats(v) => Some(v),
+            _ => None,
+        }
+    }
+    /// Native pointers come from Vec itself, not a temporary unique slice borrow.
+    pub(crate) fn native_float_view(&mut self) -> Option<(*mut f64, usize)> {
+        let _ = self.float_view()?;
+        let len = self.len();
+        Some((self.native_floats_mut()?, len))
+    }
+    pub(crate) fn native_floats_mut(&mut self) -> Option<*mut f64> {
+        self.snapshot.take();
+        match &mut self.storage {
+            Storage::Floats(values) => {
+                self.native_writes.set(1);
+                Some(values.as_mut_ptr())
+            }
             _ => None,
         }
     }
@@ -263,13 +279,15 @@ impl Deref for List {
             Storage::Values(v) => v,
             Storage::Bools(v) => {
                 // A native store must miss until an exclusive borrow discards this snapshot.
-                self.native_bool_writes.set(0);
+                self.native_writes.set(0);
                 self.snapshot
                     .get_or_init(|| v.iter().map(|v| Value::Bool(*v != 0)).collect())
             }
-            Storage::Floats(v) => self
-                .snapshot
-                .get_or_init(|| v.iter().copied().map(Value::Float).collect()),
+            Storage::Floats(v) => {
+                self.native_writes.set(0);
+                self.snapshot
+                    .get_or_init(|| v.iter().copied().map(Value::Float).collect())
+            }
         }
     }
 }
@@ -278,7 +296,7 @@ impl DerefMut for List {
         if !matches!(self.storage, Storage::Values(_)) {
             let values = self.snapshot.take().unwrap_or_else(|| self.to_vec());
             self.storage = Storage::Values(values);
-            self.native_bool_writes.set(0);
+            self.native_writes.set(0);
         }
         let Storage::Values(v) = &mut self.storage else {
             unreachable!()
@@ -332,7 +350,7 @@ impl Clone for List {
         Self {
             storage: self.storage.clone(),
             snapshot: OnceCell::new(),
-            native_bool_writes: Cell::new(0),
+            native_writes: Cell::new(0),
         }
     }
 }
@@ -354,5 +372,23 @@ mod tests {
         };
         assert!(list.snapshot.get().is_none());
         assert!(list.bools().is_some());
+    }
+    #[test]
+    fn float_native_permission_is_renewed_after_boxed_snapshots() {
+        let mut list = List::from(vec![Value::Float(1.0), Value::Float(2.0)]);
+        let (_, len) = list.native_float_view().unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(list.native_writes.get(), 1);
+        let old = list.deref().clone();
+        assert_eq!(list.native_writes.get(), 0);
+        let (pointer, _) = list.native_float_view().unwrap();
+        assert_eq!(list.native_writes.get(), 1);
+        // The exclusive list owns this initialized element; no payload borrow remains.
+        unsafe {
+            pointer.write(9.0);
+        }
+        assert_eq!(old[0], Value::Float(1.0));
+        assert_eq!(list.deref()[0], Value::Float(9.0));
+        assert_eq!(list.native_writes.get(), 0);
     }
 }

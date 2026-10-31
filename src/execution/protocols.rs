@@ -2,6 +2,54 @@
 use super::*;
 
 impl Vm {
+    pub(super) fn inplace_scalar(op: &str, old: Value, rhs: Value) -> Option<Value> {
+        // Exact scalar values cannot invoke Python hooks. Keep the same checked
+        // arithmetic used by adaptive bytecode before taking the protocol path.
+        if let (Value::Int(left), Value::Int(right)) = (old, rhs) {
+            let value = match op {
+                "+" => left.checked_add(right),
+                "-" => left.checked_sub(right),
+                "*" => left.checked_mul(right),
+                _ => None,
+            };
+            if let Some(value) = value {
+                return Some(Value::Int(value));
+            }
+        }
+        if let (Value::Float(left), Value::Float(right)) = (old, rhs) {
+            use crate::scalar::FloatOperator;
+            let operator = match op {
+                "+" => Some(FloatOperator::Add),
+                "-" => Some(FloatOperator::Subtract),
+                "*" => Some(FloatOperator::Multiply),
+                "/" => Some(FloatOperator::Divide),
+                "**" => Some(FloatOperator::Power),
+                _ => None,
+            };
+            if let Some(value) = operator.and_then(|operator| operator.evaluate(left, right)) {
+                return Some(Value::Float(value));
+            }
+        }
+        None
+    }
+
+    pub(super) fn inplace_value(&mut self, op: &str, old: Value, rhs: Value) -> Result<Value> {
+        if let Some(value) = Self::inplace_scalar(op, old, rhs) {
+            return Ok(value);
+        }
+        if op == "+" && matches!(self.heap.get(old), Ok(Object::List(_))) {
+            self.method(old, "extend", &[rhs])?;
+            Ok(old)
+        } else if op == "*" && matches!(self.heap.get(old), Ok(Object::List(_))) {
+            let replacement = repeat(&self.heap, old, integer(rhs)?)?;
+            let object = self.heap.get(replacement)?.clone();
+            *self.heap.get_mut(old)? = object;
+            Ok(old)
+        } else {
+            self.py_inplace(op, old, rhs)
+        }
+    }
+
     pub(crate) fn instance_class(&self, value: Value) -> Option<Value> {
         match self.heap.get(value) {
             Ok(Object::Instance { class, .. }) => Some(*class),

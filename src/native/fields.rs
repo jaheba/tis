@@ -79,14 +79,14 @@ pub(super) fn load(
         types::I64,
         MemFlagsData::new(),
         host,
-        offset_of!(crate::native_runtime::Context<'_>, inline_field_hits) as i32,
+        offset_of!(crate::native_abi::NativeHeader, inline_field_hits) as i32,
     );
     let count = b.ins().iadd_imm_s(count, 1);
     b.ins().store(
         MemFlagsData::new(),
         count,
         host,
-        offset_of!(crate::native_runtime::Context<'_>, inline_field_hits) as i32,
+        offset_of!(crate::native_abi::NativeHeader, inline_field_hits) as i32,
     );
     b.ins().jump(done, &[]);
     b.switch_to_block(miss);
@@ -114,7 +114,7 @@ pub(super) fn checked_row(
         types::I8,
         MemFlagsData::new(),
         host,
-        offset_of!(crate::native_runtime::Context<'_>, collecting) as i32,
+        offset_of!(crate::native_abi::NativeHeader, collecting) as i32,
     );
     let quiet = b.ins().icmp_imm_s(IntCC::Equal, collecting, 0);
     guard!(quiet);
