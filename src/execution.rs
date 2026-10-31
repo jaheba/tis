@@ -1932,6 +1932,13 @@ impl Vm {
         if exhausted.get() {
             return Ok(None);
         }
+        // String cursors use UTF-8 byte offsets, unlike list/tuple element indices.
+        if !matches!(
+            self.heap.get(*source),
+            Ok(Object::List(_) | Object::Tuple(_))
+        ) {
+            return Ok(None);
+        }
         let position = index.get();
         let Ok(key) = i64::try_from(position) else {
             return Ok(None);

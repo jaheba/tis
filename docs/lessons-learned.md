@@ -927,6 +927,27 @@ of magnitude, but this does not address method acquisition or dictionary updates
 
 Evidence: [loop-entry inlining](../benchmarks/results/2026-10-31-loop-inlining/README.md).
 
+## 48. Iterator output type does not identify the cursor representation
+
+A list of strings and a string iterator both return strings. Selecting StringNext from the result profile made list
+loops miss a closed probe at every item. Use the iterator source profile; guard the actual source at runtime.
+Cranelift also lacked the sequence fallback CnP already used after a range-cursor miss.
+
+The first repair exposed a contract bug: the nominal sequence helper accepted strings through generic indexing,
+although string cursors track UTF-8 byte offsets. The full string-iteration test failed at exhaustion. Restrict the
+helper to list/tuple sources and advance strings through the dedicated character path. Keep tests about results,
+GC and fallback costs rather than one required helper name.
+
+Builtin method acquisition can also avoid full root publication while still allocating a fresh bound object.
+An exact builtin receiver, supported method and one-object budget permit a non-collecting probe. Descriptor mode
+and allocation pressure retain the original rooted callback. Escaped methods and observable identity stay intact.
+
+Together these changes cut retained get/Unicode histograms about 49–50% with CnP and 42–43% with Cranelift.
+A separate get diagnostic drops root synchronizations from about 58,000 to 330. This is still several times CPython
+and around ten times PyPy: dictionary hashing/update dispatch and helper frames remain. No parity claim follows.
+
+Evidence: [dictionary paths](../benchmarks/results/2026-10-31-dictionary-paths/README.md).
+
 ## Updating this notebook
 
 After a substantive architecture or performance experiment, add or revise the applicable lesson.

@@ -379,7 +379,7 @@ fn region_imports(
         .collect()
 }
 
-/// Probe only existing instance fields. No allocation, Python calls or collection may occur here.
+/// Probe instance fields and exact builtin methods without Python calls or collection.
 pub(crate) extern "C" fn field_callback(
     raw: *mut c_void,
     registers: *mut Slot,
@@ -412,6 +412,7 @@ pub(crate) extern "C" fn field_callback(
         };
         // Verification proves the operand and destination lie inside this invocation's image.
         let receiver = unsafe { (*registers.add(arguments[0].0)).value()? };
+        let instance = matches!(vm.heap.get(receiver), Ok(crate::Object::Instance { .. }));
         let value = match vm.heap.get(receiver) {
             Ok(crate::Object::Instance { attributes, .. }) => {
                 let (value, hit) = attributes.read(attribute);
@@ -419,6 +420,34 @@ pub(crate) extern "C" fn field_callback(
                     vm.tier_stats.shape_read_hits += 1;
                 }
                 value
+            }
+            Ok(
+                crate::Object::List(_)
+                | crate::Object::Dict(_)
+                | crate::Object::Set(_)
+                | crate::Object::FrozenSet(_)
+                | crate::Object::ByteArray(_)
+                | crate::Object::Bytes(_)
+                | crate::Object::String(_),
+            ) => {
+                // Exact builtin methods have no descriptor hooks. Bound objects remain fresh;
+                // the one-object budget forces the ordinary rooted callback before GC pressure.
+                if !vm.allocation_fits_without_collection(1) {
+                    return Ok(false);
+                }
+                vm.builtin_method(receiver, &attribute.text)?.map(|name| {
+                    vm.heap
+                        .allocate(crate::Object::Bound(receiver, name.into()))
+                })
+            }
+            _ if matches!(receiver, Value::InlineString(_)) => {
+                if !vm.allocation_fits_without_collection(1) {
+                    return Ok(false);
+                }
+                vm.builtin_method(receiver, &attribute.text)?.map(|name| {
+                    vm.heap
+                        .allocate(crate::Object::Bound(receiver, name.into()))
+                })
             }
             _ => None,
         };
@@ -431,7 +460,11 @@ pub(crate) extern "C" fn field_callback(
                         .0,
                 ) = Slot::boxed(value);
             }
-            vm.tier_stats.native_field_hits += 1;
+            if instance {
+                vm.tier_stats.native_field_hits += 1;
+            } else {
+                vm.tier_stats.native_builtin_method_hits += 1;
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -691,6 +724,8 @@ pub(crate) extern "C" fn guarded_helper_callback(
                     // Exact list/tuple cursors can advance without allocating an end sentinel.
                     vm.tier_stats.native_sequence_loads += 1;
                     value
+                } else if let Some(value) = vm.try_string_next(iterator)? {
+                    value
                 } else {
                     return Ok(false);
                 }
@@ -717,6 +752,16 @@ pub(crate) extern "C" fn guarded_helper_callback(
                     *value = slots[input.0].value()?;
                 }
                 match helper {
+                    lir::Helper::Python(crate::hir::CoreOp::Next) => {
+                        if let Some(value) = vm.try_sequence_next(values[0])? {
+                            vm.tier_stats.native_sequence_loads += 1;
+                            value
+                        } else if let Some(value) = vm.try_string_next(values[0])? {
+                            value
+                        } else {
+                            return Ok(false);
+                        }
+                    }
                     lir::Helper::GetItem => {
                         // String keys cannot hit the sequence helper. Skip that extra probe
                         // to preserve the existing mapping fast path.

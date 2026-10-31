@@ -36,3 +36,5 @@ The current benchmark-game report uses its own external evidence archive and rep
 - [Custom variation fixes](2026-10-31-custom-fixes/README.md): guarded loops, count/dictionary runtime work, CnP body inlining, native float views and descriptor safety.
 
 - [Loop-entry guards for inlined helpers](2026-10-31-loop-inlining/README.md): shared float-helper proof, both backends, controls and full-suite validation.
+
+- [Builtin method and iterator probes](2026-10-31-dictionary-paths/README.md): histogram costs, source/result type distinction, UTF-8 cursor guard and paired controls.

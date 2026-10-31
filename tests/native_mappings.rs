@@ -190,3 +190,85 @@ assert events==['hash']
         }
     }
 }
+
+#[test]
+fn native_builtin_method_acquisition_preserves_identity_roots_and_descriptors() {
+    for tier in [Tiering::Native, Tiering::CopyPatch] {
+        let mut vm = compiled(
+            r#"
+def acquire(obj): return obj.get
+d = {'key': [42]}
+held = []
+for i in range(6000):
+    a = acquire(d)
+    b = acquire(d)
+    assert a is not b
+    assert a('key')[0] == 42
+    if i % 137 == 0:
+        held.append(a)
+assert all(method('key')[0] == 42 for method in held)
+"#,
+            BytecodeMode::Register,
+            tier,
+        );
+        assert!(vm.tier_stats.native_builtin_method_hits > 100);
+        vm.run_program(
+            &mut compile(
+                r#"
+log = []
+class Custom:
+    @property
+    def get(self):
+        log.append('get')
+        return lambda key: key + 1
+assert acquire(Custom())(41) == 42
+assert log == ['get']
+try:
+    acquire([])
+    assert False
+except AttributeError:
+    pass
+assert acquire(d)('missing', 7) == 7
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn string_results_do_not_imply_a_string_iterator_source() {
+    for tier in [Tiering::Native, Tiering::CopyPatch] {
+        let vm = compiled(
+            r#"
+def total(words):
+    count = 0
+    for word in words:
+        count += len(word)
+    return count
+words = ['one', 'é', '😀', ''] * 500
+for i in range(10):
+    assert total(words) == 2500
+"#,
+            BytecodeMode::Register,
+            tier,
+        );
+        let hir = vm.function_hir(vm.get_global("total").unwrap()).unwrap();
+        let lir = hir.lower_lir(tis::lir::LoweringMode::Profiled).unwrap();
+        assert!(
+            !lir.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i.operation,
+                    tis::lir::Operation::Call {
+                        helper: tis::lir::Helper::StringNext,
+                        ..
+                    }
+                ))
+        );
+        assert!(vm.tier_stats.native_sequence_loads + vm.tier_stats.native_inline_next > 100);
+        assert!(vm.tier_stats.native_root_syncs < 1000);
+    }
+}

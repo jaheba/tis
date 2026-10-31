@@ -1236,15 +1236,11 @@ impl Function {
                                 && inputs.len() == 1
                                 && hir.instruction(inputs[0]).is_some_and(|iterator| {
                                     matches!(iterator.op, hir::Op::Runtime(CoreOp::Iter, _))
-                                        && (profile
+                                        && profile
                                             .site(inputs[0])
                                             .and_then(|site| site.operands.first())
                                             .and_then(|operand| operand.monomorphic())
                                             == Some(ValueKind::String)
-                                            || profile
-                                                .site(origin)
-                                                .and_then(|site| site.result.monomorphic())
-                                                == Some(ValueKind::String))
                                 }) =>
                         {
                             Helper::StringNext

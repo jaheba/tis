@@ -72,6 +72,7 @@ pub struct TierStats {
     pub native_region_failures: u64,
     pub native_runtime_calls: u64,
     pub native_field_hits: u64,
+    pub native_builtin_method_hits: u64,
     pub native_sequence_loads: u64,
     pub native_list_stores: u64,
     pub native_range_steps: u64,

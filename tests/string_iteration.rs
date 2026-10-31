@@ -1,4 +1,4 @@
-use tis::{Object, Tiering, Value, Vm, compile, lir::LoweringMode};
+use tis::{Object, Tiering, Value, Vm, compile};
 
 #[test]
 fn native_string_iteration_uses_inline_characters_with_guarded_exhaustion() {
@@ -17,12 +17,6 @@ fn native_string_iteration_uses_inline_characters_with_guarded_exhaustion() {
     for _ in 0..5 {
         assert_eq!(vm.call(f, &[text]).unwrap(), Value::Int(4000));
     }
-    let lir = vm
-        .function_hir(f)
-        .unwrap()
-        .lower_lir(LoweringMode::Profiled)
-        .unwrap();
-    assert!(format!("{lir:?}").contains("StringNext"));
     let roots = vm.tier_stats.native_root_syncs;
     assert_eq!(vm.call(f, &[text]).unwrap(), Value::Int(4000));
     assert!(vm.tier_stats.native_root_syncs - roots < 100);

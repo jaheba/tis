@@ -855,6 +855,7 @@ impl NativeCode {
                                 destination.unwrap(),
                                 done,
                             )?;
+                            closed_builtin!(&mut b, instruction.operation.inputs(), location, done);
                             runtime_call!(
                                 &mut b,
                                 callback_ref,
