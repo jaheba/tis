@@ -184,6 +184,9 @@ pub(crate) fn execute(
             inline_float_views: 0,
             inline_unpack_batches: 0,
             inline_next: 0,
+            closed_inline_region: usize::MAX,
+            closed_inline_attempt: usize::MAX,
+            inline_body_hits: 0,
         };
         let outcome = (|| {
             // SAFETY: Context and the fixed-size slot allocation remain alive and unmoved for this
@@ -206,6 +209,7 @@ pub(crate) fn execute(
             vm.tier_stats.native_unpack_batches += context.inline_unpack_batches;
             vm.tier_stats.native_inline_unpack_batches += context.inline_unpack_batches;
             vm.tier_stats.native_inline_next += context.inline_next;
+            vm.tier_stats.native_body_inlines += context.inline_body_hits;
             context.flush_region()?;
             // Quiet counts contain no Python handles. Merge even on guard/error exits, after
             // native execution has stopped; observing blocks still use immediate bookkeeping.
@@ -298,8 +302,82 @@ pub(crate) struct Context<'a> {
     pub(crate) inline_float_views: u64,
     pub(crate) inline_unpack_batches: u64,
     pub(crate) inline_next: u64,
+    pub(crate) closed_inline_region: usize,
+    pub(crate) closed_inline_attempt: usize,
+    pub(crate) inline_body_hits: u64,
 }
 const _: () = assert!(std::mem::offset_of!(Context<'static>, header) == 0);
+
+fn prepare_inline_bindings(
+    lir: &lir::Function,
+    region: &crate::region::LoopRegion,
+    vm: &mut Vm,
+    slots: &mut [Slot],
+) -> Result<bool> {
+    if !region.has_inline(lir) {
+        return Ok(true);
+    }
+    if vm.depth >= 256 || !vm.allocation_fits_without_collection(0) {
+        return Ok(false);
+    }
+    for &index in &region.name_sites {
+        let instruction = &lir.blocks[region.body.0].instructions[index];
+        if let Operation::Call {
+            helper: lir::Helper::LoadName(name),
+            ..
+        } = &instruction.operation
+        {
+            // Missing names must miss: an empty loop or an earlier body effect may precede this read.
+            let Ok(value) = vm.load_name_slot(&name.text, &name.cache) else {
+                return Ok(false);
+            };
+            slots[instruction.result.ok_or(Error::InvalidIr("closed name"))?.0] =
+                Slot::boxed(value);
+        }
+    }
+    for &index in &region.inline_sites {
+        let instruction = &lir.blocks[region.body.0].instructions[index];
+        if let Operation::Call {
+            helper: lir::Helper::InlineCall { body, .. },
+            arguments,
+            ..
+        } = &instruction.operation
+        {
+            if !body.loop_safe() || arguments.len() != body.parameters + 1 {
+                return Ok(false);
+            }
+            let mut arguments_values = [Value::Float(0.0); 5];
+            arguments_values[0] = slots[arguments[0].0].value()?;
+            let mut scratch = [Slot::default(); 128];
+            if body.nodes.len() > scratch.len()
+                || body
+                    .prepare(
+                        &vm.heap,
+                        &arguments_values[..arguments.len()],
+                        &mut scratch[..body.nodes.len()],
+                    )
+                    .is_none()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn region_imports(
+    lir: &lir::Function,
+    region: &crate::region::LoopRegion,
+    slots: &[Slot],
+) -> Result<std::collections::BTreeMap<lir::Register, Value>> {
+    region
+        .imports
+        .iter()
+        .copied()
+        .chain(region.names(lir))
+        .map(|r| Ok((r, slots[r.0].value()?)))
+        .collect()
+}
 
 /// Probe only existing instance fields. No allocation, Python calls or collection may occur here.
 pub(crate) extern "C" fn field_callback(
@@ -399,6 +477,8 @@ fn callback_impl<const SCOPED: bool>(
     // SAFETY: only generated Entry calls this private callback, using its original Context
     // pointer. Calls are synchronous; nested JIT frames allocate distinct contexts and slots.
     let context = unsafe { &mut *raw.cast::<Context<'_>>() };
+    // No cached loop-call proof survives a general callback, including observation and GC.
+    context.closed_inline_region = usize::MAX;
     // SAFETY: each synchronous gateway holds the suspended invocation's exclusive VM borrow.
     unsafe {
         (&mut *context.vm).tier_stats.native_runtime_calls += 1;
@@ -993,6 +1073,66 @@ impl Context<'_> {
         vm.tier_stats.native_region_entries += 1;
         Ok(())
     }
+    fn prepare_closed_inline(&mut self, index: usize) -> Result<()> {
+        let region = self
+            .lir
+            .regions
+            .get(index)
+            .ok_or(Error::InvalidIr("closed inline region"))?;
+        self.closed_inline_attempt = index;
+        self.closed_inline_region = usize::MAX;
+        // SAFETY: this synchronous callback owns the suspended VM and its fixed canonical image.
+        let vm = unsafe { &mut *self.vm };
+        let slots =
+            unsafe { std::slice::from_raw_parts_mut(self.registers, self.lir.registers.len() + 1) };
+        if self.header.collecting
+            || vm.collecting(self.function)
+            || !prepare_inline_bindings(self.lir, region, vm, slots)?
+        {
+            return Ok(());
+        }
+        let iterator = slots[region.iterator.0].value()?;
+        let roots = region
+            .imports
+            .iter()
+            .copied()
+            .chain(region.names(self.lir))
+            .map(|r| slots[r.0].value());
+        if !self.views.prepare(&mut vm.heap, roots, iterator)? {
+            return Ok(());
+        }
+        let crate::Object::Iterator { source, .. } = vm.heap.get(iterator)? else {
+            return Ok(());
+        };
+        let source = Slot::boxed(*source);
+        self.schema_key.clear();
+        self.schema_key.extend([index as u64, source.tag, source.a]);
+        for register in region.imports.iter().copied().chain(region.names(self.lir)) {
+            if register == region.iterator {
+                continue;
+            }
+            let s = slots[register.0];
+            self.schema_key.extend([register.0 as u64, s.tag]);
+            if s.tag & KIND_MASK == REF {
+                self.schema_key.push(s.a);
+            }
+        }
+        if !self.views.schemas.contains(self.schema_key.as_slice()) {
+            let imports = region_imports(self.lir, region, slots)?;
+            if !region
+                .schema
+                .as_ref()
+                .ok_or(Error::InvalidIr("closed schema"))?
+                .validate(&vm.heap, iterator, &imports)?
+            {
+                return Ok(());
+            }
+            self.views.schemas.insert(self.schema_key.clone());
+        }
+        self.closed_inline_region = index;
+        vm.tier_stats.native_region_entries += 1;
+        Ok(())
+    }
     fn prepare_region(&mut self, index: usize) -> Result<()> {
         let region = self
             .lir
@@ -1013,10 +1153,17 @@ impl Context<'_> {
                 value
             }
         };
+        if region.has_inline(self.lir) && !prepare_inline_bindings(self.lir, region, vm, slots)? {
+            vm.tier_stats.native_region_failures += 1;
+            self.side_exit = Some(region.entry);
+            return Ok(());
+        }
         let iterator = slots[region.iterator.0].value()?;
         let roots = region
             .imports
             .iter()
+            .copied()
+            .chain(region.names(self.lir))
             .map(|r| slots[r.0].value())
             .chain(std::iter::once(Ok(done)));
         if vm.collecting(self.function) || !self.views.prepare(&mut vm.heap, roots, iterator)? {
@@ -1031,8 +1178,8 @@ impl Context<'_> {
             let source = Slot::boxed(*source);
             self.schema_key.clear();
             self.schema_key.extend([index as u64, source.tag, source.a]);
-            for register in &region.imports {
-                if *register == region.iterator {
+            for register in region.imports.iter().copied().chain(region.names(self.lir)) {
+                if register == region.iterator {
                     continue;
                 }
                 let s = slots[register.0];
@@ -1042,11 +1189,7 @@ impl Context<'_> {
                 }
             }
             if !self.views.schemas.contains(self.schema_key.as_slice()) {
-                let imported = region
-                    .imports
-                    .iter()
-                    .map(|r| Ok((*r, slots[r.0].value()?)))
-                    .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+                let imported = region_imports(self.lir, region, slots)?;
                 if !schema.validate(&vm.heap, iterator, &imported)? {
                     vm.tier_stats.native_region_failures += 1;
                     self.side_exit = Some(region.entry);
@@ -1138,6 +1281,9 @@ impl Context<'_> {
     ) -> Result<()> {
         if registers != self.registers {
             return Err(Error::InvalidIr("native register buffer changed"));
+        }
+        if event == CLOSED_INLINE_ENTER {
+            return self.prepare_closed_inline(location as usize);
         }
         if event == LEAF_ENTER {
             let &(block, index) = self

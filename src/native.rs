@@ -310,6 +310,8 @@ impl NativeCode {
                 entry: n.entry,
                 imports: n.imports.clone(),
                 schema: None,
+                inline_sites: vec![],
+                name_sites: vec![],
             });
             let power_ref = module.declare_func_in_func(power_id, b.func);
             let blocks = (0..owner.lir.blocks.len())
@@ -673,6 +675,7 @@ impl NativeCode {
                             )?;
                         }
                         let mut emitter = region::Emitter {
+                            host,
                             b: &mut b,
                             scalars: &scalars,
                             registers,
@@ -688,6 +691,7 @@ impl NativeCode {
                             .map(|i| &owner.lir.regions[i])
                             .unwrap_or_else(|| outer_region.as_ref().unwrap());
                         let mut emitter = region::Emitter {
+                            host,
                             b: &mut b,
                             scalars: &scalars,
                             registers,

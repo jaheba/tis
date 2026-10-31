@@ -908,6 +908,25 @@ Per-call inline validation and method-object construction also remain; no backen
 
 Evidence: [custom variation fixes](../benchmarks/results/2026-10-31-custom-fixes/README.md).
 
+## 47. Inlining needs a loop-lifetime proof to remove repeated validation
+
+Copying a helper body removes frames, but per-call guards still prevent closed-loop execution.
+A shared region proof now checks unbound argument-only float helpers at entry, with callable revision/type guards.
+Retained numeric-helper time drops from 4.51 to 0.276 ms with Cranelift and 1.77 to 0.844 ms with CnP.
+The direct loop remains about 0.245 ms and 0.747 ms respectively. Extracted-helper n-body improves
+123 → 34.7 ms with Cranelift, while original n-body remains about 32 ms.
+
+Prepare metadata once: scanning the IR at every entry regressed original n-body about 20%, despite selecting
+no new helper plan there. Verified call/name site lists and skipping preparation for ordinary regions removed most
+of that cost. The final original n-body sample is still about 2.4% slower; short samples do not resolve its cause.
+
+Callback invalidation, sticky failed attempts and conservative nest boundaries are part of the optimization.
+Missing names cannot raise before an empty loop or preceding effect; overloaded arithmetic must retain callbacks,
+rebinding and GC behavior. Methods, field reads and other effects remain excluded. Runtime crossings fall by orders
+of magnitude, but this does not address method acquisition or dictionary updates and does not establish PyPy parity.
+
+Evidence: [loop-entry inlining](../benchmarks/results/2026-10-31-loop-inlining/README.md).
+
 ## Updating this notebook
 
 After a substantive architecture or performance experiment, add or revise the applicable lesson.

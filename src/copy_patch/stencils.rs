@@ -288,6 +288,42 @@ compare!(tis_stencil_flt, Lt);
 compare!(tis_stencil_fle, Le);
 compare!(tis_stencil_fgt, Gt);
 compare!(tis_stencil_fge, Ge);
+/// Loop-local proofs contain no pointers and are invalidated at general callbacks or region exits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_closed_guard(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        let active = ctx.cast::<u8>().add(p.power).cast::<usize>().read();
+        if active as u64 == p.status && (p.tag == 0 || !(*ctx.cast::<NativeHeader>()).collecting) {
+            next(ctx, slots, p)
+        } else {
+            fallback(ctx, slots, p)
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tis_stencil_closed_clear(
+    ctx: *mut c_void,
+    slots: *mut Slot,
+    patch: *const Patch,
+) -> u64 {
+    unsafe {
+        let p = &*patch;
+        ctx.cast::<u8>()
+            .add(p.a as usize)
+            .cast::<usize>()
+            .write(usize::MAX);
+        ctx.cast::<u8>()
+            .add(p.b as usize)
+            .cast::<usize>()
+            .write(usize::MAX);
+        next(ctx, slots, p)
+    }
+}
 /// Preflight borrows the suspended VM without allocation/GC; scratch contains only primitive bits.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tis_stencil_inline_preflight(
@@ -299,6 +335,14 @@ pub unsafe extern "C" fn tis_stencil_inline_preflight(
         let p = &*patch;
         let check: extern "C" fn(*mut c_void, *mut Slot, i32, *mut Slot) -> i32 =
             std::mem::transmute(p.power);
+        if p.c != 0 && !(*ctx.cast::<NativeHeader>()).collecting {
+            let active = ctx.cast::<u8>().add(p.b as usize).cast::<usize>().read();
+            if active as u64 == p.c - 1 {
+                let hits = ctx.cast::<u8>().add(p.a as usize).cast::<u64>();
+                hits.write(hits.read().wrapping_add(1));
+                return next(ctx, slots, p);
+            }
+        }
         let output = slots.cast::<u8>().add(p.left).cast::<Slot>();
         match check(ctx, slots, p.location, output) {
             0 => next(ctx, slots, p),

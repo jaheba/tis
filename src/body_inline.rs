@@ -36,6 +36,22 @@ enum Source {
 }
 
 impl Plan {
+    /// Closed loops admit only argument-only float arithmetic with no binding or field effects.
+    pub(crate) fn loop_safe(&self) -> bool {
+        !self.bound
+            && !self.boolean
+            && self.nodes.iter().all(|node| {
+                matches!(
+                    node,
+                    Node::Argument(_)
+                        | Node::Constant(_)
+                        | Node::Add(..)
+                        | Node::Subtract(..)
+                        | Node::Multiply(..)
+                )
+            })
+    }
+
     pub(crate) fn observe(heap: &Heap, mut callee: Value) -> Option<Rc<Self>> {
         let bound = if let Object::Method(function, _) = heap.get(callee).ok()? {
             callee = *function;
@@ -404,6 +420,32 @@ mod tests {
             let error = vm.call(caller, &[Value::Float(4.0)]).unwrap_err();
             assert!(error.to_string().contains("RecursionError"));
             assert_eq!(vm.tier_stats.native_body_inlines, hits);
+            assert_eq!(vm.depth, 255);
+            assert_eq!(vm.stack_len(), 0);
+            vm.depth = 0;
+        }
+    }
+    #[test]
+    fn loop_call_proof_keeps_callee_depth_and_prefix_store_on_miss() {
+        for tier in [Tiering::CopyPatch, Tiering::Native] {
+            let mut vm = Vm::new();
+            vm.tiering = tier;
+            vm.thresholds.function_entries = 12;
+            vm.thresholds.loop_backedges = 16;
+            vm.run_program(&mut compile("def norm(x,y,z):\n    return x*x+y*y+z*z\ndef batch(points):\n    total=0.0\n    for point in points:\n        x,y,z=point\n        point[0]=x+1.0\n        total+=norm(x,y,z)\n    return total\npoints=[[1.0,2.0,3.0]]\nfor repeat in range(100):\n    batch(points)\n").unwrap()).unwrap();
+            let batch = vm.get_global("batch").unwrap();
+            let points = vm.get_global("points").unwrap();
+            let point = vm.heap.get_item(points, Value::Int(0)).unwrap();
+            let Value::Float(before) = vm.heap.get_item(point, Value::Int(0)).unwrap() else {
+                panic!("not float");
+            };
+            vm.depth = 255;
+            let error = vm.call(batch, &[points]).unwrap_err();
+            assert!(error.to_string().contains("RecursionError"));
+            assert_eq!(
+                vm.heap.get_item(point, Value::Int(0)).unwrap(),
+                Value::Float(before + 1.0)
+            );
             assert_eq!(vm.depth, 255);
             assert_eq!(vm.stack_len(), 0);
             vm.depth = 0;

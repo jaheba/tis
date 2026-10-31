@@ -103,6 +103,10 @@ impl LoopNest {
                 .filter(|(_, r)| blocks.contains(&r.header) && blocks.contains(&r.body))
                 .map(|(i, _)| i)
                 .collect::<Vec<_>>();
+            // Child callable guards are currently prepared at their own header, not the outer entry.
+            if children.iter().any(|&i| lir.regions[i].has_inline(lir)) {
+                continue;
+            }
             if children.is_empty() {
                 continue;
             }

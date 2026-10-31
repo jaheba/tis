@@ -31,15 +31,9 @@ enum Expr {
 impl Schema {
     pub(crate) fn build(lir: &lir::Function, header: BlockId, body: BlockId) -> Option<Self> {
         let imports = LoopRegion::imports(lir, header, body);
-        // A changing phi can change type or object identity on the backedge. Keep its per-iteration guards.
-        if imports
-            .iter()
-            .any(|r| lir.blocks[header.0].parameters.contains(r))
-        {
-            return None;
-        }
         let mut values = imports
-            .into_iter()
+            .iter()
+            .copied()
             .map(|r| {
                 (
                     r,
@@ -67,6 +61,30 @@ impl Schema {
                 _ => None,
             };
             let expr = match op {
+                Operation::Call {
+                    helper: lir::Helper::LoadName(_),
+                    ..
+                } => Some(Expr::Path(Path {
+                    root: Root::Import(i.result?),
+                    indices: vec![],
+                })),
+                Operation::Call {
+                    helper: lir::Helper::InlineCall { body, .. },
+                    arguments,
+                    ..
+                } if body.loop_safe() => {
+                    for argument in &arguments[1..] {
+                        match values.get(argument)? {
+                            Expr::Path(path) => {
+                                constraints.insert(Constraint::Float(path.clone()));
+                            }
+                            Expr::Scalar(crate::profile::ValueKind::Float) => {}
+                            _ => return None,
+                        }
+                    }
+                    Some(Expr::Scalar(crate::profile::ValueKind::Float))
+                }
+                Operation::Copy(source) => values.get(source).cloned(),
                 Operation::SequenceUnpack {
                     value, kind, count, ..
                 } => {
@@ -135,6 +153,36 @@ impl Schema {
             };
             if let Some(expr) = expr {
                 values.insert(i.result?, expr);
+            }
+        }
+        // Changing phis require an inductive scalar proof: entry guard plus a same-typed backedge.
+        let Terminator::Jump(edge) = &lir.blocks[body.0].terminator else {
+            return None;
+        };
+        for (parameter, argument) in lir.blocks[header.0].parameters.iter().zip(&edge.arguments) {
+            if !imports.contains(parameter) {
+                continue;
+            }
+            let path = Path {
+                root: Root::Import(*parameter),
+                indices: vec![],
+            };
+            if let Some(Expr::Path(same)) = values.get(argument)
+                && same == &path
+            {
+                continue;
+            }
+            let proven = match values.get(argument) {
+                Some(Expr::Scalar(crate::profile::ValueKind::Float)) => {
+                    constraints.contains(&Constraint::Float(path))
+                }
+                Some(Expr::Scalar(crate::profile::ValueKind::Int)) => {
+                    constraints.contains(&Constraint::Int(path))
+                }
+                _ => false,
+            };
+            if !proven {
+                return None;
             }
         }
         Some(Self {

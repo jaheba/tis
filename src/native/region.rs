@@ -6,6 +6,7 @@ pub(super) struct Emitter<'a, 'b> {
     pub b: &'a mut FunctionBuilder<'b>,
     pub scalars: &'a ScalarVars,
     pub registers: ir::Value,
+    pub host: ir::Value,
     pub lir: &'a lir::Function,
     pub region: &'a LoopRegion,
     pub nest_vars: Option<&'a super::virtual_iter::NestVars>,
@@ -221,6 +222,67 @@ impl Emitter<'_, '_> {
     }
     pub fn emit(&mut self, op: &Operation, dst: Option<Register>) -> Result<bool> {
         match op {
+            Operation::Call {
+                helper: lir::Helper::LoadName(_),
+                ..
+            } => {
+                let dst = dst.ok_or(Error::InvalidIr("region name"))?;
+                for field in [0, 8] {
+                    let value = load(self.b, self.registers, dst, field, types::I64)?;
+                    store_word_cached(self.b, self.scalars, self.registers, dst, field, value)?;
+                }
+            }
+            Operation::Call {
+                helper: lir::Helper::InlineCall { body, .. },
+                arguments,
+                ..
+            } if body.loop_safe() => {
+                let mut values = Vec::with_capacity(body.nodes.len());
+                for node in &body.nodes {
+                    use crate::body_inline::Node;
+                    let value = match node {
+                        Node::Argument(i) => {
+                            let bits = load_cached(
+                                self.b,
+                                self.scalars,
+                                self.registers,
+                                arguments[i + 1],
+                                8,
+                                types::I64,
+                            )?;
+                            self.b.ins().bitcast(types::F64, MemFlagsData::new(), bits)
+                        }
+                        Node::Constant(value) => self.b.ins().f64const(*value),
+                        Node::Add(a, b) => self.b.ins().fadd(values[*a], values[*b]),
+                        Node::Subtract(a, b) => self.b.ins().fsub(values[*a], values[*b]),
+                        Node::Multiply(a, b) => self.b.ins().fmul(values[*a], values[*b]),
+                        _ => return Err(Error::InvalidIr("closed inline node")),
+                    };
+                    values.push(value);
+                }
+                let bits =
+                    self.b
+                        .ins()
+                        .bitcast(types::I64, MemFlagsData::new(), values[body.result]);
+                let offset =
+                    offset_of!(crate::native_runtime::Context<'_>, inline_body_hits) as i32;
+                let hits = self
+                    .b
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), self.host, offset);
+                let hits = self.b.ins().iadd_imm_s(hits, 1);
+                self.b
+                    .ins()
+                    .store(MemFlagsData::new(), hits, self.host, offset);
+                store_scalar_cached(
+                    self.b,
+                    self.scalars,
+                    self.registers,
+                    dst.unwrap(),
+                    FLOAT,
+                    bits,
+                )?;
+            }
             Operation::Truth { value, .. } => {
                 let bits =
                     load_cached(self.b, self.scalars, self.registers, *value, 8, types::I64)?;

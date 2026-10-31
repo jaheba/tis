@@ -1486,7 +1486,14 @@ impl Function {
                 let entry = output.exit(state, ExitReason::TypeGuard);
                 let imports = crate::region::LoopRegion::imports(&output, header, body);
                 let schema = crate::region::schema::Schema::build(&output, header, body);
+                if schema.is_none() && crate::region::LoopRegion::inline_body(&output, body) {
+                    continue;
+                }
+                let (inline_sites, name_sites) =
+                    crate::region::LoopRegion::call_sites(&output, body);
                 output.regions.push(crate::region::LoopRegion {
+                    inline_sites,
+                    name_sites,
                     schema,
                     imports,
                     header,
@@ -1688,8 +1695,11 @@ impl Function {
                 })
                 .ok_or_else(fail)?;
             let expected_state = state(*entry_state)?;
-            if region.schema
-                != crate::region::schema::Schema::build(self, region.header, region.body)
+            if (region.inline_sites.clone(), region.name_sites.clone())
+                != crate::region::LoopRegion::call_sites(self, region.body)
+                || (region.has_inline(self) && region.schema.is_none())
+                || region.schema
+                    != crate::region::schema::Schema::build(self, region.header, region.body)
                 || region.imports
                     != crate::region::LoopRegion::imports(self, region.header, region.body)
                 || region
@@ -2766,7 +2776,11 @@ impl Helper {
             | Self::LeafReturn(_)
             | Self::TupleReturn(_) => count == 1,
             Self::CurrentEnvironment => count == 0,
-            Self::InlineCall { names, .. } => count == names.len() + 1,
+            Self::InlineCall { names, body } => {
+                count == names.len() + 1
+                    && count + usize::from(body.bound) == body.parameters + 1
+                    && names.iter().all(Option::is_none)
+            }
             Self::StringConstant(_) | Self::LoadName(_) => count == 0,
             Self::StoreName(_) | Self::GetAttr(_) => count == 1,
             Self::SetAttr(_) => count == 2,

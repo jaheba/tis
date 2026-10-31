@@ -18,8 +18,50 @@ pub struct LoopRegion {
     pub entry: lir::ExitId,
     pub imports: Vec<Register>,
     pub schema: Option<schema::Schema>,
+    pub inline_sites: Vec<usize>,
+    pub name_sites: Vec<usize>,
 }
 impl LoopRegion {
+    pub(crate) fn has_inline(&self, _lir: &lir::Function) -> bool {
+        !self.inline_sites.is_empty()
+    }
+    pub(crate) fn call_sites(lir: &lir::Function, body: BlockId) -> (Vec<usize>, Vec<usize>) {
+        let mut calls = vec![];
+        let mut names = vec![];
+        for (index, instruction) in lir.blocks[body.0].instructions.iter().enumerate() {
+            match instruction.operation {
+                Operation::Call {
+                    helper: lir::Helper::InlineCall { .. },
+                    ..
+                } => calls.push(index),
+                Operation::Call {
+                    helper: lir::Helper::LoadName(_),
+                    ..
+                } => names.push(index),
+                _ => {}
+            }
+        }
+        (calls, names)
+    }
+    pub(crate) fn inline_body(lir: &lir::Function, body: BlockId) -> bool {
+        lir.blocks[body.0].instructions.iter().any(|i| {
+            matches!(
+                i.operation,
+                Operation::Call {
+                    helper: lir::Helper::InlineCall { .. },
+                    ..
+                }
+            )
+        })
+    }
+    pub(crate) fn names<'a>(
+        &'a self,
+        lir: &'a lir::Function,
+    ) -> impl Iterator<Item = Register> + 'a {
+        self.name_sites
+            .iter()
+            .filter_map(|&index| lir.blocks[self.body.0].instructions[index].result)
+    }
     pub(crate) fn imports(lir: &lir::Function, header: BlockId, body: BlockId) -> Vec<Register> {
         let instructions = lir.blocks[header.0]
             .instructions
@@ -101,33 +143,76 @@ impl LoopRegion {
                 if b.instructions.iter().any(|i| i.result == Some(*iterator)) {
                     continue;
                 }
+                let inline = Self::inline_body(lir, edge.block);
+                let names = b
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i.operation {
+                        Operation::Call {
+                            helper: lir::Helper::LoadName(_),
+                            ..
+                        } => i.result,
+                        _ => None,
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                let defined = h
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(h.instructions.iter().filter_map(|i| i.result))
+                    .chain(b.instructions.iter().filter_map(|i| i.result))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if b.instructions.iter().any(|i| match &i.operation {
+                    Operation::Call {
+                        helper: lir::Helper::InlineCall { body, .. },
+                        arguments,
+                        ..
+                    } => {
+                        !body.loop_safe()
+                            || arguments
+                                .first()
+                                .is_none_or(|r| defined.contains(r) && !names.contains(r))
+                    }
+                    _ => false,
+                }) {
+                    continue;
+                }
                 // Adding an operation requires reviewing its effects and the region pointer-lifetime contract.
                 if b.instructions.iter().any(|i| {
-                    !matches!(
-                        i.operation,
-                        Operation::FloatListView { .. }
-                            | Operation::FloatListUnpack { .. }
-                            | Operation::FloatListLoad { .. }
-                            | Operation::FloatListStore { .. }
-                            | Operation::SequenceUnpack { .. }
-                            | Operation::SequenceGet {
-                                index: lir::SequenceIndex::Constant(_),
+                    let closed_call = inline
+                        && matches!(
+                            &i.operation,
+                            Operation::Call {
+                                helper: lir::Helper::LoadName(_) | lir::Helper::InlineCall { .. },
                                 ..
                             }
-                            | Operation::Copy(_)
-                            | Operation::Constant(_)
-                            | Operation::GuardInt { .. }
-                            | Operation::GuardFloat { .. }
-                            | Operation::UnboxFloat(_)
-                            | Operation::UnboxInt(_)
-                            | Operation::IntToFloat(_)
-                            | Operation::FloatBinary { .. }
-                            | Operation::FloatCompare { .. }
-                            | Operation::CheckedAdd { .. }
-                            | Operation::BoxFloat(_)
-                            | Operation::BoxInt(_)
-                            | Operation::BoxBool(_)
-                    )
+                        );
+                    !closed_call
+                        && !matches!(
+                            i.operation,
+                            Operation::FloatListView { .. }
+                                | Operation::FloatListUnpack { .. }
+                                | Operation::FloatListLoad { .. }
+                                | Operation::FloatListStore { .. }
+                                | Operation::SequenceUnpack { .. }
+                                | Operation::SequenceGet {
+                                    index: lir::SequenceIndex::Constant(_),
+                                    ..
+                                }
+                                | Operation::Copy(_)
+                                | Operation::Constant(_)
+                                | Operation::GuardInt { .. }
+                                | Operation::GuardFloat { .. }
+                                | Operation::UnboxFloat(_)
+                                | Operation::UnboxInt(_)
+                                | Operation::IntToFloat(_)
+                                | Operation::FloatBinary { .. }
+                                | Operation::FloatCompare { .. }
+                                | Operation::CheckedAdd { .. }
+                                | Operation::BoxFloat(_)
+                                | Operation::BoxInt(_)
+                                | Operation::BoxBool(_)
+                        )
                 }) {
                     continue;
                 }

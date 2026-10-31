@@ -185,9 +185,34 @@ impl Plan {
         } else {
             crate::region::reduce::find(lir)
         };
+        let closed_regions = if feedback {
+            vec![]
+        } else {
+            lir.regions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.has_inline(lir))
+                .collect::<Vec<_>>()
+        };
         let partial_origins = lir.block_origins.iter().any(Option::is_none);
         for (block, body) in lir.blocks.iter().enumerate() {
             plan.blocks.push(plan.nodes.len());
+            let closed_region = closed_regions
+                .iter()
+                .find(|(_, region)| region.header.0 == block || region.body.0 == block)
+                .map(|(i, _)| *i);
+            if !closed_regions.is_empty() && closed_region.is_none() {
+                plan.push(
+                    "closed_clear",
+                    Patch {
+                        a: std::mem::offset_of!(native_runtime::Context<'_>, closed_inline_region)
+                            as u64,
+                        b: std::mem::offset_of!(native_runtime::Context<'_>, closed_inline_attempt)
+                            as u64,
+                        ..Patch::default()
+                    },
+                );
+            }
             // Inlined blocks without origins retain header callbacks, matching the
             // shared quiet-edge policy; those backedges cannot be deferred safely.
             let observing_header =
@@ -241,6 +266,25 @@ impl Plan {
                 );
             } else {
                 plan.callback(ENTER, block)?;
+            }
+            if let Some(index) = closed_region
+                && lir.regions[index].header.0 == block
+            {
+                plan.split(
+                    "closed_guard",
+                    Patch {
+                        power: std::mem::offset_of!(
+                            native_runtime::Context<'_>,
+                            closed_inline_attempt
+                        ),
+                        status: index as u64,
+                        callback: plan.gateway,
+                        event: CLOSED_INLINE_ENTER,
+                        location: i32::try_from(index).map_err(|_| Error::IntegerOverflow)?,
+                        ..Patch::default()
+                    },
+                    "callback",
+                );
             }
             if let Some(fill) = fills.iter().find(|f| f.header.0 == block)
                 && let Some(backedge) = quiet_edges
@@ -363,6 +407,21 @@ impl Plan {
                     ..Patch::default()
                 };
                 let stencil = match &instruction.operation {
+                    Operation::Call {
+                        helper: lir::Helper::LoadName(_),
+                        ..
+                    } if closed_region.is_some() => {
+                        p.power =
+                            std::mem::offset_of!(native_runtime::Context<'_>, closed_inline_region);
+                        p.status = closed_region.unwrap() as u64;
+                        p.tag = 1;
+                        p.callback = plan.gateway;
+                        p.event = HELPER;
+                        p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
+                        plan.split("closed_guard", p, "callback");
+                        continue;
+                    }
+
                     Operation::FloatListView { value, length, .. } => {
                         p.callback = native_runtime::float_view_callback as *const u8 as usize;
                         p.event = FLOAT_VIEW;
@@ -477,6 +536,16 @@ impl Plan {
                         p.left = slot(Register(inline_base))?;
                         p.tag = body.nodes.len() as u64;
                         p.power = native_runtime::inline_preflight as *const u8 as usize;
+                        if let Some(index) = closed_region {
+                            p.a =
+                                std::mem::offset_of!(native_runtime::Context<'_>, inline_body_hits)
+                                    as u64;
+                            p.b = std::mem::offset_of!(
+                                native_runtime::Context<'_>,
+                                closed_inline_region
+                            ) as u64;
+                            p.c = index as u64 + 1;
+                        }
                         p.callback = plan.gateway;
                         p.event = HELPER;
                         p.location = i32::try_from(location).map_err(|_| Error::IntegerOverflow)?;
@@ -485,6 +554,9 @@ impl Plan {
                         plan.nodes[slow].cold = true;
                         plan.nodes[fast].alternate = Target::Node(slow);
                         plan.nodes[fast].next = Target::Node(plan.nodes.len());
+                        let mut operands_for = (0..body.nodes.len())
+                            .map(|index| Register(inline_base + index))
+                            .collect::<Vec<_>>();
                         for (index, node) in body.nodes.iter().enumerate() {
                             use crate::body_inline::Node as Expr;
                             let mut operands = Patch {
@@ -492,6 +564,16 @@ impl Plan {
                                 ..Patch::default()
                             };
                             let stencil = match node {
+                                Expr::Argument(argument) if !body.bound => {
+                                    let Operation::Call { arguments, .. } = &instruction.operation
+                                    else {
+                                        unreachable!()
+                                    };
+                                    // Preflight (or the loop proof) establishes exact float operands.
+                                    // Arithmetic reads payload bits directly, avoiding scratch copies.
+                                    operands_for[index] = arguments[argument + 1];
+                                    continue;
+                                }
                                 Expr::Argument(_) | Expr::Field(..) => continue,
                                 Expr::Constant(value) => {
                                     operands.tag = RAW_FLOAT;
@@ -503,8 +585,8 @@ impl Plan {
                                 | Expr::Multiply(a, b)
                                 | Expr::Less(a, b)
                                 | Expr::Compare(_, a, b) => {
-                                    operands.left = slot(Register(inline_base + *a))?;
-                                    operands.right = slot(Register(inline_base + *b))?;
+                                    operands.left = slot(operands_for[*a])?;
+                                    operands.right = slot(operands_for[*b])?;
                                     match node {
                                         Expr::Add(..) => "fadd",
                                         Expr::Subtract(..) => "fsub",
@@ -530,7 +612,7 @@ impl Plan {
                             "retag",
                             Patch {
                                 dst,
-                                left: slot(Register(inline_base + body.result))?,
+                                left: slot(operands_for[body.result])?,
                                 tag: if body.boolean { BOOL } else { FLOAT },
                                 ..Patch::default()
                             },
@@ -1441,7 +1523,7 @@ mod tests {
     };
     #[test]
     fn stencil_library_contains_offline_code() {
-        assert_eq!(generated::STENCILS.len(), 61);
+        assert_eq!(generated::STENCILS.len(), 63);
         assert!(
             generated::STENCILS
                 .iter()

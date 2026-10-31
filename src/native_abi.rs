@@ -26,6 +26,7 @@ pub(crate) const TUPLE_ALLOC: i32 = 10;
 pub(crate) const NAME_LOAD: i32 = 11;
 pub(crate) const LEAF_ENTER: i32 = 12;
 pub(crate) const NAME_STORE: i32 = 13;
+pub(crate) const CLOSED_INLINE_ENTER: i32 = 18;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Slot {
